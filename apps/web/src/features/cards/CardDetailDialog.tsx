@@ -16,6 +16,8 @@ interface Props {
   item?: CollectionItem | null;
   onClose: () => void;
   onChanged?: () => void;
+  /** tab to show when opened (e.g. 'copy' to jump straight to editing) */
+  initialTab?: 'price' | 'details' | 'sales' | 'copy';
 }
 
 interface Sale {
@@ -31,15 +33,15 @@ interface Sale {
   condition: string | null;
 }
 
-export function CardDetailDialog({ cardId, item, onClose, onChanged }: Props) {
+export function CardDetailDialog({ cardId, item, onClose, onChanged, initialTab }: Props) {
   const me = useSession((s) => s.user!);
   const revision = useLive((s) => s.revision);
   const [variantId, setVariantId] = useState<string | undefined>(item?.variant?.id);
   const [tab, setTab] = useState<'price' | 'details' | 'sales' | 'copy'>('price');
   useEffect(() => {
     setVariantId(item?.variant?.id);
-    setTab('price');
-  }, [cardId, item]);
+    setTab(initialTab ?? 'price');
+  }, [cardId, item, initialTab]);
 
   const card = useAsync(() => (cardId ? api.get<{ card: CardDTO; owners: { display_name: string; quantity: number; variant: string | null; condition: string }[] }>(`/api/cards/${cardId}`) : Promise.resolve(null)), [cardId, revision]);
   const v = variantId ? `&variantId=${variantId}` : '';

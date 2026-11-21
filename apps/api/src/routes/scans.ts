@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { and, desc, eq, sql, scans, identifications, researchJobs } from '@cardvault/database';
+import { and, desc, eq, sql, scans, researchJobs } from '@cardvault/database';
 import { ImageValidationError } from '@cardvault/imaging';
 import { GAME_SLUGS } from '@cardvault/shared';
 import type { AppContext } from '../context.js';
@@ -69,7 +69,7 @@ export async function scanRoutes(app: FastifyInstance, ctx: AppContext) {
     const me = currentUser(req);
     const q = parse(z.object({ limit: z.coerce.number().int().min(1).max(100).default(20), status: z.string().optional() }), req.query);
     const rows = await ctx.db.execute(sql`
-      SELECT s.id, s.status, s.confidence, s.thumbnail_path, s.created_at, s.card_id, c.name AS card_name, c.image_url, c.image_path
+      SELECT s.id, s.status, s.confidence, s.thumbnail_path, s.created_at, s.card_id, s.collection_item_id, c.name AS card_name, c.image_url, c.image_path
       FROM scans s LEFT JOIN cards c ON c.id = s.card_id
       WHERE s.user_id = ${me.id} ${q.status ? sql`AND s.status = ${q.status}` : sql``}
       ORDER BY s.created_at DESC LIMIT ${q.limit}`);
@@ -82,6 +82,7 @@ export async function scanRoutes(app: FastifyInstance, ctx: AppContext) {
         createdAt: r.created_at,
         cardId: r.card_id,
         cardName: r.card_name,
+        collectionItemId: r.collection_item_id,
         cardImage: r.image_path ? `/api/files/${r.image_path}` : r.image_url,
       })),
     };
@@ -92,7 +93,12 @@ export async function scanRoutes(app: FastifyInstance, ctx: AppContext) {
     const [scan] = await ctx.db.select().from(scans).where(eq(scans.id, req.params.id));
     if (!scan) throw notFound();
     if (scan.userId !== me.id && me.role !== 'ADMIN') throw forbidden();
-    const idents = await ctx.db.select().from(identifications).where(eq(identifications.scanId, scan.id)).orderBy(identifications.rank);
+    // candidates with their names so the UI can show "best guess" for unresolved scans
+    const idents = await ctx.db.execute(sql`
+      SELECT i.card_id AS "cardId", i.confidence, i.rank, i.method, i.raw_result->'ocr'->>'top' AS "ocrTop",
+        c.name, c.collector_number AS "collectorNumber", s.name AS "setName"
+      FROM identifications i LEFT JOIN cards c ON c.id = i.card_id LEFT JOIN sets s ON s.id = c.set_id
+      WHERE i.scan_id = ${scan.id} ORDER BY i.created_at DESC, i.rank`);
     const jobs = await ctx.db.select().from(researchJobs).where(eq(researchJobs.scanId, scan.id)).orderBy(desc(researchJobs.createdAt));
     return {
       scan: {

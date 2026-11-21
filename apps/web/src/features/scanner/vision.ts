@@ -31,6 +31,8 @@ export interface Detection {
 }
 
 export const CARD_RATIO = 63 / 88;
+/** Sobel magnitude that counts as a card edge (≈ 15 grey levels of contrast). */
+const EDGE_FLOOR = 60;
 
 /**
  * Grayscale plus per-pixel *minimum* channel. Specular glare clips every
@@ -141,7 +143,10 @@ export function detectCard(gray: Float32Array, w: number, h: number, guide: Rect
         if (gm > best) best = gm;
       }
       if (best < 60) continue; // no edge on this scan-line
-      const thr = best * 0.55;
+      // Outermost edge above a fixed strength floor: a weak card border on a
+      // dark table must win over strong artwork/text edges further inside.
+      // (Random table texture outside the card is rejected by the line fit.)
+      const thr = Math.min(best * 0.55, EDGE_FLOOR);
       const k = vals.findIndex((x) => x >= thr);
       if (k >= 0) pts.push({ u: outer + k * step, v: vv });
     }
@@ -238,4 +243,39 @@ export function autoLevels(img: ImageData): ImageData {
   const k = 255 / (hi - lo);
   for (let i = 0; i < d.length; i += 4) for (let c = 0; c < 3; c++) d[i + c] = Math.max(0, Math.min(255, (d[i + c]! - lo) * k));
   return img;
+}
+
+/**
+ * Coarse 8×8 luminance signature of the guide region, mean-removed so mild
+ * exposure changes don't matter. Used to tell "same card still in frame"
+ * from "a new card was placed".
+ */
+export function regionSignature(gray: Float32Array, w: number, r: Rect): Float32Array {
+  const out = new Float32Array(64);
+  const cw = r.w / 8, ch = r.h / 8;
+  for (let cy = 0; cy < 8; cy++) {
+    for (let cx = 0; cx < 8; cx++) {
+      let sum = 0, n = 0;
+      for (let y = Math.floor(r.y + cy * ch); y < r.y + (cy + 1) * ch; y += 2) {
+        for (let x = Math.floor(r.x + cx * cw); x < r.x + (cx + 1) * cw; x += 2) {
+          const v = gray[y * w + x];
+          if (v !== undefined) {
+            sum += v;
+            n++;
+          }
+        }
+      }
+      out[cy * 8 + cx] = n ? sum / n : 0;
+    }
+  }
+  const mean = out.reduce((a, b) => a + b, 0) / 64;
+  for (let i = 0; i < 64; i++) out[i]! -= mean;
+  return out;
+}
+
+/** Mean absolute difference between two signatures (0 = identical). */
+export function signatureDiff(a: Float32Array, b: Float32Array): number {
+  let d = 0;
+  for (let i = 0; i < 64; i++) d += Math.abs(a[i]! - b[i]!);
+  return d / 64;
 }

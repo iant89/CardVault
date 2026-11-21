@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router';
 import { CONDITIONS, GAME_SLUGS, VARIANT_TYPES } from '@cardvault/shared';
 import { GAME_MODULES } from '@cardvault/card-model';
 import { api, ApiError, qs } from '../../services/api';
@@ -42,8 +43,10 @@ export default function ReviewPage() {
   const revision = useLive((s) => s.revision);
   const list = useAsync(() => api.get<{ reviews: Review[] }>('/api/manual-review'), [revision]);
   const [selId, setSelId] = useState<string | null>(null);
+  const [params] = useSearchParams();
   const reviews = list.data?.reviews ?? [];
-  const sel = reviews.find((r) => r.id === selId) ?? reviews[0] ?? null;
+  // ?scan=<id> (from the scanner's Edit button) preselects that scan's review
+  const sel = reviews.find((r) => r.id === selId) ?? reviews.find((r) => r.scanId === params.get('scan')) ?? reviews[0] ?? null;
 
   if (list.loading && !list.data) return <Loading />;
   return (
