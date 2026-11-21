@@ -1515,6 +1515,8 @@ menu() {
       14) check_for_updates; pause ;;
       15) show_info ;;
       16) lan_menu ;;
+      17) lan_diagnose ;;
+      18) https_menu ;;
       0)
         section 'Goodbye'
         if services_running; then
