@@ -35,22 +35,68 @@ section() {
   printf '\n%s%s━━ %s ━━%s\n' "$BOLD" "$BLUE" "$*" "$RESET"
 }
 
+RUN_LOG=${CARDVAULT_LOG:-/tmp/cardvault-setup.log}
 STEP_NO=0
 STEP_TOTAL=8
-step() {
-  STEP_NO=$((STEP_NO + 1))
-  printf '\n%s[%d/%d]%s %s%s%s\n' "$CYAN" "$STEP_NO" "$STEP_TOTAL" "$RESET" "$BOLD" "$*" "$RESET"
+BAR_WIDTH=28
+
+progress_bar() {
+  local pct=$1 width=${2:-$BAR_WIDTH} i bar=''
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  for ((i = 0; i < width; i++)); do
+    if (( i < pct * width / 100 )); then bar+="${GREEN}█${RESET}"
+    else bar+="${DIM}░${RESET}"; fi
+  done
+  printf '[%s]' "$bar"
 }
 
+step() {
+  STEP_NO=$((STEP_NO + 1))
+  local pct=$(( STEP_NO * 100 / STEP_TOTAL ))
+  printf '\n%s[%d/%d]%s %s%s%s\n' "$CYAN" "$STEP_NO" "$STEP_TOTAL" "$RESET" "$BOLD" "$*" "$RESET"
+  printf '  %sOverall%s ' "$DIM" "$RESET"
+  progress_bar "$pct" 24
+  printf ' %3d%%\n' "$pct"
+}
+
+task() { printf '    %s↳%s %s\n' "$DIM" "$RESET" "$*"; }
+
+# Runs a task with an animated progress bar. Set EXPECTED_SECONDS before calling
+# to make the bar fill at a realistic pace; it holds at 95% if a task runs long.
 run() {
-  local label=$1 start=$SECONDS
-  printf '  %s→%s %s\n' "$DIM" "$RESET" "$label"
+  local label=$1 expected=${EXPECTED_SECONDS:-30} start=$SECONDS pid rc=0
   shift
-  if "$@"; then
-    ok "$label  ${DIM}($((SECONDS - start))s)${RESET}"
+  printf '  %s→%s %s\n' "$DIM" "$RESET" "$label"
+  if [[ ${CARDVAULT_VERBOSE:-0} == 1 ]]; then
+    set +e
+    "$@" 2>&1 | tee -a "$RUN_LOG"
+    rc=${PIPESTATUS[0]}
+    set -e
   else
-    err "$label failed"
-    return 1
+    "$@" >>"$RUN_LOG" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+      local elapsed=$(( SECONDS - start ))
+      local pct=$(( elapsed * 100 / expected ))
+      (( pct > 95 )) && pct=95
+      printf '\r  '
+      progress_bar "$pct"
+      printf ' %3d%%  %02d:%02d' "$pct" "$(( elapsed / 60 ))" "$(( elapsed % 60 ))"
+      sleep 0.2
+    done
+    if wait "$pid"; then rc=0; else rc=$?; fi
+    printf '\r\033[2K'
+  fi
+  if (( rc == 0 )); then
+    ok "$label  ${DIM}($(( SECONDS - start ))s)${RESET}"
+  else
+    err "$label failed (exit ${rc})"
+    if [[ -s $RUN_LOG ]]; then
+      printf '  %sLast log lines:%s\n' "$DIM" "$RESET" >&2
+      tail -n 15 "$RUN_LOG" >&2
+    fi
+    return "$rc"
   fi
 }
 
@@ -59,8 +105,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 ask() {
   local prompt=$1 default=${2:-y} ans
   if [[ ! -t 0 ]]; then printf '%s\n' "$prompt (non-interactive: using default)" >&2; [[ $default == y ]]; return; fi
-  if [[ $default == y ]]; then printf '  %s?%s %s %s[Y/n]%s ' "$BLUE" "$RESET" "$prompt" "$BOLD" "$RESET"
-  else printf '  %s?%s %s %s[y/N]%s ' "$BLUE" "$RESET" "$prompt" "$BOLD" "$RESET"; fi
+  if [[ $default == y ]]; then printf '  %s?%s %s %s[Y/n]%s ' "$BLUE" "$RESET" "$prompt" "$BOLD" "$RESET" >&2
+  else printf '  %s?%s %s %s[y/N]%s ' "$BLUE" "$RESET" "$prompt" "$BOLD" "$RESET" >&2; fi
   read -r ans || ans=''
   case "${ans,,}" in
     y|yes) return 0 ;;
@@ -73,29 +119,29 @@ ask() {
 prompt_value() {
   local prompt=$1 default=${2:-} out
   if [[ ! -t 0 ]]; then printf '%s\n' "$prompt (non-interactive: using default)" >&2; printf '%s' "$default"; return; fi
-  if [[ -n $default ]]; then printf '  %s?%s %s %s[%s]%s ' "$BLUE" "$RESET" "$prompt" "$DIM" "$default" "$RESET"
-  else printf '  %s?%s %s ' "$BLUE" "$RESET" "$prompt"; fi
+  if [[ -n $default ]]; then printf '  %s?%s %s %s[%s]%s ' "$BLUE" "$RESET" "$prompt" "$DIM" "$default" "$RESET" >&2
+  else printf '  %s?%s %s ' "$BLUE" "$RESET" "$prompt" >&2; fi
   IFS= read -r out || true
   printf '%s' "${out:-$default}"
 }
 
 prompt_secret() {
   local prompt=$1 out
-  printf '  %s?%s %s ' "$BLUE" "$RESET" "$prompt"
+  printf '  %s?%s %s ' "$BLUE" "$RESET" "$prompt" >&2
   IFS= read -rs out || true
-  printf '\n'
+  printf '\n' >&2
   printf '%s' "$out"
 }
 
 confirm_type() {
   local word=$1 ans
-  printf '  Type %s%s%s to confirm: ' "$BOLD" "$word" "$RESET"
+  printf '  Type %s%s%s to confirm: ' "$BOLD" "$word" "$RESET" >&2
   IFS= read -r ans || true
   [[ $ans == "$word" ]]
 }
 
 pause() {
-  if [[ -t 0 ]]; then read -r -p $'  \033[2mPress Enter to continue…\033[0m' _ || true; fi
+  if [[ -t 0 ]]; then printf '  %sPress Enter to continue…%s' "$DIM" "$RESET" >&2; read -r _ || true; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -164,60 +210,69 @@ node_major() { node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1 | grep -E '^[0-9
 
 install_packages() {
   section "System dependencies"
+  task "Checking which packages are already present"
   case $OS_FAMILY in
     debian)
-      run "Refresh package index" as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
-      run "Install base packages" as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      task "Refreshing package lists"
+      EXPECTED_SECONDS=60 run "Refresh package index" as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      task "Installing PostgreSQL, Redis, nginx, Node.js prerequisites and build tools"
+      EXPECTED_SECONDS=180 run "Install base packages" as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         curl git ca-certificates openssl nano build-essential python3 postgresql postgresql-contrib postgresql-client redis-server nginx
       if [[ $(node_major) -lt 22 ]]; then
-        run "Add NodeSource Node.js 22 repository" bash -c 'curl -fsSL https://deb.nodesource.com/setup_22.x | '"$( [[ $EUID -eq 0 ]] || echo sudo )"' bash -'
-        run "Install Node.js 22" as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs
+        EXPECTED_SECONDS=45 run "Add NodeSource Node.js 22 repository" bash -c 'curl -fsSL https://deb.nodesource.com/setup_22.x | '"$( [[ $EUID -eq 0 ]] || echo sudo )"' bash -'
+        EXPECTED_SECONDS=90 run "Install Node.js 22" as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs
       fi
       ;;
     rhel)
-      run "Install base packages" as_root dnf install -y -q curl git ca-certificates openssl nano gcc gcc-c++ make python3 postgresql-server postgresql-contrib redis nginx
+      EXPECTED_SECONDS=180 run "Install base packages" as_root dnf install -y -q curl git ca-certificates openssl nano gcc gcc-c++ make python3 postgresql-server postgresql-contrib redis nginx
       if [[ $(node_major) -lt 22 ]]; then
-        run "Add NodeSource Node.js 22 repository" bash -c 'curl -fsSL https://deb.nodesource.com/setup_22.x | '"$( [[ $EUID -eq 0 ]] || echo sudo )"' bash -'
-        run "Install Node.js 22" as_root dnf install -y -q nodejs
+        EXPECTED_SECONDS=45 run "Add NodeSource Node.js 22 repository" bash -c 'curl -fsSL https://deb.nodesource.com/setup_22.x | '"$( [[ $EUID -eq 0 ]] || echo sudo )"' bash -'
+        EXPECTED_SECONDS=90 run "Install Node.js 22" as_root dnf install -y -q nodejs
       fi
       ;;
     arch)
-      run "Install base packages" as_root pacman -Syu --noconfirm curl git ca-certificates openssl nano base-devel python3 npm postgresql redis nginx
+      EXPECTED_SECONDS=180 run "Install base packages" as_root pacman -Syu --noconfirm curl git ca-certificates openssl nano base-devel python3 npm postgresql redis nginx
       ;;
   esac
 
   if ! have pnpm || [[ $(pnpm --version 2>/dev/null | cut -d. -f1) -lt 10 ]]; then
-    run "Install pnpm 10" as_root npm install -g pnpm@10.12.1
+    task "Installing the pnpm package manager"
+    EXPECTED_SECONDS=60 run "Install pnpm 10" as_root npm install -g pnpm@10.12.1
   fi
   ok "Node $(node -v), pnpm $(pnpm --version), $(pg_config --version 2>/dev/null || echo 'PostgreSQL installed')"
 }
 
 configure_postgres() {
   section "PostgreSQL"
+  task "Ensuring the PostgreSQL server is running"
   if ! pg_admin psql -tAc 'SELECT 1' >/dev/null 2>&1; then
     if have postgresql-setup; then
-      run "Initialise PostgreSQL data directory" as_root postgresql-setup --initdb
+      EXPECTED_SECONDS=60 run "Initialise PostgreSQL data directory" as_root postgresql-setup --initdb
     else
-      run "Initialise PostgreSQL data directory" as_root install -d -o postgres -g postgres /var/lib/postgresql/data
-      run "Run initdb" pg_admin initdb -D /var/lib/postgresql/data
+      EXPECTED_SECONDS=30 run "Initialise PostgreSQL data directory" as_root install -d -o postgres -g postgres /var/lib/postgresql/data
+      EXPECTED_SECONDS=60 run "Run initdb" pg_admin initdb -D /var/lib/postgresql/data
     fi
   fi
   as_root systemctl enable --now postgresql >/dev/null 2>&1 || as_root service postgresql start >/dev/null 2>&1 || true
   sleep 1
 
   if [[ -z $(pg_admin psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='cardvault'" 2>/dev/null) ]]; then
-    run "Create database role 'cardvault'" pg_admin psql -c "CREATE ROLE cardvault LOGIN PASSWORD '${DB_PASS}';"
+    task "Creating the cardvault database role"
+    EXPECTED_SECONDS=30 run "Create database role 'cardvault'" pg_admin psql -c "CREATE ROLE cardvault LOGIN PASSWORD '${DB_PASS}';"
   else
-    run "Update database role password" pg_admin psql -c "ALTER ROLE cardvault WITH LOGIN PASSWORD '${DB_PASS}';"
+    task "Updating the cardvault database password"
+    EXPECTED_SECONDS=30 run "Update database role password" pg_admin psql -c "ALTER ROLE cardvault WITH LOGIN PASSWORD '${DB_PASS}';"
   fi
   if [[ -z $(pg_admin psql -tAc "SELECT 1 FROM pg_database WHERE datname='cardvault'" 2>/dev/null) ]]; then
-    run "Create database 'cardvault'" pg_admin createdb -O cardvault cardvault
+    task "Creating the cardvault database"
+    EXPECTED_SECONDS=30 run "Create database 'cardvault'" pg_admin createdb -O cardvault cardvault
   fi
   ok "PostgreSQL ready"
 }
 
 configure_redis() {
   section "Redis"
+  task "Ensuring the Redis server is running"
   local conf=''
   for f in /etc/redis/redis.conf /etc/redis.conf; do [[ -f $f ]] && conf=$f && break; done
   if [[ -n $conf ]]; then
@@ -464,6 +519,9 @@ service_status() {
 fresh_install() {
   banner
   section "New installation"
+  : >"$RUN_LOG" 2>/dev/null || true
+  info "Detailed progress is logged to ${RUN_LOG}"
+  info "Answer a few questions, then the installer will take it from here."
 
   INSTALL_DIR=${CARDVAULT_DIR:-$(prompt_value "Install directory" /opt/cardvault)}
   TRACK_BRANCH=$(prompt_value "Git branch to track" "$BRANCH_DEFAULT")
@@ -486,9 +544,12 @@ fresh_install() {
 
   STEP_TOTAL=8
   step "Preparing system"
+  task "Detecting the operating system"
   detect_os
   ok "Detected ${OS_PRETTY}"
+  task "Checking administrator privileges"
   ensure_sudo
+  task "Creating ${INSTALL_DIR}"
   as_root mkdir -p "$INSTALL_DIR"
   as_root chown -R "$INSTALL_USER" "$INSTALL_DIR"
 
@@ -500,7 +561,8 @@ fresh_install() {
   configure_redis
 
   step "Downloading CardVault source"
-  if have git && git clone --depth 1 --branch "$TRACK_BRANCH" "$REPO" "$INSTALL_DIR.tmp" 2>/dev/null; then
+  task "Cloning ${REPO} (${TRACK_BRANCH})"
+  if have git && EXPECTED_SECONDS=90 run "Clone repository" git clone --depth 1 --branch "$TRACK_BRANCH" "$REPO" "$INSTALL_DIR.tmp"; then
     if [[ $SCRIPT_DIR == "$INSTALL_DIR" ]]; then
       # Never delete the directory the running script lives in.
       (cd "$INSTALL_DIR.tmp" && tar -cf - .) | as_root tar -xf - -C "$INSTALL_DIR"
@@ -522,6 +584,8 @@ fresh_install() {
   mkdir -p "$INSTALL_DIR/storage" "$INSTALL_DIR/backups"
 
   step "Writing configuration"
+  task "Generating session secret and database password"
+  task "Writing ${INSTALL_DIR}/.env"
   cat >"$INSTALL_DIR/.env.tmp" <<EOF
 NODE_ENV=production
 DATABASE_URL=postgres://cardvault:${DB_PASS}@127.0.0.1:5432/cardvault
@@ -548,17 +612,24 @@ EOF
   ok "Configuration saved to ${INSTALL_DIR}/.env"
 
   step "Installing application and building"
-  run "pnpm install" bash -c "cd '$INSTALL_DIR' && pnpm install --frozen-lockfile"
-  run "pnpm build" bash -c "cd '$INSTALL_DIR' && pnpm build"
+  task "Downloading workspace dependencies with pnpm"
+  EXPECTED_SECONDS=240 run "pnpm install" bash -c "cd '$INSTALL_DIR' && pnpm install --frozen-lockfile"
+  task "Compiling packages and applications"
+  EXPECTED_SECONDS=120 run "pnpm build" bash -c "cd '$INSTALL_DIR' && pnpm build"
 
   step "Initialising database and admin user"
-  run "Apply migrations" bash -c "cd '$INSTALL_DIR' && pnpm db:migrate"
-  run "Seed catalog" bash -c "cd '$INSTALL_DIR' && pnpm db:seed"
-  run "Create administrator" bash -c "cd '$INSTALL_DIR' && pnpm user:create --bootstrap"
+  task "Applying the database schema"
+  EXPECTED_SECONDS=60 run "Apply migrations" bash -c "cd '$INSTALL_DIR' && pnpm db:migrate"
+  task "Loading the card catalog"
+  EXPECTED_SECONDS=60 run "Seed catalog" bash -c "cd '$INSTALL_DIR' && pnpm db:seed"
+  task "Creating the administrator account"
+  EXPECTED_SECONDS=45 run "Create administrator" bash -c "cd '$INSTALL_DIR' && pnpm user:create --bootstrap"
   ok "Administrator '${ADMIN_USERNAME}' created"
 
   step "Installing services and web server"
+  task "Writing systemd units"
   install_units
+  task "Configuring nginx on port ${WEB_PORT}"
   install_nginx
   if [[ -n $SCRIPT_PATH ]]; then
     install_manager "$SCRIPT_PATH"
@@ -567,10 +638,13 @@ EOF
   fi
 
   step "Starting CardVault"
-  if [[ $boot == yes ]]; then enable_boot; fi
+  if [[ $boot == yes ]]; then task "Enabling services at boot"; enable_boot; fi
+  task "Checking the local firewall"
   configure_firewall
+  task "Starting API, worker and web server"
   restart_services
-  sleep 3
+  info "Waiting for services to become ready…"
+  EXPECTED_SECONDS=10 run "Health check" sleep 3
   service_status
 
   section "Installation complete"
@@ -891,6 +965,8 @@ Environment overrides:
   CARDVAULT_DIR    Install directory  (default: /opt/cardvault)
   CARDVAULT_PORT   Web port           (default: 8080)
   CARDVAULT_USER   Account to run services as
+  CARDVAULT_VERBOSE=1  Stream command output instead of progress bars
+  CARDVAULT_LOG    Log file (default: /tmp/cardvault-setup.log)
   NO_COLOR         Disable coloured output
 EOF
       exit 0
