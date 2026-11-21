@@ -41,6 +41,35 @@ Set `SEED_DEMO=true` to load 8 sample cards (Pikachu, Charizard, Black Lotus, Bl
 
 ---
 
+## Native install (without Docker)
+
+`scripts/install.sh` sets up CardVault directly on a Linux host (Debian/Ubuntu, Fedora/RHEL or Arch). It installs Node.js 22, pnpm, PostgreSQL, Redis and nginx, clones the repository to `/opt/cardvault`, creates the database and admin account, writes systemd units, and serves the UI on port 8080.
+
+```bash
+git clone https://github.com/iant89/CardVault.git
+cd CardVault
+bash scripts/install.sh
+```
+
+The script asks for the admin password and whether to start services on boot. It detects an existing installation on later runs, offers an upgrade when the tracked branch has new commits, and otherwise opens a menu for:
+
+- service status / start / stop / restart / live logs
+- export, import or clear the database
+- export or import stored card images
+- change a user password, create a user, edit `.env`
+
+Reopen the console at any time with:
+
+```bash
+sudo cardvault-setup
+```
+
+If CardVault is already installed, the script goes straight to the menu. If it isn't, it simply asks whether you want to install it. Use menu option 14 to check for upgrades.
+
+Defaults can be overridden with `CARDVAULT_REPO`, `CARDVAULT_BRANCH`, `CARDVAULT_DIR`, `CARDVAULT_PORT` and `CARDVAULT_USER`. Backups written by the menu land in `/opt/cardvault/backups`.
+
+---
+
 ## Development
 
 Requirements: Node 22+, pnpm 10, PostgreSQL 16, Redis 7.
