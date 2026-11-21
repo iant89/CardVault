@@ -1,0 +1,63 @@
+/* ---------- the digital card table ---------- */
+.scene { position: relative; border-radius: 22px; overflow: hidden; border: 1px solid var(--line); min-height: 420px; isolation: isolate; }
+.scene-bg { position: absolute; inset: 0; z-index: -2; background: var(--scene-bg); background-size: cover; background-position: center; transition: background 0.6s ease; }
+.scene-surface { position: absolute; inset: 0; z-index: -1; background: var(--scene-surface); }
+.scene-light { position: absolute; inset: 0; z-index: -1; pointer-events: none; background: var(--scene-light); mix-blend-mode: screen; }
+.scene-content { position: relative; padding: 22px; }
+@media (max-width: 760px) { .scene-content { padding: 14px; } .scene { border-radius: 16px; } }
+
+.card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--card-w, 190px), 1fr)); gap: 26px 22px; perspective: 1400px; }
+@media (max-width: 760px) { .card-grid { --card-w: 140px; gap: 18px 12px; } }
+
+.tcard { position: relative; cursor: pointer; transform-style: preserve-3d; outline: none; }
+.tcard-inner {
+  position: relative; aspect-ratio: 63 / 88; border-radius: 4.5% / 3.2%; transform-style: preserve-3d;
+  transform: perspective(900px) rotateX(var(--rx, 0deg)) rotateY(var(--ry, 0deg)) translateZ(var(--tz, 0px)) scale(var(--s, 1));
+  transition: transform .5s cubic-bezier(.2, .8, .25, 1.15), box-shadow .4s ease;
+  box-shadow: 0 2px 2px rgba(0,0,0,.25), 0 10px 18px -6px rgba(0,0,0,.55);
+  will-change: transform; background: #1b2232;
+}
+.tcard.hovering .tcard-inner { transition: transform .08s linear, box-shadow .3s ease; box-shadow: 0 6px 10px rgba(0,0,0,.3), 0 28px 40px -12px rgba(0,0,0,.65); }
+.tcard:focus-visible .tcard-inner { box-shadow: 0 0 0 3px var(--accent), 0 20px 30px -10px rgba(0,0,0,.6); }
+.tcard-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; border-radius: inherit; user-select: none; -webkit-user-drag: none; }
+.tcard-shine { position: absolute; inset: 0; border-radius: inherit; pointer-events: none; opacity: 0; transition: opacity .3s;
+  background: radial-gradient(circle at var(--mx, 50%) var(--my, 50%), rgba(255,255,255,.28), rgba(255,255,255,0) 45%); mix-blend-mode: soft-light; }
+.tcard.hovering .tcard-shine { opacity: 1; }
+.tcard.holo .tcard-shine { background:
+  radial-gradient(circle at var(--mx, 50%) var(--my, 50%), rgba(255,255,255,.3), transparent 40%),
+  linear-gradient(115deg, transparent 20%, rgba(255,0,140,.18) 35%, rgba(0,220,255,.18) 50%, rgba(255,230,0,.16) 65%, transparent 80%);
+  background-size: 100% 100%, 200% 200%; background-position: center, var(--mx, 50%) var(--my, 50%); mix-blend-mode: color-dodge; }
+.tcard-edge { position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 0 0 1px rgba(255,255,255,.12); pointer-events: none; }
+.tcard-placeholder { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; padding: 12px; border-radius: inherit;
+  background: radial-gradient(120% 80% at 50% 0%, color-mix(in srgb, var(--ph, #6ea8ff) 45%, transparent), transparent 70%), linear-gradient(160deg, #222b40, #121726);
+  color: var(--text-2); font-weight: 700; font-size: 13px; border: 6px solid color-mix(in srgb, var(--ph, #6ea8ff) 35%, #1a2030); }
+.tcard-placeholder .ph-game { position: absolute; top: 10px; left: 0; right: 0; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: color-mix(in srgb, var(--ph, #6ea8ff) 80%, #fff); }
+.tcard-placeholder .ph-name { font-size: 15px; color: var(--text); }
+.tcard-qty { position: absolute; top: 6px; right: 6px; transform: translateZ(30px); background: rgba(0,0,0,.75); color: #fff; font-size: 12px; font-weight: 800; padding: 2px 7px; border-radius: 99px; border: 1px solid rgba(255,255,255,.25); }
+.tcard-flash { animation: cardFlash 1.2s ease; }
+@keyframes cardFlash { 0% { box-shadow: 0 0 0 0 rgba(110,168,255,.9); } 100% { box-shadow: 0 0 0 18px rgba(110,168,255,0); } }
+.tcard-meta { margin-top: 10px; display: grid; gap: 1px; }
+.tcard-meta .n { font-weight: 700; font-size: 14px; }
+.tcard-meta .s { font-size: 12px; color: var(--text-2); }
+.tcard-meta .p { display: flex; justify-content: space-between; font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.scene .tcard-meta .n { text-shadow: 0 1px 3px rgba(0,0,0,.7); }
+.scene .tcard-meta .s { color: rgba(240,244,255,.75); text-shadow: 0 1px 3px rgba(0,0,0,.7); }
+
+@media (prefers-reduced-motion: reduce) {
+  .tcard-inner, .tcard.hovering .tcard-inner { transition: none; transform: none !important; }
+}
+
+/* card detail */
+.detail { display: grid; grid-template-columns: minmax(240px, 340px) 1fr; gap: 28px; align-items: start; }
+@media (max-width: 860px) { .detail { grid-template-columns: 1fr; } .detail .tcard { width: min(240px, 62vw); margin: 0 auto; } }
+.detail-title { font-size: 30px; font-weight: 800; letter-spacing: -.02em; }
+.kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.kv > div { padding: 10px 12px; border-radius: 10px; background: rgba(255,255,255,.035); border: 1px solid var(--line); }
+.kv dt { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+.kv dd { margin: 3px 0 0; font-weight: 600; }
+.kv .wide { grid-column: 1 / -1; }
+.attack { padding: 8px 0; border-top: 1px solid var(--line); }
+.attack:first-child { border-top: 0; }
+.market { text-align: center; padding: 18px; border-radius: 16px; background: linear-gradient(180deg, rgba(110,168,255,.10), rgba(167,123,255,.06)); border: 1px solid var(--line); }
+.market .big { font-size: 40px; font-weight: 800; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.chart-box { height: 260px; }

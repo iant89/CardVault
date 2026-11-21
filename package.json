@@ -1,0 +1,36 @@
+{
+  "name": "cardvault",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Private, self-hosted family trading card collection platform",
+  "packageManager": "pnpm@10.12.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "dev:api": "pnpm --filter @cardvault/api dev",
+    "dev:worker": "pnpm --filter @cardvault/worker dev",
+    "dev:web": "pnpm --filter @cardvault/web dev",
+    "db:migrate": "pnpm --filter @cardvault/database migrate",
+    "db:generate": "pnpm --filter @cardvault/database generate",
+    "db:seed": "pnpm --filter @cardvault/database seed",
+    "user:create": "pnpm --filter @cardvault/api user:create",
+    "backup": "bash scripts/backup.sh"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@types/node": "^22.19.0",
+    "tsx": "^4.20.6",
+    "vitest": "^3.2.4"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "@node-rs/argon2"
+    ]
+  }
+}

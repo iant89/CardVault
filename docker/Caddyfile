@@ -1,0 +1,11 @@
+# Optional HTTPS front door (`docker compose --profile https up -d`).
+# Phone cameras require HTTPS on anything other than localhost.
+# `tls internal` uses Caddy's own local CA: install its root certificate on
+# each family device once (see README → HTTPS).
+{$CARDVAULT_HOST:cardvault.home} {
+  tls internal
+  encode zstd gzip
+  reverse_proxy web:80 {
+    flush_interval -1
+  }
+}

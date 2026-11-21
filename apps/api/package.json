@@ -1,0 +1,32 @@
+{
+  "name": "@cardvault/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "user:create": "tsx src/cli/create-user.ts"
+  },
+  "dependencies": {
+    "@cardvault/card-model": "workspace:*",
+    "@cardvault/config": "workspace:*",
+    "@cardvault/database": "workspace:*",
+    "@cardvault/imaging": "workspace:*",
+    "@cardvault/jobs": "workspace:*",
+    "@cardvault/shared": "workspace:*",
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/helmet": "^13.0.2",
+    "@fastify/multipart": "^9.3.0",
+    "@fastify/rate-limit": "^10.3.0",
+    "@node-rs/argon2": "^2.0.2",
+    "fastify": "^5.6.1",
+    "ioredis": "^5.11.1",
+    "postgres": "^3.4.9",
+    "zod": "^4.1.12"
+  }
+}
