@@ -67,6 +67,8 @@ export default function QueuePage() {
   const [scope, setScope] = useState<'mine' | 'all'>('mine');
   const [all, setAll] = useState<JobDTO[] | null>(null);
   const pending = useOfflineQueue((s) => s.items);
+  const retryUpload = useOfflineQueue((s) => s.retry);
+  const discardUpload = useOfflineQueue((s) => s.discard);
 
   useEffect(() => {
     if (scope === 'all') void api.get<{ jobs: JobDTO[] }>('/api/jobs?scope=all&limit=300').then((r) => setAll(r.jobs));
@@ -136,6 +138,22 @@ export default function QueuePage() {
           <div className="faint" style={{ fontSize: 14 }}>
             These scans are stored on this device and will upload automatically when the server is reachable.
           </div>
+          {pending.map((p) => (
+            <div key={p.id} className="row between" style={{ gap: 8, padding: '10px 0', borderTop: '1px solid var(--line)' }}>
+              <div style={{ minWidth: 0 }}>
+                <strong className="truncate">{new Date(p.capturedAt).toLocaleString()}</strong>
+                <div className="faint" style={{ fontSize: 13 }}>
+                  {p.status}
+                  {p.error ? ` — ${p.error}` : ''}
+                  {p.attempts ? ` (attempt ${p.attempts})` : ''}
+                </div>
+              </div>
+              <div className="row" style={{ gap: 6, flexShrink: 0 }}>
+                <button className="btn sm" onClick={() => void retryUpload(p.id)}>Retry</button>
+                <button className="btn sm ghost" onClick={() => void discardUpload(p.id)}>Discard</button>
+              </div>
+            </div>
+          ))}
         </div>
       )}
       {section('Processing', groups.processing, '●')}

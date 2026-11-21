@@ -25,6 +25,79 @@ else
   BOLD=''; DIM=''; RESET=''; RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; WHITE=''
 fi
 
+# ---------------------------------------------------------------------------
+# Console layout: the last terminal row is reserved for the overall status bar.
+# A scroll region keeps every other message above it, so text can never paint
+# over the bar and the bar can never paint over text.
+# ---------------------------------------------------------------------------
+TTY_DEV=''
+TERM_ROWS=0
+TERM_COLS=0
+CONTENT_ROWS=0
+STATUS_ROW=0
+TERMINAL_UI=0
+CURRENT_STEP='Idle'
+CURRENT_TASK=''
+
+draw_status() {
+  (( TERMINAL_UI )) || return 0
+  local pct=0 text=${CURRENT_STEP:-Idle} max
+  (( STEP_TOTAL > 0 )) && pct=$(( STEP_NO * 100 / STEP_TOTAL ))
+  if [[ -n ${CURRENT_TASK:-} ]]; then text="${CURRENT_STEP} › ${CURRENT_TASK}"; fi
+  max=$(( TERM_COLS - 46 )); (( max < 8 )) && max=8
+  text=${text:0:$max}
+  printf '\033[s\033[%d;1H\033[2K' "$STATUS_ROW" >"$TTY_DEV"
+  printf ' %s[%d/%d]%s ' "$CYAN" "$STEP_NO" "$STEP_TOTAL" "$RESET" >"$TTY_DEV"
+  { progress_bar "$pct" 20; } >"$TTY_DEV"
+  printf ' %s%3d%%%s  %s%s%s' "$YELLOW" "$pct" "$RESET" "$BOLD" "$text" "$RESET" >"$TTY_DEV"
+  printf '\033[u' >"$TTY_DEV"
+}
+
+init_console() {
+  [[ -t 0 && -t 1 && -n ${TERM:-} && ${TERM:-dumb} != dumb ]] || return 0
+  [[ -e /dev/tty ]] || return 0
+  local size='' rows='' cols=''
+  size=$(stty size </dev/tty 2>/dev/null || true)
+  if [[ -z $size ]]; then
+    rows=$(tput lines 2>/dev/null || true); cols=$(tput cols 2>/dev/null || true)
+    size="${rows:-24} ${cols:-100}"
+  fi
+  rows=${size%% *}; cols=${size##* }
+  [[ $rows =~ ^[0-9]+$ ]] || rows=24
+  [[ $cols =~ ^[0-9]+$ ]] || cols=100
+  (( rows >= 10 )) || return 0
+
+  TTY_DEV=/dev/tty
+  TERM_ROWS=$rows
+  TERM_COLS=$cols
+  STATUS_ROW=$rows
+  CONTENT_ROWS=$(( rows - 1 ))
+  TERMINAL_UI=1
+  printf '\033[1;%dr' "$CONTENT_ROWS" >"$TTY_DEV"
+  printf '\033[H\033[2J' >"$TTY_DEV"
+  draw_status
+}
+
+clear_content() {
+  if (( TERMINAL_UI )); then
+    local i
+    printf '\033[1;%dr' "$CONTENT_ROWS" >"$TTY_DEV"
+    for (( i = 1; i <= CONTENT_ROWS; i++ )); do
+      printf '\033[%d;1H\033[2K' "$i" >"$TTY_DEV"
+    done
+    printf '\033[1;1H' >"$TTY_DEV"
+    draw_status
+  else
+    clear 2>/dev/null || true
+  fi
+}
+
+cleanup_console() {
+  if (( TERMINAL_UI )); then
+    printf '\033[r\033[%d;1H' "$TERM_ROWS" >"$TTY_DEV"
+  fi
+}
+
 ok()   { printf '  %s✔%s %s\n' "$GREEN" "$RESET" "$*"; }
 info() { printf '  %s•%s %s\n' "$CYAN" "$RESET" "$*"; }
 warn() { printf '  %s!%s %s\n' "$YELLOW" "$RESET" "$*"; }
@@ -54,19 +127,31 @@ progress_bar() {
 step() {
   STEP_NO=$((STEP_NO + 1))
   local pct=$(( STEP_NO * 100 / STEP_TOTAL ))
+  CURRENT_STEP="$*"
+  CURRENT_TASK=''
   printf '\n%s[%d/%d]%s %s%s%s\n' "$CYAN" "$STEP_NO" "$STEP_TOTAL" "$RESET" "$BOLD" "$*" "$RESET"
-  printf '  %sOverall%s ' "$DIM" "$RESET"
-  progress_bar "$pct" 24
-  printf ' %3d%%\n' "$pct"
+  if (( TERMINAL_UI )); then
+    draw_status
+  else
+    printf '  %sOverall%s ' "$DIM" "$RESET"
+    progress_bar "$pct" 24
+    printf ' %3d%%\n' "$pct"
+  fi
 }
 
-task() { printf '    %s↳%s %s\n' "$DIM" "$RESET" "$*"; }
+task() {
+  CURRENT_TASK="$*"
+  draw_status
+  printf '    %s↳%s %s\n' "$DIM" "$RESET" "$*"
+}
 
 # Runs a task with an animated progress bar. Set EXPECTED_SECONDS before calling
 # to make the bar fill at a realistic pace; it holds at 95% if a task runs long.
 run() {
   local label=$1 expected=${EXPECTED_SECONDS:-30} start=$SECONDS pid rc=0
   shift
+  CURRENT_TASK="$label"
+  draw_status
   printf '  %s→%s %s\n' "$DIM" "$RESET" "$label"
   if [[ ${CARDVAULT_VERBOSE:-0} == 1 ]]; then
     set +e
@@ -88,6 +173,8 @@ run() {
     if wait "$pid"; then rc=0; else rc=$?; fi
     printf '\r\033[2K'
   fi
+  CURRENT_TASK=''
+  draw_status
   if (( rc == 0 )); then
     ok "$label  ${DIM}($(( SECONDS - start ))s)${RESET}"
   else
@@ -235,11 +322,126 @@ install_packages() {
       ;;
   esac
 
+  if [[ ${HTTPS_ENABLED:-no} == yes ]]; then
+    install_caddy
+  fi
+
   if ! have pnpm || [[ $(pnpm --version 2>/dev/null | cut -d. -f1) -lt 10 ]]; then
     task "Installing the pnpm package manager"
     EXPECTED_SECONDS=60 run "Install pnpm 10" as_root npm install -g pnpm@10.12.1
   fi
   ok "Node $(node -v), pnpm $(pnpm --version), $(pg_config --version 2>/dev/null || echo 'PostgreSQL installed')"
+}
+
+install_caddy() {
+  have caddy && { ok "Caddy already installed"; return; }
+  local sudo_prefix=''
+  [[ $EUID -eq 0 ]] || sudo_prefix=sudo
+  task "Installing Caddy (reverse proxy with local CA)"
+  case $OS_FAMILY in
+    debian)
+      EXPECTED_SECONDS=90 run "Add Caddy repository" bash -c "curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/setup.deb.sh | ${sudo_prefix} bash -"
+      EXPECTED_SECONDS=90 run "Install Caddy" as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy
+      ;;
+    rhel)
+      EXPECTED_SECONDS=90 run "Add Caddy repository" bash -c "curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/setup.rpm.sh | ${sudo_prefix} bash -"
+      EXPECTED_SECONDS=90 run "Install Caddy" as_root dnf install -y -q caddy
+      ;;
+    arch)
+      EXPECTED_SECONDS=90 run "Install Caddy" as_root pacman -S --noconfirm caddy
+      ;;
+  esac
+  have caddy || die "Caddy could not be installed."
+}
+
+ca_source_cert() {
+  local p
+  for p in /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt \
+           /etc/caddy/pki/authorities/local/root.crt \
+           /var/lib/caddy/pki/authorities/local/root.crt; do
+    if [[ -f $p ]]; then printf '%s' "$p"; return; fi
+  done
+}
+
+publish_ca_cert() {
+  local src='' i=''
+  src=$(ca_source_cert)
+  if [[ -z $src && -n ${HTTPS_HOST:-} ]]; then
+    # Caddy creates the internal CA on first TLS handshake — trigger it locally.
+    sleep 1
+    have curl && curl -sk --resolve "${HTTPS_HOST}:443:127.0.0.1" "https://${HTTPS_HOST}/" -o /dev/null 2>/dev/null || true
+    for i in {1..15}; do
+      sleep 1
+      src=$(ca_source_cert)
+      [[ -n $src ]] && break
+    done
+  fi
+  if [[ -z $src ]]; then
+    warn "Caddy's root CA has not been generated yet; run option 18 → 3 again shortly."
+    return 1
+  fi
+  as_root install -d -m 0755 /etc/cardvault/ca
+  as_root install -m 0644 "$src" /etc/cardvault/ca/cardvault-ca.crt
+  ok "CA download ready: http://${HTTPS_HOST:-cardvault.home}/cardvault-ca.crt"
+}
+
+install_https() {
+  [[ ${HTTPS_ENABLED:-no} == yes ]] || return 0
+  [[ -n ${HTTPS_HOST:-} ]] || HTTPS_HOST=cardvault.home
+  task "Writing Caddyfile for ${HTTPS_HOST}"
+  local tmp; tmp=$(mktemp)
+  cat >"$tmp" <<EOF
+# Generated by cardvault-setup. Local CA certificate, no public exposure needed.
+${HTTPS_HOST} {
+    tls internal
+    reverse_proxy 127.0.0.1:${WEB_PORT}
+}
+
+# Onboarding link: plain HTTP on the LAN so phones can fetch the root CA.
+# Everything else on HTTP still redirects to HTTPS.
+http://${HTTPS_HOST}/cardvault-ca.crt {
+    header Content-Type application/x-x509-ca-cert
+    file_server {
+        root /etc/cardvault/ca
+    }
+}
+EOF
+  as_root install -d -m 0755 /etc/caddy
+  as_root install -m 0644 "$tmp" /etc/caddy/Caddyfile
+  rm -f "$tmp"
+  if have_systemd; then as_root systemctl enable --now caddy >/dev/null 2>&1 || true; fi
+  publish_ca_cert || true
+  ok "HTTPS configured at https://${HTTPS_HOST}"
+}
+
+set_https_env() {
+  local enabled=$1 host=${2:-} value
+  if [[ $enabled == yes ]]; then
+    value="https://${host}"
+    sed -i "s|^WEB_ORIGIN=.*|WEB_ORIGIN=${value}|; s|^COOKIE_SECURE=.*|COOKIE_SECURE=true|" "$INSTALL_DIR/.env"
+  else
+    detect_lan
+    value="http://${LAN_HOSTNAME}:${WEB_PORT}"
+    sed -i "s|^WEB_ORIGIN=.*|WEB_ORIGIN=${value}|; s|^COOKIE_SECURE=.*|COOKIE_SECURE=false|" "$INSTALL_DIR/.env"
+  fi
+  ok "WEB_ORIGIN=${value}"
+}
+
+https_instructions() {
+  section "Trusted certificate on your devices"
+  publish_ca_cert || true
+  if [[ ! -f /etc/cardvault/ca/cardvault-ca.crt ]]; then
+    warn "Root certificate not ready yet. Run option 18 → 3 again shortly."
+    return
+  fi
+  printf '  On each phone/tablet, open this link and install the profile:\n'
+  printf '  %shttp://%s/cardvault-ca.crt%s\n' "$CYAN" "${HTTPS_HOST:-cardvault.home}" "$RESET"
+  printf '\n'
+  printf '  iOS: tap the downloaded .crt → Install Profile → enter passcode.\n'
+  printf '       Then Settings → General → About → Certificate Trust Settings\n'
+  printf '       → enable full trust for the CardVault local CA.\n'
+  printf '  Direct file on the server: %s/etc/cardvault/ca/cardvault-ca.crt%s\n' "$DIM" "$RESET"
+  printf '  Then browse %shttps://%s%s and the live camera will work.\n' "$CYAN" "${HTTPS_HOST:-cardvault.home}" "$RESET"
 }
 
 configure_postgres() {
@@ -287,16 +489,57 @@ configure_redis() {
 }
 
 # ---------------------------------------------------------------------------
+# LAN addressing helpers
+# ---------------------------------------------------------------------------
+LAN_HOSTNAME=''
+LAN_FQDN=''
+LAN_IPS=()
+PRIMARY_LAN_IP=''
+
+is_private_ip() {
+  case ${1:-} in
+    10.*|192.168.*) return 0 ;;
+  esac
+  [[ ${1:-} =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]]
+}
+
+detect_lan() {
+  LAN_HOSTNAME=$(hostname -s 2>/dev/null || echo cardvault)
+  LAN_FQDN=$(hostname -f 2>/dev/null || echo "$LAN_HOSTNAME")
+  LAN_IPS=()
+  local ip=''
+  while IFS= read -r ip; do
+    ip=${ip%%/*}
+    [[ -n $ip && $ip =~ ^[0-9]+\. ]] && is_private_ip "$ip" && LAN_IPS+=("$ip")
+  done < <( (hostname -I 2>/dev/null || true) | tr ' ' '\n')
+  if (( ${#LAN_IPS[@]} == 0 )) && have ip; then
+    while IFS= read -r ip; do
+      ip=${ip%%/*}
+      [[ -n $ip ]] && is_private_ip "$ip" && LAN_IPS+=("$ip")
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}')
+  fi
+  PRIMARY_LAN_IP=${LAN_IPS[0]:-}
+}
+
+server_names() {
+  local names=("$LAN_FQDN" "$LAN_HOSTNAME" "${LAN_IPS[@]}" _)
+  printf '%s' "${names[*]}"
+}
+
+# ---------------------------------------------------------------------------
 # Installed-state helpers
 # ---------------------------------------------------------------------------
 write_config() {
-  local dir=$1 branch=$2 user=$3 port=$4
+  local dir=$1 branch=$2 user=$3 port=$4 access=${5:-yes} https=${6:-no} host=${7:-}
   as_root tee "$CONF_FILE" >/dev/null <<EOF
 # Generated by cardvault-setup — safe to edit.
 INSTALL_DIR="${dir}"
 TRACK_BRANCH="${branch}"
 INSTALL_USER="${user}"
 WEB_PORT="${port}"
+LAN_ACCESS="${access}"
+HTTPS_ENABLED="${https}"
+HTTPS_HOST="${host}"
 EOF
 }
 
@@ -305,6 +548,9 @@ load_config() {
   # shellcheck disable=SC1090
   . "$CONF_FILE"
   [[ -n ${INSTALL_DIR:-} && -d $INSTALL_DIR ]] || return 1
+  LAN_ACCESS=${LAN_ACCESS:-yes}
+  HTTPS_ENABLED=${HTTPS_ENABLED:-no}
+  HTTPS_HOST=${HTTPS_HOST:-}
 }
 
 env_get() {
@@ -337,7 +583,7 @@ find_install() {
       WEB_PORT=$(grep -s '^WEB_PORT=' "$guess/.env" | tail -n1 | cut -d= -f2-)
       [[ -n $WEB_PORT ]] || WEB_PORT=8080
       info "Adopting existing installation at ${INSTALL_DIR}"
-      write_config "$INSTALL_DIR" "$TRACK_BRANCH" "$INSTALL_USER" "$WEB_PORT"
+      write_config "$INSTALL_DIR" "$TRACK_BRANCH" "$INSTALL_USER" "$WEB_PORT" "${LAN_ACCESS:-yes}" "${HTTPS_ENABLED:-no}" "${HTTPS_HOST:-}"
       return 0
     fi
   done
@@ -406,12 +652,16 @@ EOF
 
 install_nginx() {
   have nginx || return 0
+  detect_lan
   local tmp; tmp=$(mktemp)
+  local names; names=$(server_names)
+  local listen="${WEB_PORT}"
+  [[ ${HTTPS_ENABLED:-no} == yes ]] && listen="127.0.0.1:${WEB_PORT}"
   cat >"$tmp" <<EOF
 # Generated by cardvault-setup. Local-network only.
 server {
-    listen ${WEB_PORT};
-    server_name _;
+    listen ${listen};
+    server_name ${names};
     root ${INSTALL_DIR}/apps/web/dist;
     client_max_body_size 20m;
     server_tokens off;
@@ -485,32 +735,165 @@ stop_services() {
 
 restart_services() { stop_services; sleep 1; start_services; }
 
+services_running() {
+  if have_systemd && [[ -f /etc/systemd/system/cardvault-api.service ]]; then
+    local unit
+    for unit in cardvault-api cardvault-worker; do
+      systemctl is-active --quiet "$unit" 2>/dev/null && return 0
+    done
+  else
+    local p
+    for p in api worker; do
+      if [[ -f $INSTALL_DIR/$p.pid ]]; then
+        kill -0 "$(cat "$INSTALL_DIR/$p.pid" 2>/dev/null)" 2>/dev/null && return 0
+      fi
+    done
+  fi
+  return 1
+}
+
 enable_boot() {
   have_systemd || { warn "Boot start requires systemd; skipping."; return; }
-  as_root systemctl enable cardvault-api cardvault-worker nginx postgresql redis-server >/dev/null 2>&1 || true
+  as_root systemctl enable cardvault-api cardvault-worker nginx postgresql redis-server cardvault-lan.service >/dev/null 2>&1 || true
+  [[ ${HTTPS_ENABLED:-no} == yes ]] && as_root systemctl enable caddy >/dev/null 2>&1 || true
   ok "Services enabled at boot"
 }
 
-configure_firewall() {
+lan_rich_rule() {
+  printf 'rule family="ipv4" source address="%s" port port="%s" protocol="tcp" accept' "$1" "$2"
+}
+
+lan_ports() {
+  local ports="$WEB_PORT"
+  [[ ${HTTPS_ENABLED:-no} == yes ]] && ports="$ports 443 80"
+  printf '%s' "$ports"
+}
+
+firewall_active() {
   if have ufw && as_root ufw status 2>/dev/null | grep -q '^Status: active'; then
-    if ask "Allow LAN devices to reach port ${WEB_PORT} through ufw?" y; then
-      for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
-        as_root ufw allow from "$net" to any port "$WEB_PORT" proto tcp comment 'CardVault LAN' >/dev/null 2>&1 || true
-      done
-      ok "LAN access allowed on port ${WEB_PORT} (private ranges only)"
-    fi
+    printf 'ufw'
+  elif have firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
+    printf 'firewalld'
   fi
+}
+
+configure_firewall() {
+  [[ ${LAN_ACCESS:-yes} == yes ]] || return 0
+  local net port rule fw ports
+  ports=$(lan_ports)
+  fw=$(firewall_active)
+  if [[ $fw == ufw ]]; then
+    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+      for port in $ports; do
+        as_root ufw allow from "$net" to any port "$port" proto tcp comment 'CardVault LAN' >/dev/null 2>&1 || true
+      done
+    done
+    ok "ufw: LAN access allowed on ports ${ports}"
+  elif [[ $fw == firewalld ]]; then
+    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+      for port in $ports; do
+        rule=$(lan_rich_rule "$net" "$port")
+        as_root firewall-cmd --permanent --add-rich-rule="$rule" >/dev/null 2>&1 || true
+      done
+    done
+    as_root firewall-cmd --reload >/dev/null 2>&1 || true
+    ok "firewalld: LAN access allowed on ports ${ports}"
+  else
+    info "No active host firewall detected; ports ${ports} are open locally."
+  fi
+}
+
+remove_firewall_rules() {
+  local net port rule fw ports
+  ports=$(lan_ports)
+  fw=$(firewall_active)
+  if [[ $fw == ufw ]]; then
+    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+      for port in $ports; do
+        as_root ufw delete allow from "$net" to any port "$port" proto tcp >/dev/null 2>&1 || true
+      done
+    done
+  elif [[ $fw == firewalld ]]; then
+    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+      for port in $ports; do
+        rule=$(lan_rich_rule "$net" "$port")
+        as_root firewall-cmd --permanent --remove-rich-rule="$rule" >/dev/null 2>&1 || true
+      done
+    done
+    as_root firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+install_lan_unit() {
+  have_systemd || return 0
+  if [[ ! -x $MGR ]]; then
+    warn "Management console not installed; skipping the boot LAN refresh unit."
+    return 0
+  fi
+  as_root tee /etc/systemd/system/cardvault-lan.service >/dev/null <<EOF
+[Unit]
+Description=Refresh CardVault LAN hostname, IPs and firewall rules
+After=network-online.target
+Before=nginx.service cardvault-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${MGR} --refresh-lan
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  as_root systemctl daemon-reload
+  if [[ ${LAN_ACCESS:-yes} == yes ]]; then
+    as_root systemctl enable cardvault-lan.service >/dev/null 2>&1 || true
+  else
+    as_root systemctl disable cardvault-lan.service >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_web_origin() {
+  detect_lan
+  local current; current=$(env_get WEB_ORIGIN)
+  if [[ -z $current || $current == http://localhost:* || $current == http://127.0.0.1:* ]]; then
+    local value="http://${LAN_HOSTNAME}:${WEB_PORT}"
+    sed -i "s|^WEB_ORIGIN=.*|WEB_ORIGIN=${value}|" "$INSTALL_DIR/.env"
+    ok "WEB_ORIGIN set to ${value}"
+  fi
+}
+
+refresh_lan() {
+  detect_lan
+  task "Refreshing LAN names and firewall rules"
+  ensure_web_origin
+  install_nginx
+  configure_firewall
+  if have_systemd && systemctl is-active --quiet nginx 2>/dev/null; then
+    as_root systemctl reload nginx >/dev/null 2>&1 || as_root systemctl restart nginx >/dev/null 2>&1 || true
+  fi
+  ok "Listening on http://${LAN_HOSTNAME}:${WEB_PORT}"
+  [[ -n $PRIMARY_LAN_IP ]] && ok "Also available at http://${PRIMARY_LAN_IP}:${WEB_PORT}"
 }
 
 service_status() {
   printf '  %-28s %s\n' 'SERVICE' 'STATUS'
-  for s in cardvault-api cardvault-worker nginx postgresql redis-server; do
+  for s in cardvault-api cardvault-worker nginx caddy postgresql redis-server; do
     local state='n/a'
     if have_systemd; then state=$(systemctl is-active "$s" 2>/dev/null || true); fi
     if [[ $state == active ]]; then printf '  %-28s %s%s%s\n' "$s" "$GREEN" "$state" "$RESET"
     else printf '  %-28s %s%s%s\n' "$s" "$YELLOW" "${state:-not installed}" "$RESET"; fi
   done
-  printf '\n  %sURL:%s http://localhost:%s\n' "$DIM" "$RESET" "$WEB_PORT"
+  detect_lan
+  printf '\n  %sURLs:%s\n' "$DIM" "$RESET"
+  if [[ ${HTTPS_ENABLED:-no} == yes ]]; then
+    printf '  • https://%s\n' "${HTTPS_HOST:-cardvault.home}"
+    printf '  • http://127.0.0.1:%s (local proxy only)\n' "$WEB_PORT"
+  else
+    printf '  • http://localhost:%s\n' "$WEB_PORT"
+    printf '  • http://%s:%s\n' "$LAN_HOSTNAME" "$WEB_PORT"
+    [[ -n $PRIMARY_LAN_IP ]] && printf '  • http://%s:%s\n' "$PRIMARY_LAN_IP" "$WEB_PORT"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -541,6 +924,14 @@ fresh_install() {
 
   local boot=no
   ask "Start CardVault automatically on boot?" n && boot=yes
+  LAN_ACCESS=yes
+  ask "Allow other devices on your LAN to use CardVault?" y || LAN_ACCESS=no
+  HTTPS_ENABLED=no
+  HTTPS_HOST=''
+  if ask "Set up HTTPS with a local certificate (needed for the live phone camera)?" y; then
+    HTTPS_ENABLED=yes
+    HTTPS_HOST=$(prompt_value "Hostname for HTTPS (must resolve on your LAN)" "${LAN_FQDN:-cardvault.home}")
+  fi
 
   STEP_TOTAL=8
   step "Preparing system"
@@ -584,7 +975,17 @@ fresh_install() {
   mkdir -p "$INSTALL_DIR/storage" "$INSTALL_DIR/backups"
 
   step "Writing configuration"
+  task "Detecting this PC's hostname and LAN IP addresses"
+  detect_lan
+  ok "Host: ${LAN_HOSTNAME}${PRIMARY_LAN_IP:+  •  LAN IP: ${PRIMARY_LAN_IP}}"
   task "Generating session secret and database password"
+  if [[ ${HTTPS_ENABLED:-no} == yes && -n ${HTTPS_HOST:-} ]]; then
+    WEB_ORIGIN_VALUE="https://${HTTPS_HOST}"
+    COOKIE_VALUE=true
+  else
+    WEB_ORIGIN_VALUE="http://${LAN_HOSTNAME}:${WEB_PORT}"
+    COOKIE_VALUE=false
+  fi
   task "Writing ${INSTALL_DIR}/.env"
   cat >"$INSTALL_DIR/.env.tmp" <<EOF
 NODE_ENV=production
@@ -594,8 +995,8 @@ SESSION_SECRET=${SESSION_SECRET}
 STORAGE_DIR=${INSTALL_DIR}/storage
 API_PORT=3000
 API_HOST=127.0.0.1
-COOKIE_SECURE=false
-WEB_ORIGIN=http://localhost:${WEB_PORT}
+COOKIE_SECURE=${COOKIE_VALUE}
+WEB_ORIGIN=${WEB_ORIGIN_VALUE}
 WEB_PORT=${WEB_PORT}
 ADMIN_USERNAME=${ADMIN_USERNAME}
 ADMIN_PASSWORD=${ADMIN_PASSWORD}
@@ -608,7 +1009,7 @@ EOF
   chmod 600 "$INSTALL_DIR/.env"
   as_root chown "$INSTALL_USER" "$INSTALL_DIR/.env"
   printf 'installed=%s\nbranch=%s\nport=%s\n' "$(date -Iseconds)" "$TRACK_BRANCH" "$WEB_PORT" > "$INSTALL_DIR/.cardvault-installed"
-  write_config "$INSTALL_DIR" "$TRACK_BRANCH" "$INSTALL_USER" "$WEB_PORT"
+  write_config "$INSTALL_DIR" "$TRACK_BRANCH" "$INSTALL_USER" "$WEB_PORT" "${LAN_ACCESS:-yes}" "${HTTPS_ENABLED:-no}" "${HTTPS_HOST:-}"
   ok "Configuration saved to ${INSTALL_DIR}/.env"
 
   step "Installing application and building"
@@ -629,13 +1030,19 @@ EOF
   step "Installing services and web server"
   task "Writing systemd units"
   install_units
-  task "Configuring nginx on port ${WEB_PORT}"
+  task "Configuring nginx on port ${WEB_PORT} for ${LAN_HOSTNAME} and LAN IPs"
   install_nginx
+  if [[ ${HTTPS_ENABLED:-no} == yes ]]; then
+    task "Configuring Caddy for https://${HTTPS_HOST}"
+    install_https
+  fi
   if [[ -n $SCRIPT_PATH ]]; then
     install_manager "$SCRIPT_PATH"
   else
     warn "Started via a pipe, so no manager copy was installed. Save this script and run it again to get '${MGR}'."
   fi
+  task "Installing the boot-time LAN refresh"
+  install_lan_unit
 
   step "Starting CardVault"
   if [[ $boot == yes ]]; then task "Enabling services at boot"; enable_boot; fi
@@ -651,7 +1058,11 @@ EOF
   ok "CardVault is running at http://localhost:${WEB_PORT}"
   info "On other devices: http://$(hostname -I 2>/dev/null | awk '{print $1}'):${WEB_PORT}"
   info "Management console: ${MGR}"
-  info "Phone camera: use HTTPS or 'Upload photo instead' on plain HTTP."
+  if [[ ${HTTPS_ENABLED:-no} == yes ]]; then
+    info "Live phone camera: https://${HTTPS_HOST}"
+  else
+    info "Phone camera: use HTTPS or 'Upload photo instead' on plain HTTP."
+  fi
   pause
 }
 
@@ -691,7 +1102,7 @@ do_upgrade() {
   run "Update dependencies" bash -c "cd '$INSTALL_DIR' && pnpm install --frozen-lockfile"
   run "Rebuild application" bash -c "cd '$INSTALL_DIR' && pnpm build"
   run "Apply migrations" bash -c "cd '$INSTALL_DIR' && pnpm db:migrate && pnpm db:seed"
-  write_config "$INSTALL_DIR" "$branch" "$INSTALL_USER" "$WEB_PORT"
+  write_config "$INSTALL_DIR" "$branch" "$INSTALL_USER" "$WEB_PORT" "${LAN_ACCESS:-yes}" "${HTTPS_ENABLED:-no}" "${HTTPS_HOST:-}"
   install_nginx
   if [[ -f $INSTALL_DIR/scripts/install.sh ]]; then install_manager "$INSTALL_DIR/scripts/install.sh"; fi
   restart_services
@@ -893,12 +1304,175 @@ show_info() {
   pause
 }
 
+lan_menu() {
+  section "LAN access"
+  detect_lan
+  printf '  %-14s %s\n' 'Hostname:' "$LAN_HOSTNAME"
+  printf '  %-14s %s\n' 'FQDN:' "$LAN_FQDN"
+  if (( ${#LAN_IPS[@]} )); then
+    local i
+    for i in "${LAN_IPS[@]}"; do printf '  %-14s %s\n' 'LAN IP:' "$i"; done
+  else
+    warn "No private LAN IP detected."
+  fi
+  printf '\n  %sAddresses to use from other devices:%s\n' "$BOLD" "$RESET"
+  printf '  • http://%s:%s\n' "$LAN_HOSTNAME" "$WEB_PORT"
+  [[ -n $PRIMARY_LAN_IP ]] && printf '  • http://%s:%s\n' "$PRIMARY_LAN_IP" "$WEB_PORT"
+  printf '\n'
+  printf '  %s 1)%s Refresh addresses, firewall and nginx now\n' "$CYAN" "$RESET"
+  printf '  %s 2)%s Enable LAN access (firewall + boot refresh)\n' "$CYAN" "$RESET"
+  printf '  %s 3)%s Disable LAN firewall rules / boot refresh\n' "$CYAN" "$RESET"
+  printf '  %s 4)%s Set WEB_ORIGIN to the hostname\n' "$CYAN" "$RESET"
+  printf '  %s 5)%s Set WEB_ORIGIN to the LAN IP\n' "$CYAN" "$RESET"
+  printf '  %s 0)%s Back\n\n' "$CYAN" "$RESET"
+  local c; c=$(prompt_value "Select an option" 0)
+  case $c in
+    1) refresh_lan; restart_services; ok "Refreshed." ;;
+    2)
+      LAN_ACCESS=yes
+      write_config "$INSTALL_DIR" "$TRACK_BRANCH" "$INSTALL_USER" "$WEB_PORT" "$LAN_ACCESS" "${HTTPS_ENABLED:-no}" "${HTTPS_HOST:-}"
+      install_lan_unit
+      configure_firewall
+      refresh_lan
+      restart_services
+      ok "LAN access enabled."
+      ;;
+    3)
+      LAN_ACCESS=no
+      write_config "$INSTALL_DIR" "$TRACK_BRANCH" "$INSTALL_USER" "$WEB_PORT" "$LAN_ACCESS" "${HTTPS_ENABLED:-no}" "${HTTPS_HOST:-}"
+      install_lan_unit
+      remove_firewall_rules
+      ok "LAN boot refresh disabled and firewall rules removed. nginx still serves on port ${WEB_PORT}."
+      ;;
+    4)
+      if [[ ${HTTPS_ENABLED:-no} == yes && -n ${HTTPS_HOST:-} ]]; then
+        set_https_env yes "$HTTPS_HOST"
+      else
+        sed -i "s|^WEB_ORIGIN=.*|WEB_ORIGIN=http://${LAN_HOSTNAME}:${WEB_PORT}|" "$INSTALL_DIR/.env"
+        ok "WEB_ORIGIN is now http://${LAN_HOSTNAME}:${WEB_PORT}"
+      fi
+      restart_services
+      ;;
+    5)
+      if [[ ${HTTPS_ENABLED:-no} == yes ]]; then
+        warn "HTTPS uses the configured hostname. Use menu 18 to change it."
+        pause
+        return
+      fi
+      [[ -n $PRIMARY_LAN_IP ]] || { warn "No LAN IP detected."; pause; return; }
+      sed -i "s|^WEB_ORIGIN=.*|WEB_ORIGIN=http://${PRIMARY_LAN_IP}:${WEB_PORT}|" "$INSTALL_DIR/.env"
+      restart_services
+      ok "WEB_ORIGIN is now http://${PRIMARY_LAN_IP}:${WEB_PORT}"
+      ;;
+    0) return ;;
+    *) warn "Unknown option: ${c}" ;;
+  esac
+  pause
+}
+
+lan_diagnose() {
+  section "Network diagnostics"
+  detect_lan
+  printf '  %-14s %s\n' 'Hostname:' "$LAN_HOSTNAME"
+  printf '  %-14s %s\n' 'FQDN:' "$LAN_FQDN"
+  printf '  %-14s %s\n' 'LAN IPs:' "${LAN_IPS[*]:-none detected}"
+  printf '  %-14s %s\n' 'Web port:' "$WEB_PORT"
+
+  printf '\n  %sListening sockets:%s\n' "$BOLD" "$RESET"
+  if have ss; then
+    if ss -tlnp 2>/dev/null | grep -E "[:.]${WEB_PORT}([[:space:]]|$)"; then :; else warn "Nothing is listening on port ${WEB_PORT}."; fi
+  elif have netstat; then
+    if netstat -tlnp 2>/dev/null | grep -E "[:.]${WEB_PORT}([[:space:]]|$)"; then :; else warn "Nothing is listening on port ${WEB_PORT}."; fi
+  else
+    info "Install iproute2/net-tools to inspect listening sockets."
+  fi
+
+  printf '\n  %sServices:%s\n' "$BOLD" "$RESET"
+  local s state
+  for s in nginx cardvault-api cardvault-worker; do
+    state='unknown'
+    if have_systemd; then state=$(systemctl is-active "$s" 2>/dev/null || true); fi
+    if [[ $state == active ]]; then printf '  %-20s %s%s%s\n' "$s" "$GREEN" "$state" "$RESET"
+    else printf '  %-20s %s%s%s\n' "$s" "$YELLOW" "${state:-inactive}" "$RESET"; fi
+  done
+
+  printf '\n  %sFirewall:%s\n' "$BOLD" "$RESET"
+  local fw; fw=$(firewall_active)
+  if [[ -z $fw ]]; then
+    info "No active host firewall detected."
+  else
+    printf '  %-20s %s\n' 'Active firewall:' "$fw"
+    if [[ $fw == ufw ]]; then
+      if as_root ufw status 2>/dev/null | grep -q "$WEB_PORT"; then
+        ok "ufw has a rule mentioning port ${WEB_PORT}"
+      else
+        warn "ufw has no rule for port ${WEB_PORT}. Use menu 16 → 2."
+      fi
+    else
+      if as_root firewall-cmd --list-rich-rules 2>/dev/null | grep -q "$WEB_PORT"; then
+        ok "firewalld has a rule for port ${WEB_PORT}"
+      else
+        warn "firewalld has no rule for port ${WEB_PORT}. Use menu 16 → 2."
+      fi
+    fi
+  fi
+
+  printf '\n  %sTry from another device:%s\n' "$BOLD" "$RESET"
+  [[ -z $PRIMARY_LAN_IP ]] || printf '  • http://%s:%s\n' "$PRIMARY_LAN_IP" "$WEB_PORT"
+  printf '  • http://%s:%s\n' "$LAN_HOSTNAME" "$WEB_PORT"
+  info "If nothing is listening, start services from menu option 2."
+  pause
+}
+
+https_menu() {
+  section "HTTPS (local CA)"
+  if [[ ${HTTPS_ENABLED:-no} == yes ]]; then
+    ok "Enabled at https://${HTTPS_HOST:-cardvault.home}"
+  else
+    info "HTTPS is currently disabled."
+  fi
+  printf '\n'
+  printf '  %s 1)%s Enable HTTPS (Caddy + local CA)\n' "$CYAN" "$RESET"
+  printf '  %s 2)%s Disable HTTPS (back to plain HTTP)\n' "$CYAN" "$RESET"
+  printf '  %s 3)%s Show certificate install instructions\n' "$CYAN" "$RESET"
+  printf '  %s 0)%s Back\n\n' "$CYAN" "$RESET"
+  local c; c=$(prompt_value "Select an option" 0)
+  case $c in
+    1)
+      install_caddy
+      HTTPS_ENABLED=yes
+      HTTPS_HOST=$(prompt_value "Hostname for HTTPS (must resolve on your LAN)" "${HTTPS_HOST:-cardvault.home}")
+      set_https_env yes "$HTTPS_HOST"
+      install_nginx
+      install_https
+      configure_firewall
+      write_config "$INSTALL_DIR" "$TRACK_BRANCH" "$INSTALL_USER" "$WEB_PORT" "$LAN_ACCESS" "$HTTPS_ENABLED" "$HTTPS_HOST"
+      restart_services
+      https_instructions
+      ;;
+    2)
+      HTTPS_ENABLED=yes remove_firewall_rules
+      HTTPS_ENABLED=no
+      set_https_env no
+      install_nginx
+      write_config "$INSTALL_DIR" "$TRACK_BRANCH" "$INSTALL_USER" "$WEB_PORT" "$LAN_ACCESS" "$HTTPS_ENABLED" "${HTTPS_HOST:-}"
+      if have_systemd; then as_root systemctl disable --now caddy >/dev/null 2>&1 || true; fi
+      restart_services
+      ok "HTTPS disabled. Plain HTTP is back on port ${WEB_PORT}."
+      ;;
+    3) https_instructions ;;
+    0) return ;;
+    *) warn "Unknown option: ${c}" ;;
+  esac
+  pause
+}
+
 # ---------------------------------------------------------------------------
 # Menu
 # ---------------------------------------------------------------------------
 menu() {
   while true; do
-    clear 2>/dev/null || true
+    clear_content
     banner
     section "CardVault management console"
     printf '  %s 1)%s Service status / URL\n' "$CYAN" "$RESET"
@@ -918,6 +1492,9 @@ menu() {
     printf '  %s13)%s Edit configuration (.env)\n' "$CYAN" "$RESET"
     printf '  %s14)%s Check for updates / upgrade\n' "$CYAN" "$RESET"
     printf '  %s15)%s Installation details\n' "$CYAN" "$RESET"
+    printf '  %s16)%s LAN access / addresses\n' "$CYAN" "$RESET"
+    printf '  %s17)%s Network diagnostics\n' "$CYAN" "$RESET"
+    printf '  %s18)%s HTTPS (local certificate)\n' "$CYAN" "$RESET"
     printf '\n'
     printf '  %s 0)%s Exit\n\n' "$CYAN" "$RESET"
     local c; c=$(prompt_value "Select an option" 0)
@@ -937,7 +1514,16 @@ menu() {
       13) edit_config ;;
       14) check_for_updates; pause ;;
       15) show_info ;;
-      0) section 'Goodbye'; ok 'CardVault is left running in the background.'; exit 0 ;;
+      16) lan_menu ;;
+      0)
+        section 'Goodbye'
+        if services_running; then
+          ok 'CardVault is left running in the background.'
+        else
+          info 'CardVault services are stopped.'
+        fi
+        exit 0
+        ;;
       *) warn "Unknown option: ${c}" ;;
     esac
   done
@@ -948,9 +1534,17 @@ menu() {
 # ---------------------------------------------------------------------------
 trap 'rc=$?; [[ $rc -eq 0 ]] || err "Unexpected failure (exit ${rc}) at line ${LINENO}"' ERR
 trap 'printf "\n"; warn "Interrupted."; exit 130' INT
+trap cleanup_console EXIT
 
 main() {
   case ${1:-} in
+    --refresh-lan)
+      init_console
+      detect_os
+      ensure_sudo
+      if find_install; then refresh_lan; else warn "No CardVault installation found."; fi
+      exit 0
+      ;;
     -h|--help)
       banner
       cat <<EOF
@@ -958,6 +1552,7 @@ Usage: cardvault-setup [options]
 
 Options:
   -h, --help    Show this help
+  --refresh-lan Refresh hostname/IP/nginx/firewall (used by the boot unit)
 
 Environment overrides:
   CARDVAULT_REPO   Git URL to clone (default: ${REPO})
@@ -973,6 +1568,7 @@ EOF
       ;;
   esac
 
+  init_console
   detect_os
   ensure_sudo
 

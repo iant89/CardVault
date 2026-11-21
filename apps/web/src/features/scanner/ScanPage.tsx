@@ -63,8 +63,33 @@ function Meter({ label, value, good, text }: { label: string; value: number; goo
   );
 }
 
+/** iOS often hands us HEIC; convert to a modest JPEG the API can always decode. */
+async function preparePhoto(f: File): Promise<Blob> {
+  if (f.type === 'image/jpeg' || f.size > 60_000_000) return f;
+  const url = URL.createObjectURL(f);
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const max = 1600;
+    const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    c.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    c.getContext('2d')!.drawImage(img, 0, 0, c.width, c.height);
+    const blob = await new Promise<Blob | null>((r) => c.toBlob(r, 'image/jpeg', 0.92));
+    return blob ?? f;
+  } catch {
+    // Older browsers may not decode the selected type — let the server try it.
+    return f;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 export default function ScanPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const vpRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -377,12 +402,22 @@ export default function ScanPage() {
                   : 'READY';
 
   const onFile = async (f: File) => {
-    const localId = await add(f, { gameHint: game || undefined, quality: { source: 'file' } });
-    toast('Captured', 'success');
-    if (!batch && localId) {
-      stopCamera();
-      setCamState('paused');
-      setCaptured({ localId, url: URL.createObjectURL(f) });
+    try {
+      toast('Preparing photo…', 'info');
+      const blob = await preparePhoto(f);
+      const localId = await add(blob, { gameHint: game || undefined, quality: { source: 'file' } });
+      if (!localId) {
+        toast('Not signed in — sign in again and retry.', 'error');
+        return;
+      }
+      toast('Captured — uploading now', 'success');
+      if (!batch) {
+        stopCamera();
+        setCamState('paused');
+        setCaptured({ localId, url: URL.createObjectURL(blob) });
+      }
+    } catch (e) {
+      toast(e instanceof Error ? `Photo failed: ${e.message}` : 'Photo failed', 'error');
     }
   };
 
@@ -526,10 +561,20 @@ export default function ScanPage() {
                   </div>
                 </div>
               </details>
-              <label className="btn" style={{ width: '100%' }}>
+              <button className="btn" style={{ width: '100%' }} onClick={() => fileInputRef.current?.click()}>
                 ⇪ Upload photo instead
-                <input type="file" accept="image/*" capture="environment" hidden onChange={(e) => e.target.files?.[0] && void onFile(e.target.files[0])} />
-              </label>
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                hidden
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = ''; // allow picking the same photo again
+                  if (f) void onFile(f);
+                }}
+              />
             </div>
           </div>
         </div>
@@ -597,7 +642,9 @@ function SingleResult({
                 ? IDENTIFIED.includes(scan.status)
                   ? `${STATUS_LABEL[scan.status]}${scan.confidence != null ? ` · ${(scan.confidence * 100).toFixed(0)}% match` : ''}`
                   : STATUS_LABEL[scan.status]
-                : 'Saved on this device — it uploads automatically.'}
+                : pending?.error
+                    ? `Waiting to upload: ${pending.error}`
+                    : 'Saved on this device — it uploads automatically.'}
         </div>
         <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
           {dup ? (

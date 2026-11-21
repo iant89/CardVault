@@ -51,12 +51,14 @@ cd CardVault
 bash scripts/install.sh
 ```
 
-The script asks for the admin password and whether to start services on boot. It detects an existing installation on later runs, offers an upgrade when the tracked branch has new commits, and otherwise opens a menu for:
+The script asks for the admin password, whether to start services on boot, whether to allow LAN devices, and whether to set up HTTPS with a local CA (needed for the live phone camera). It detects an existing installation on later runs, offers an upgrade when the tracked branch has new commits, and otherwise opens a menu for:
 
 - service status / start / stop / restart / live logs
 - export, import or clear the database
 - export or import stored card images
 - change a user password, create a user, edit `.env`
+- view the PC's hostname and LAN IPs, refresh them, and enable/disable LAN firewall rules at boot
+- enable/disable HTTPS with Caddy, publish the root CA at `http://<hostname>/cardvault-ca.crt` over LAN HTTP, and print the phone install instructions
 
 Reopen the console at any time with:
 
@@ -66,7 +68,9 @@ sudo cardvault-setup
 
 If CardVault is already installed, the script goes straight to the menu. If it isn't, it simply asks whether you want to install it. Use menu option 14 to check for upgrades.
 
-Defaults can be overridden with `CARDVAULT_REPO`, `CARDVAULT_BRANCH`, `CARDVAULT_DIR`, `CARDVAULT_PORT` and `CARDVAULT_USER`. The installer shows a step counter, overall progress bar and per-task progress bars; full command output is written to `/tmp/cardvault-setup.log`, and `CARDVAULT_VERBOSE=1` streams it live instead. Backups written by the menu land in `/opt/cardvault/backups`.
+nginx listens on all interfaces and is configured with the PC's hostname and private LAN IP addresses, so other devices can open `http://<hostname>:8080` or `http://<lan-ip>:8080`. A `cardvault-lan.service` unit refreshes those names and the firewall rules at boot (when LAN access was accepted during install). Use menu option 16 to change this later, option 17 for network diagnostics (listening port, services, firewall rules), and option 18 to enable/disable HTTPS. Both `ufw` and `firewalld` are supported.
+
+Defaults can be overridden with `CARDVAULT_REPO`, `CARDVAULT_BRANCH`, `CARDVAULT_DIR`, `CARDVAULT_PORT` and `CARDVAULT_USER`. The installer pins the overall progress bar to the bottom row of the terminal, with steps and tasks scrolling above it, and shows a per-task bar for long commands. Full command output is written to `/tmp/cardvault-setup.log`, and `CARDVAULT_VERBOSE=1` streams it live instead. Backups written by the menu land in `/opt/cardvault/backups`.
 
 ---
 
