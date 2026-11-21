@@ -66,7 +66,7 @@ sudo cardvault-setup
 
 If CardVault is already installed, the script goes straight to the menu. If it isn't, it simply asks whether you want to install it. Use menu option 14 to check for upgrades.
 
-Defaults can be overridden with `CARDVAULT_REPO`, `CARDVAULT_BRANCH`, `CARDVAULT_DIR`, `CARDVAULT_PORT` and `CARDVAULT_USER`. Backups written by the menu land in `/opt/cardvault/backups`.
+Defaults can be overridden with `CARDVAULT_REPO`, `CARDVAULT_BRANCH`, `CARDVAULT_DIR`, `CARDVAULT_PORT` and `CARDVAULT_USER`. The installer shows a step counter, overall progress bar and per-task progress bars; full command output is written to `/tmp/cardvault-setup.log`, and `CARDVAULT_VERBOSE=1` streams it live instead. Backups written by the menu land in `/opt/cardvault/backups`.
 
 ---
 
