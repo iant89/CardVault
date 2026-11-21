@@ -1,0 +1,127 @@
+# CardVault — home server stack.
+#   docker compose up -d                    → http://<server>:8080
+#   docker compose --profile https up -d    → https://cardvault.home (Caddy)
+#   docker compose --profile backup up -d   → nightly DB / weekly image backups
+# PostgreSQL, Redis and the worker are never exposed outside the Docker network.
+
+x-app-env: &app-env
+  NODE_ENV: production
+  DATABASE_URL: postgres://cardvault:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/cardvault
+  REDIS_URL: redis://redis:6379
+  SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+  STORAGE_DIR: /data/storage
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  WEB_ORIGIN: ${WEB_ORIGIN:-http://cardvault.local:8080}
+  ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+  POKEMONTCG_API_KEY: ${POKEMONTCG_API_KEY:-}
+  EBAY_CLIENT_ID: ${EBAY_CLIENT_ID:-}
+  EBAY_CLIENT_SECRET: ${EBAY_CLIENT_SECRET:-}
+  EBAY_MARKETPLACE_ID: ${EBAY_MARKETPLACE_ID:-EBAY_US}
+  CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT:-CardVault/0.1 (self-hosted personal collection tool)}
+  RESEARCH_REFRESH_HOURS: ${RESEARCH_REFRESH_HOURS:-24}
+  SEED_DEMO: ${SEED_DEMO:-false}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cardvault
+      POSTGRES_USER: cardvault
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cardvault -d cardvault"]
+      interval: 10s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # AOF persistence so queued jobs survive a server restart
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 10
+
+  api:
+    build: { context: ., dockerfile: docker/Dockerfile, target: api }
+    image: cardvault-api
+    container_name: cardvault-api
+    restart: unless-stopped
+    environment: *app-env
+    volumes:
+      - storage:/data/storage
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: { context: ., dockerfile: docker/Dockerfile, target: worker }
+    image: cardvault-worker
+    container_name: cardvault-worker
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      AUTO_MIGRATE: "false"
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+    volumes:
+      - storage:/data/storage
+    depends_on:
+      api: { condition: service_healthy }
+    stop_grace_period: 60s
+
+  web:
+    build: { context: ., dockerfile: docker/Dockerfile, target: web }
+    image: cardvault-web
+    container_name: cardvault-web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - api
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    environment:
+      CARDVAULT_HOST: ${CARDVAULT_HOST:-cardvault.home}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+    depends_on:
+      - web
+
+  backup:
+    image: postgres:16-alpine
+    profiles: ["backup"]
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGUSER: cardvault
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: cardvault
+      KEEP_DAILY: ${BACKUP_KEEP_DAILY:-14}
+      KEEP_WEEKLY: ${BACKUP_KEEP_WEEKLY:-8}
+    volumes:
+      - ./scripts/backup.sh:/backup.sh:ro
+      - ${BACKUP_DIR:-./backups}:/backups
+      - storage:/data/storage:ro
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache bash >/dev/null && while true; do bash /backup.sh; sleep 86400; done"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  redisdata:
+  storage:
+  caddydata:

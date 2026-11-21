@@ -1,0 +1,29 @@
+{
+  "name": "@cardvault/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@cardvault/card-model": "workspace:*",
+    "@cardvault/config": "workspace:*",
+    "@cardvault/database": "workspace:*",
+    "@cardvault/imaging": "workspace:*",
+    "@cardvault/jobs": "workspace:*",
+    "@cardvault/provider-sdk": "workspace:*",
+    "@cardvault/shared": "workspace:*",
+    "@tesseract.js-data/eng": "^1.0.0",
+    "bullmq": "^5.63.0",
+    "ioredis": "^5.8.2",
+    "pino": "^10.1.0",
+    "postgres": "^3.4.7",
+    "tesseract.js": "^7.0.0"
+  }
+}
