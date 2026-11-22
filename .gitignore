@@ -11,3 +11,6 @@ backups/
 .DS_Store
 coverage/
 dump.rdb
+# written by scripts/install.sh at runtime
+*.pid
+.cardvault-installed
