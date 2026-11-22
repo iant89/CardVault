@@ -47,6 +47,8 @@ interface Overview {
   newSinceExam: number;
   import: { status: string; done?: number; total?: number; added?: number; skipped?: number; error?: string; alreadyImported?: number } | null;
   dataset: { id: string; createdAt: string; rows: number; counts: Record<string, number>; dir: string; storage: string } | null;
+  datasets: DatasetInfo[];
+  training: Training | null;
   evaluations: Evaluation[];
 }
 interface Gate {
@@ -102,6 +104,31 @@ interface Models {
   trialMinLines: number;
   models: Model[];
   events: { action: string; entityId: string; metadata: Record<string, unknown>; createdAt: string }[];
+}
+interface Training {
+  status: 'queued' | 'starting' | 'running' | 'done' | 'failed' | 'cancelled';
+  requested?: string;
+  dataset?: string;
+  lines?: number;
+  epochs?: number;
+  epoch?: number;
+  loss?: number;
+  devName?: number | null;
+  devNumber?: number | null;
+  minutes?: number;
+  synthetic?: number;
+  modelId?: string;
+  dev?: Record<string, { n: number; accuracy: number | null }> | null;
+  python?: string;
+  error?: string;
+  log?: string[];
+  updatedAt?: string;
+}
+interface DatasetInfo {
+  id: string;
+  rows: number;
+  counts: Record<string, number>;
+  createdAt: string | null;
 }
 
 const EVENT_LABEL: Record<string, string> = {
@@ -173,7 +200,7 @@ export default function OcrLabPage() {
   const [detail, setDetail] = useState<Evaluation | null>(null);
   const [filter, setFilter] = useState<{ source?: string; field?: string; regression?: string }>({});
   const samples = useAsync(() => api.get<{ samples: Sample[] }>(`/api/dev/ocr/samples?${new URLSearchParams(filter as Record<string, string>)}`), [JSON.stringify(filter)]);
-  const busy = !!ov.data && (ov.data.evaluations.some((e) => e.status === 'queued' || e.status === 'running') || ov.data.import?.status === 'running' || ov.data.import?.status === 'queued');
+  const busy = !!ov.data && (ov.data.evaluations.some((e) => e.status === 'queued' || e.status === 'running') || ov.data.import?.status === 'running' || ov.data.import?.status === 'queued' || ['queued', 'starting', 'running'].includes(ov.data.training?.status ?? ''));
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -429,6 +456,9 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
   const active = m?.models.find((x) => x.status === 'active');
   const storage = d.dataset?.storage ?? '<STORAGE_DIR>';
   const cmd = `python tools/ocr-trainer/train.py --storage ${storage}`;
+  const [form, setForm] = useState({ dataset: 'latest', epochs: 30, synthetic: 20000, maxMinutes: 0 });
+  const t = d.training;
+  const trainActive = !!t && ['queued', 'starting', 'running'].includes(t.status);
   return (
     <div className="panel">
       <div className="panel-head">
@@ -464,12 +494,72 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
           </button>
         </div>
         <div>
-          <strong>2. Train on the server</strong>
-          <p className="faint">CPU is enough. Needs Python with the packages in tools/ocr-trainer/requirements.txt.</p>
-          <div className="ocr-cmd">
-            <code>{cmd}</code>
-            <button className="btn sm ghost" onClick={() => void navigator.clipboard?.writeText(cmd).then(() => toast('Copied', 'success'))}>Copy</button>
-          </div>
+          <strong>2. Train</strong>
+          <p className="faint">Runs on this server (CPU is enough). Needs Python with the packages in tools/ocr-trainer/requirements.txt.</p>
+          {t && (
+            <div className="ocr-training">
+              {t.status === 'failed' ? (
+                <span style={{ color: 'var(--bad)', whiteSpace: 'pre-wrap' }}>{t.error}</span>
+              ) : t.status === 'cancelled' ? (
+                <span className="faint">Training stopped.</span>
+              ) : t.status === 'done' ? (
+                <>
+                  <span>Finished <code>{t.modelId}</code> · {t.minutes ?? 0} min{t.epochs ? ` · ${t.epochs} epochs` : ''}</span>
+                  <span className="faint">Held-out check: names {pct(t.dev?.name?.accuracy)} · numbers {pct(t.dev?.number?.accuracy)}</span>
+                  <span className="faint">Registered below — score it on the exam next.</span>
+                </>
+              ) : (
+                <>
+                  <div className="row between" style={{ width: '100%' }}>
+                    <span>{t.status === 'queued' ? 'Queued…' : t.status === 'starting' ? `Starting${t.python ? ` · ${t.python}` : ''}…` : `Epoch ${t.epoch ?? '…'} / ${t.epochs ?? '…'} · loss ${t.loss ?? '…'}`}</span>
+                    <span className="faint">{t.dataset ?? t.requested}{t.lines != null ? ` · ${t.lines.toLocaleString()} lines` : ''}{t.minutes ? ` · ${t.minutes} min` : ''}</span>
+                  </div>
+                  {t.status !== 'queued' && <div className="ocr-bar" style={{ width: '100%' }}><i style={{ width: `${t.epochs ? Math.min(100, ((t.epoch ?? 0) / t.epochs) * 100) : 0}%` }} /></div>}
+                  <div className="row between" style={{ width: '100%' }}>
+                    <span className="faint">Held out: names {pct(t.devName)} · numbers {pct(t.devNumber)}</span>
+                    <button className="btn sm ghost" onClick={() => void act(() => api.post('/api/dev/ocr/train/cancel', {}), 'Stopping after the current step')}>Stop</button>
+                  </div>
+                </>
+              )}
+              {t.log?.length ? <pre className="ocr-log">{t.log.slice(-6).join('\n')}</pre> : null}
+            </div>
+          )}
+          {!trainActive && (
+            <div className="ocr-form">
+              <label>
+                Dataset
+                <select className="select" value={form.dataset} onChange={(e) => setForm({ ...form, dataset: e.target.value })}>
+                  <option value="latest">Newest export{d.datasets.length ? ` (${d.datasets.at(-1)?.id})` : ''}</option>
+                  {[...d.datasets].reverse().map((ds) => (
+                    <option key={ds.id} value={ds.id}>{ds.id} · {ds.rows.toLocaleString()} lines</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Epochs
+                <input className="input" type="number" min={1} max={500} value={form.epochs} onChange={(e) => setForm({ ...form, epochs: +e.target.value })} />
+              </label>
+              <label>
+                Synthetic lines per epoch
+                <input className="input" type="number" min={0} max={200000} step={1000} value={form.synthetic} onChange={(e) => setForm({ ...form, synthetic: +e.target.value })} />
+              </label>
+              <label>
+                Stop after minutes (0 = no limit)
+                <input className="input" type="number" min={0} max={10080} value={form.maxMinutes} onChange={(e) => setForm({ ...form, maxMinutes: +e.target.value })} />
+              </label>
+              <button className="btn sm primary" disabled={busy || !d.datasets.length} onClick={() => void act(() => api.post('/api/dev/ocr/train', form), 'Training started')}>
+                Start training
+              </button>
+              {!d.datasets.length && <span className="faint">Export training data first.</span>}
+            </div>
+          )}
+          <details>
+            <summary>…or run the trainer yourself (SSH)</summary>
+            <div className="ocr-cmd" style={{ marginTop: 6 }}>
+              <code>{cmd}</code>
+              <button className="btn sm ghost" onClick={() => void navigator.clipboard?.writeText(cmd).then(() => toast('Copied', 'success'))}>Copy</button>
+            </div>
+          </details>
         </div>
         <div>
           <strong>3. Score, trial, promote</strong>

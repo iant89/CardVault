@@ -23,7 +23,9 @@ getting worse anywhere (see *Promotion gates*).
    - lines a person corrected count triple, reviewed lines double
    - for harvested cards, which number spot holds the number is decided per set
      by a small vote, and the label comes from TCGdex, never from what was read
-3. **Train** on the server:
+3. **Train** — right in the app: OCR Lab → Models → *Train*, which runs the
+   trainer on the server and shows its progress (dataset, epochs, held-out
+   accuracy), or on the server by hand:
 
    ```bash
    python3 -m venv ~/ocr-venv
@@ -35,7 +37,10 @@ getting worse anywhere (see *Promotion gates*).
    Options: `--dataset <id>` (default: latest), `--epochs 30`,
    `--synthetic 20000` (generated lines per epoch), `--max-minutes 60`,
    `--threads N`. The model, its ONNX export and a model card land in
-   `storage/ocr/models/<model id>/`.
+   `storage/ocr/models/<model id>/`. The *Train* button needs a Python that can
+   import torch (it looks at `~/ocr-venv/bin/python`, then `python3`; set
+   `OCR_TRAIN_PYTHON` in `.env` to point elsewhere) and registers the finished
+   model for scoring by itself.
 4. **Score** (OCR Lab → Models → *Look for new models*, then *Score on exam*).
 5. **Live trial** (*Start live trial*): the model reads every new scan
    alongside the live engine. Its readings are only recorded; identification
