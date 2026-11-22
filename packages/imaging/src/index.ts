@@ -158,18 +158,15 @@ export async function prepareForOcr(input: Buffer, region?: { top: number; heigh
   return img.grayscale().resize({ width: 1400, withoutEnlargement: false }).normalize().sharpen().png().toBuffer();
 }
 
-/**
- * One small region (a title line or a collector number) made ready for OCR:
- * cropped, scaled so the text is ~`targetHeight` px tall overall, contrast
- * stretched. Measured on rendered cards: plain grayscale with no added margin
- * reads best; a white margin (a hard frame around the grey card stock) and
- * adaptive thresholding (breaks up small digits) both made numbers unreadable.
- */
-export async function prepareOcrRegion(
-  input: Buffer,
-  region: { left: number; top: number; width: number; height: number },
-  targetHeight = 110,
-): Promise<Buffer> {
+export interface CardRegion {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/** Cut a region (fractions of the card) out of an image, at its original resolution, as PNG. */
+export async function cropRegion(input: Buffer, region: CardRegion): Promise<Buffer> {
   const m = await sharp(input).metadata();
   const W = m.width ?? 0, H = m.height ?? 0;
   const left = Math.min(W - 1, Math.round(W * region.left));
@@ -181,11 +178,41 @@ export async function prepareOcrRegion(
       width: Math.max(1, Math.min(W - left, Math.round(W * region.width))),
       height: Math.max(1, Math.min(H - top, Math.round(H * region.height))),
     })
-    .grayscale()
-    .resize({ height: targetHeight, kernel: 'lanczos3' })
-    .normalize()
     .png()
     .toBuffer();
+}
+
+/**
+ * A cropped text line made ready for OCR: grayscale, scaled so the line is
+ * ~`targetHeight` px tall, contrast stretched. Measured on rendered cards:
+ * plain grayscale with no added margin reads best; a white margin (a hard
+ * frame around the grey card stock) and adaptive thresholding (breaks up
+ * small digits) both made numbers unreadable.
+ */
+export async function prepareLine(crop: Buffer, targetHeight = 110): Promise<Buffer> {
+  return sharp(crop).grayscale().resize({ height: targetHeight, kernel: 'lanczos3' }).normalize().png().toBuffer();
+}
+
+/** One region of a card made ready for OCR (crop + prepareLine). */
+export async function prepareOcrRegion(input: Buffer, region: CardRegion, targetHeight = 110): Promise<Buffer> {
+  return prepareLine(await cropRegion(input, region), targetHeight);
+}
+
+/**
+ * Make a clean official card image look like a scanner capture: rescaled to a
+ * camera-like card width, softened, JPEG-compressed, then stored at the
+ * scanner's 750px width. `seed` makes it repeatable per card.
+ */
+export async function simulateCapture(input: Buffer, seed: number): Promise<{ image: Buffer; cameraWidth: number }> {
+  const cameraWidth = 520 + (seed % 380);
+  const cam = await sharp(input)
+    .flatten({ background: '#808080' })
+    .resize({ width: cameraWidth })
+    .blur(0.4 + ((seed >>> 8) % 7) / 10)
+    .jpeg({ quality: 70 + ((seed >>> 12) % 20) })
+    .toBuffer();
+  const image = await sharp(cam).resize(750, 1047, { fit: 'fill' }).jpeg({ quality: 90 }).toBuffer();
+  return { image, cameraWidth };
 }
 
 export async function writeFileSafe(root: string, relative: string, data: Buffer): Promise<string> {

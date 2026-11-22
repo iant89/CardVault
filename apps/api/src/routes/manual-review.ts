@@ -136,6 +136,10 @@ export async function manualReviewRoutes(app: FastifyInstance, ctx: AppContext) 
     });
     const itemId = await addScanToCollection(ctx, scan.id, cardId, variantId, { condition: b.condition });
     const jobId = await enqueueResearch(ctx, { cardId, scanId: scan.id, userId: scan.userId, priority: 2, reason: 'MANUAL' });
+    // a person said which card this is: label the scan's OCR samples with it (exam/training data)
+    await ctx.queues.maintenance
+      .add('ocr-label', { scanId: scan.id, cardId }, { removeOnComplete: 200, removeOnFail: 200, attempts: 3, backoff: { type: 'exponential', delay: 5000 } })
+      .catch((e) => req.log.warn({ err: (e as Error).message }, 'could not queue OCR labelling'));
     await audit(ctx, req, 'manual_review.resolve', 'manual_review', review.id, { scanId: scan.id, cardId, original: review.originalIdentification });
     await ctx.events.publish({ type: 'IDENTIFICATION_COMPLETE', userId: scan.userId, scanId: scan.id, cardId, message: `Identified manually: ${card.name}` });
     return { ok: true, cardId, collectionItemId: itemId, researchJobId: jobId };

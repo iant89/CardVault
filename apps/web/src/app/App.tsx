@@ -14,6 +14,7 @@ const ReviewPage = lazy(() => import('../features/manual-review/ReviewPage'));
 const SearchPage = lazy(() => import('../features/search/SearchPage'));
 const UsersPage = lazy(() => import('../features/admin/UsersPage'));
 const SystemPage = lazy(() => import('../features/admin/SystemPage'));
+const OcrLabPage = lazy(() => import('../features/admin/OcrLabPage'));
 const ProfilePage = lazy(() => import('../features/auth/ProfilePage'));
 
 export function App() {
@@ -40,6 +41,7 @@ export function App() {
           <Route path="/profile" element={<ProfilePage />} />
           {admin && <Route path="/admin/users" element={<UsersPage />} />}
           {admin && <Route path="/admin/system" element={<SystemPage />} />}
+          {admin && <Route path="/dev/ocr" element={<OcrLabPage />} />}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Suspense>

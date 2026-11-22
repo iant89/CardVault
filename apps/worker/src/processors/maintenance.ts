@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { eq, sql, researchJobs } from '@cardvault/database';
 import type { WorkerContext } from '../context.js';
 import { snapshotCollectionValues } from '../pricing/compute.js';
+import { evaluate, importHarvest, labelReviewed } from './ocr-lab.js';
+import { pruneSamples } from '../identification/samples.js';
 
 /**
  * Recover abandoned jobs. BullMQ already re-queues *stalled* jobs whose worker
@@ -70,7 +72,14 @@ export async function processMaintenance(ctx: WorkerContext, job: Job) {
     case 'value-snapshots':
       await snapshotCollectionValues(ctx);
       return { ok: true };
+    case 'ocr-label':
+      return labelReviewed(ctx, job.data as { scanId: string; cardId: string });
+    case 'ocr-evaluate':
+      return evaluate(ctx, job.data as { evaluationId: string });
+    case 'ocr-import-harvest':
+      return importHarvest(ctx, job.data as { limit?: number });
     case 'prune':
+      await pruneSamples(ctx);
       await ctx.db.execute(sql`DELETE FROM sessions WHERE expires_at < now()`);
       await ctx.db.execute(sql`DELETE FROM research_results WHERE created_at < now() - interval '90 days'`);
       await ctx.db.execute(sql`DELETE FROM workers WHERE last_heartbeat < now() - interval '7 days'`);
