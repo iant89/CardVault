@@ -70,7 +70,13 @@ sudo cardvault-setup
 
 If CardVault is already installed, the script goes straight to the menu. If it isn't, it simply asks whether you want to install it. Use menu option 14 to check for upgrades.
 
-nginx listens on all interfaces and is configured with the PC's hostname and private LAN IP addresses, so other devices can open `http://<hostname>:8080` or `http://<lan-ip>:8080`. A `cardvault-lan.service` unit refreshes those names and the firewall rules at boot (when LAN access was accepted during install). Use menu option 16 to change this later, option 17 for network diagnostics (listening port, services, firewall rules), and option 18 to enable/disable HTTPS. Both `ufw` and `firewalld` are supported.
+nginx listens on all interfaces and is configured with the PC's hostname and private LAN IP addresses, so other devices can open `http://<hostname>:8080` or `http://<lan-ip>:8080`. Both addresses work for sign-in, because nginx passes the full address (port included) to the API's same-origin check.
+
+**Upgrading from an install that showed "Cross-origin request rejected":** earlier versions of the generated nginx config dropped the port, so only the one address in `WEB_ORIGIN` could sign in. To apply the fix:
+1. Run `sudo cardvault-setup` and upgrade (option 14). This fetches the new code and console.
+2. Run `sudo cardvault-setup` **again** and choose **16 → 1** (refresh addresses, firewall and nginx). This rewrites nginx from the fixed template.
+
+Step 2 is needed once because, during the upgrade, the previous console regenerates nginx before replacing itself. A `cardvault-lan.service` unit refreshes those names and the firewall rules at boot (when LAN access was accepted during install). Use menu option 16 to change this later, option 17 for network diagnostics (listening port, services, firewall rules), and option 18 to enable/disable HTTPS. Both `ufw` and `firewalld` are supported.
 
 Defaults can be overridden with `CARDVAULT_REPO`, `CARDVAULT_BRANCH`, `CARDVAULT_DIR`, `CARDVAULT_PORT` and `CARDVAULT_USER`. The installer pins the overall progress bar to the bottom row of the terminal, with steps and tasks scrolling above it, and shows a per-task bar for long commands. Full command output is written to `/tmp/cardvault-setup.log`, and `CARDVAULT_VERBOSE=1` streams it live instead. Backups written by the menu land in `/opt/cardvault/backups`.
 
