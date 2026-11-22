@@ -1500,6 +1500,159 @@ https_menu() {
 }
 
 # ---------------------------------------------------------------------------
+# Wipe & reinstall
+# ---------------------------------------------------------------------------
+WIPE_BACKUP_ROOT=/var/backups/cardvault
+
+# Refuse to delete anything that is not unmistakably a CardVault install folder.
+safe_install_dir() {
+  local d=${1:-}
+  [[ -n $d && $d == /* ]] || return 1
+  d=$(realpath -m "$d")
+  case $d in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var) return 1 ;;
+  esac
+  [[ $d != "$(realpath -m "${HOME:-/root}")" ]] || return 1
+  [[ -f $d/package.json && -f $d/pnpm-workspace.yaml ]] || return 1
+  grep -q '"name": "cardvault"' "$d/package.json" 2>/dev/null
+}
+
+# Only CardVault's own keys: Redis may be shared with other software.
+clear_redis_queues() {
+  have redis-cli || return 0
+  local url pattern
+  url=$(env_get REDIS_URL); url=${url:-redis://127.0.0.1:6379}
+  for pattern in 'bull:identification:*' 'bull:research:*' 'bull:pricing:*' 'bull:image:*' 'bull:manual-review:*' 'bull:maintenance:*' 'cardvault:*'; do
+    redis-cli -u "$url" --scan --pattern "$pattern" 2>/dev/null | xargs -r -n 200 redis-cli -u "$url" DEL >/dev/null 2>&1 || true
+  done
+}
+
+wipe_backup() {
+  local dest=$1 ok_all=yes
+  as_root install -d -m 0700 "$dest"
+  if have pg_dump && EXPECTED_SECONDS=30 run "Back up database" as_root pg_dump --format=custom --compress=9 --no-owner --file "$dest/cardvault.dump" "$(env_get DATABASE_URL)"; then :; else ok_all=no; fi
+  if [[ -d $INSTALL_DIR/storage ]]; then
+    EXPECTED_SECONDS=60 run "Back up card images" as_root tar -C "$INSTALL_DIR/storage" -czf "$dest/storage.tar.gz" . || ok_all=no
+  fi
+  if [[ -d $INSTALL_DIR/backups ]] && [[ -n $(find "$INSTALL_DIR/backups" -type f -print -quit 2>/dev/null) ]]; then
+    EXPECTED_SECONDS=30 run "Keep earlier exports" as_root cp -a "$INSTALL_DIR/backups" "$dest/previous-backups" || ok_all=no
+  fi
+  [[ $ok_all == yes ]]
+}
+
+wipe_restore() {
+  local src=$1
+  section "Restore backup"
+  stop_services
+  if [[ -f $src/cardvault.dump ]]; then
+    if EXPECTED_SECONDS=60 run "Restore database" as_root pg_restore --clean --if-exists --no-owner --dbname "$(env_get DATABASE_URL)" "$src/cardvault.dump"; then
+      # the backup may predate newer migrations
+      EXPECTED_SECONDS=30 run "Update database schema" bash -c "cd '$INSTALL_DIR' && pnpm db:migrate" || true
+    else
+      warn "Database restore reported errors; check ${RUN_LOG}."
+    fi
+  fi
+  if [[ -f $src/storage.tar.gz ]]; then
+    mkdir -p "$INSTALL_DIR/storage"
+    EXPECTED_SECONDS=60 run "Restore card images" as_root tar -C "$INSTALL_DIR/storage" -xzf "$src/storage.tar.gz" || warn "Image restore reported errors."
+  fi
+  if [[ -d $src/previous-backups ]]; then
+    mkdir -p "$INSTALL_DIR/backups"
+    as_root cp -a "$src/previous-backups/." "$INSTALL_DIR/backups/" || true
+  fi
+  as_root chown -R "$INSTALL_USER" "$INSTALL_DIR/storage" "$INSTALL_DIR/backups" 2>/dev/null || true
+  start_services
+  ok "Backup restored. Sign in with the accounts from the backup."
+}
+
+wipe_reinstall() {
+  section "Wipe and reinstall"
+  if ! safe_install_dir "$INSTALL_DIR"; then
+    err "Refusing to wipe '${INSTALL_DIR}': it does not look like a CardVault install folder."
+    pause; return
+  fi
+  warn "This permanently removes the current CardVault installation:"
+  printf '    • %s  (program files, .env settings, card images, exports)\n' "$INSTALL_DIR"
+  printf '    • the "cardvault" database: all collections, scans, users and price history\n'
+  printf '    • CardVault services, nginx site, Caddy site, LAN firewall rules and queued jobs\n'
+  info "Kept: system packages (Node.js, PostgreSQL, Redis, nginx, Caddy), Caddy's local"
+  info "certificate authority (phones stay trusted) and this console."
+  info "Only want an empty collection? Use option 8 (Clear database) instead."
+  printf '\n'
+
+  local stamp dest='' backed=no
+  stamp=$(date +%Y%m%d-%H%M%S)
+  if ask "Save a backup of the database and card images first (recommended)?" y; then
+    dest="$WIPE_BACKUP_ROOT/wipe-$stamp"
+    if wipe_backup "$dest"; then
+      backed=yes
+      ok "Backup saved outside the install folder: ${dest}"
+    else
+      warn "The backup did not complete (details in ${RUN_LOG}). Partial files are in ${dest}."
+      ask "Wipe anyway?" n || { warn "Wipe cancelled. Nothing was removed."; pause; return; }
+    fi
+  elif [[ -n $(find "$INSTALL_DIR/backups" -type f -print -quit 2>/dev/null) ]]; then
+    warn "Earlier exports in ${INSTALL_DIR}/backups will be deleted too."
+  fi
+
+  if ! confirm_type WIPE; then
+    warn "Wipe cancelled. Nothing was removed."
+    [[ $backed == yes ]] && info "The backup just taken is kept at ${dest}"
+    pause; return
+  fi
+
+  section "Removing the current installation"
+  task "Stopping services"
+  stop_services
+  if have_systemd; then
+    as_root systemctl disable --now cardvault-api cardvault-worker cardvault-lan >/dev/null 2>&1 || true
+    as_root rm -f /etc/systemd/system/cardvault-api.service /etc/systemd/system/cardvault-worker.service /etc/systemd/system/cardvault-lan.service
+    as_root systemctl daemon-reload || true
+  fi
+  ok "Services removed"
+
+  task "Clearing queued jobs"
+  clear_redis_queues
+  ok "Queued jobs cleared"
+
+  task "Removing the database"
+  pg_admin dropdb --if-exists --force cardvault >/dev/null 2>&1 || pg_admin dropdb --if-exists cardvault >/dev/null 2>&1 || true
+  pg_admin psql -qc 'DROP ROLE IF EXISTS cardvault;' >/dev/null 2>&1 || true
+  ok "Database removed"
+
+  task "Removing web server and firewall settings"
+  remove_firewall_rules || true
+  as_root rm -f /etc/nginx/conf.d/cardvault.conf
+  if have nginx && as_root nginx -t >/dev/null 2>&1; then
+    as_root systemctl reload nginx >/dev/null 2>&1 || true
+  fi
+  if [[ -f /etc/caddy/Caddyfile ]] && grep -q 'Generated by cardvault-setup' /etc/caddy/Caddyfile 2>/dev/null; then
+    as_root rm -f /etc/caddy/Caddyfile
+    as_root systemctl disable --now caddy >/dev/null 2>&1 || true
+  fi
+  ok "Web server and firewall settings removed"
+
+  task "Deleting ${INSTALL_DIR}"
+  as_root rm -rf -- "$(realpath -m "$INSTALL_DIR")"
+  as_root rm -f "$CONF_FILE"
+  ok "Installation removed"
+
+  # Reinstall from scratch with the usual questions.
+  STEP_NO=0
+  fresh_install
+  if [[ -f $INSTALL_DIR/scripts/install.sh ]]; then install_manager "$INSTALL_DIR/scripts/install.sh"; fi
+
+  if [[ $backed == yes ]]; then
+    if ask "Restore the backup you saved before wiping?" y; then
+      wipe_restore "$dest"
+    else
+      info "Backup kept at ${dest}"
+    fi
+    pause
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Menu
 # ---------------------------------------------------------------------------
 menu() {
@@ -1528,6 +1681,8 @@ menu() {
     printf '  %s17)%s Network diagnostics\n' "$CYAN" "$RESET"
     printf '  %s18)%s HTTPS (local certificate)\n' "$CYAN" "$RESET"
     printf '\n'
+    printf '  %s19)%s %sWipe and reinstall%s\n' "$CYAN" "$RESET" "$RED" "$RESET"
+    printf '\n'
     printf '  %s 0)%s Exit\n\n' "$CYAN" "$RESET"
     local c; c=$(prompt_value "Select an option" 0)
     case $c in
@@ -1549,6 +1704,7 @@ menu() {
       16) lan_menu ;;
       17) lan_diagnose ;;
       18) https_menu ;;
+      19) wipe_reinstall ;;
       0)
         section 'Goodbye'
         if services_running; then

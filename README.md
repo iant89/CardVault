@@ -69,6 +69,12 @@ The script asks for the admin password, whether to start services on boot, wheth
 - change a user password, create a user, edit `.env`
 - view the PC's hostname and LAN IPs, refresh them, and enable/disable LAN firewall rules at boot
 - enable/disable HTTPS with Caddy, publish the root CA at `http://<hostname>/cardvault-ca.crt` over LAN HTTP, and print the phone install instructions
+- **wipe and reinstall** (option 19). This removes the install folder, the `cardvault` database and role, CardVault's services, nginx/Caddy sites, LAN firewall rules and queued jobs, then runs a fresh install.
+  - It first offers a backup (database, card images and earlier exports) to `/var/backups/cardvault/wipe-<time>/`, outside the install folder.
+  - It requires typing `WIPE`, and refuses to delete anything that isn't a CardVault install folder.
+  - After reinstalling it offers to restore that backup.
+  - System packages and Caddy's local CA are kept, so phones stay trusted.
+  - To only empty the collection, use option 8 instead.
 
 Reopen the console at any time with:
 
