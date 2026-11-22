@@ -191,6 +191,8 @@ export const scans = pgTable(
     imageHash: text('image_hash'),
     /** sha256 of exact bytes */
     contentHash: text('content_hash').notNull(),
+    /** bumped on every retake; identification results for an older version are discarded */
+    imageVersion: integer('image_version').notNull().default(0),
     width: integer('width'),
     height: integer('height'),
     mimeType: text('mime_type').notNull(),

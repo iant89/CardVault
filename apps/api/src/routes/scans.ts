@@ -6,7 +6,8 @@ import { GAME_SLUGS } from '@cardvault/shared';
 import type { AppContext } from '../context.js';
 import { badRequest, forbidden, notFound, parse, HttpProblem } from '../errors.js';
 import { requireUser, user as currentUser } from '../auth/plugin.js';
-import { createScan } from '../services/pipeline.js';
+import { createScan, deleteScan, retakeScan } from '../services/pipeline.js';
+import { audit } from '../services/audit.js';
 import { getCard } from '../services/cards.js';
 
 const fields = z.object({
@@ -112,6 +113,50 @@ export async function scanRoutes(app: FastifyInstance, ctx: AppContext) {
     };
   });
 
+  /** Replace a scan's photo (see retakeScan for queue semantics). */
+  app.post<{ Params: { id: string } }>('/api/scans/:id/retake', { preHandler: requireUser, config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }, async (req) => {
+    parse(z.string().uuid(), req.params.id);
+    const me = currentUser(req);
+    const [scan] = await ctx.db.select().from(scans).where(eq(scans.id, req.params.id));
+    if (!scan) throw notFound('This scan no longer exists');
+    if (scan.userId !== me.id && me.role !== 'ADMIN') throw forbidden();
+    let buffer: Buffer | null = null;
+    let quality: Record<string, unknown> | undefined;
+    for await (const part of req.parts()) {
+      if (part.type === 'file') {
+        if (part.fieldname !== 'image') throw badRequest('Unexpected file field');
+        if (!/^image\/(jpeg|png|webp|heic|heif|avif)$/.test(part.mimetype)) throw badRequest('Only JPEG/PNG/WebP/HEIC images are accepted');
+        buffer = await part.toBuffer();
+      } else if (part.fieldname === 'quality') {
+        try {
+          quality = JSON.parse(String(part.value).slice(0, 2000)) as Record<string, unknown>;
+        } catch {
+          quality = undefined;
+        }
+      }
+    }
+    if (!buffer) throw badRequest('Missing image');
+    try {
+      const r = await retakeScan(ctx, scan.id, buffer, quality);
+      await audit(ctx, req, 'scan.retake', 'scan', scan.id, { previousStatus: scan.status, previousCardId: scan.cardId, queue: r.requeued });
+      return r;
+    } catch (e) {
+      if (e instanceof ImageValidationError) throw new HttpProblem(415, e.message);
+      throw e;
+    }
+  });
+
+  app.delete<{ Params: { id: string } }>('/api/scans/:id', { preHandler: requireUser }, async (req) => {
+    parse(z.string().uuid(), req.params.id);
+    const me = currentUser(req);
+    const [scan] = await ctx.db.select().from(scans).where(eq(scans.id, req.params.id));
+    if (!scan) throw notFound('This scan no longer exists');
+    if (scan.userId !== me.id && me.role !== 'ADMIN') throw forbidden();
+    const r = await deleteScan(ctx, scan.id);
+    await audit(ctx, req, 'scan.delete', 'scan', scan.id, { status: scan.status, cardId: scan.cardId, removedCopy: r.removedCopy });
+    return { ok: true, ...r };
+  });
+
   app.post<{ Params: { id: string } }>('/api/scans/:id/retry', { preHandler: requireUser }, async (req) => {
     const me = currentUser(req);
     const [scan] = await ctx.db.select().from(scans).where(eq(scans.id, req.params.id));
@@ -121,8 +166,9 @@ export async function scanRoutes(app: FastifyInstance, ctx: AppContext) {
       .insert(researchJobs)
       .values({ scanId: scan.id, userId: scan.userId, queue: 'identification', label: 'Re-identify scan', stage: 'Queued for identification', priority: 2 })
       .returning();
+    await ctx.db.update(researchJobs).set({ bullJobId: job!.id }).where(eq(researchJobs.id, job!.id));
     await ctx.db.update(scans).set({ status: 'UPLOADED', updatedAt: new Date() }).where(and(eq(scans.id, scan.id)));
-    await ctx.queues.identification.add('identify', { scanId: scan.id, userId: scan.userId, gameHint: scan.gameHint ?? undefined }, { jobId: job!.id, priority: 2 });
+    await ctx.queues.identification.add('identify', { scanId: scan.id, userId: scan.userId, gameHint: scan.gameHint ?? undefined, researchJobId: job!.id }, { jobId: job!.id, priority: 2 });
     await ctx.events.publish({ type: 'JOB_CREATED', userId: scan.userId, jobId: job!.id, scanId: scan.id, queue: 'identification', state: 'QUEUED' });
     return { jobId: job!.id };
   });

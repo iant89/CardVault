@@ -20,6 +20,10 @@ export interface PendingScan {
   nextAttemptAt: number;
   error?: string;
   allowDuplicate?: boolean;
+  /** set for a retake: replaces this server scan's photo instead of creating a scan */
+  replaceScanId?: string;
+  /** what is being retaken, for display */
+  label?: string;
   duplicate?: { scanId: string; cardId: string | null; cardName: string | null; createdAt: string };
 }
 export type PendingView = Omit<PendingScan, 'blob'> & { url: string };
@@ -62,7 +66,7 @@ interface QueueState {
   /** local capture id → server scan id, filled in as uploads succeed */
   uploadedIds: Record<string, string>;
   online: boolean;
-  add: (blob: Blob, meta: { gameHint?: string; quality?: Record<string, unknown> }) => Promise<string | null>;
+  add: (blob: Blob, meta: { gameHint?: string; quality?: Record<string, unknown>; replaceScanId?: string; label?: string }) => Promise<string | null>;
   /** returns the new local id when re-queued as an extra copy */
   resolveDuplicate: (id: string, action: 'add' | 'cancel') => Promise<string | null>;
   retry: (id: string) => Promise<void>;
@@ -97,7 +101,7 @@ export const useOfflineQueue = create<QueueState>((set, get) => {
         if (p.allowDuplicate) fd.append('allowDuplicate', 'true');
         fd.append('image', p.blob, `${p.id}.jpg`); // file last so fields are read first
         try {
-          const r = await api.upload<{ scanId: string }>('/api/scans', fd);
+          const r = await api.upload<{ scanId: string }>(p.replaceScanId ? `/api/scans/${p.replaceScanId}/retake` : '/api/scans', fd);
           await remove(p.id);
           URL.revokeObjectURL(urls.get(p.id) ?? '');
           urls.delete(p.id);
@@ -132,7 +136,7 @@ export const useOfflineQueue = create<QueueState>((set, get) => {
       const uid = useSession.getState().user?.id;
       if (!uid) return null;
       const id = crypto.randomUUID();
-      await put({ id, userId: uid, blob, gameHint: meta.gameHint, quality: meta.quality, capturedAt: new Date().toISOString(), status: 'pending', attempts: 0, nextAttemptAt: 0 });
+      await put({ id, userId: uid, blob, gameHint: meta.gameHint, quality: meta.quality, replaceScanId: meta.replaceScanId, label: meta.label, capturedAt: new Date().toISOString(), status: 'pending', attempts: 0, nextAttemptAt: 0 });
       await reload();
       void pump();
       return id;

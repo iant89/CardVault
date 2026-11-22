@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { avatarSrc } from '../services/api';
 import { useToasts } from '../stores/toasts';
 import { useNavigate } from 'react-router';
@@ -102,4 +102,55 @@ export function Empty({ icon, title, children }: { icon: string; title: string; 
       {children && <div style={{ marginTop: 6 }}>{children}</div>}
     </div>
   );
+}
+
+export interface ConfirmOptions {
+  title: string;
+  message: ReactNode;
+  confirmLabel: string;
+  danger?: boolean;
+}
+
+/**
+ * Promise-based confirmation dialog:
+ *   const [confirm, confirmDialog] = useConfirm();
+ *   if (await confirm({ title, message, confirmLabel })) …
+ */
+export function useConfirm(): [(o: ConfirmOptions) => Promise<boolean>, ReactNode] {
+  const [opts, setOpts] = useState<ConfirmOptions | null>(null);
+  const resolver = useRef<(v: boolean) => void>(undefined);
+  const confirm = useCallback(
+    (o: ConfirmOptions) =>
+      new Promise<boolean>((resolve) => {
+        resolver.current = resolve;
+        setOpts(o);
+      }),
+    [],
+  );
+  const close = (v: boolean) => {
+    resolver.current?.(v);
+    resolver.current = undefined;
+    setOpts(null);
+  };
+  const el = (
+    <Dialog open={!!opts} onClose={() => close(false)} size="sm">
+      {opts && (
+        <div className="stack">
+          <h2>{opts.title}</h2>
+          <div className="muted" style={{ fontSize: 15 }}>
+            {opts.message}
+          </div>
+          <div className="row" style={{ justifyContent: 'flex-end', gap: 8, marginTop: 6 }}>
+            <button className="btn ghost" onClick={() => close(false)}>
+              Cancel
+            </button>
+            <button className={`btn ${opts.danger ? 'danger' : 'primary'}`} onClick={() => close(true)} autoFocus>
+              {opts.confirmLabel}
+            </button>
+          </div>
+        </div>
+      )}
+    </Dialog>
+  );
+  return [confirm, el];
 }

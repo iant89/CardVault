@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Link } from 'react-router';
 import { api, money } from '../../services/api';
 import { StatusBadge } from '../../components/ui';
+import { CameraIcon, TrashIcon } from '../../components/icons';
 import type { PendingView } from './offlineQueue';
 import { canEdit } from './useScanEdit';
 import { IDENTIFIED, IN_PROGRESS, NEEDS_REVIEW, STATUS_LABEL, type ScanDetail, type ScanListItem } from './scanTypes';
@@ -14,16 +15,23 @@ interface Props {
   collapsed: boolean;
   onToggle: () => void;
   onEdit: (scan: ScanListItem) => void;
+  onRetake: (scan: ScanListItem) => void;
+  onDelete: (scan: ScanListItem) => void;
+  /** scan currently being retaken (camera armed for it) */
+  retakingId: string | null;
   onDuplicate: (id: string, action: 'add' | 'cancel') => void;
   onRetry: (id: string) => void;
   onDiscard: (id: string) => void;
 }
 
+const statusTone = (s: string) =>
+  IDENTIFIED.includes(s) ? 'good' : NEEDS_REVIEW.includes(s) ? 'warn' : s === 'FAILED' || s === 'REJECTED' ? 'bad' : 'info';
+
 const narrow = () => window.matchMedia('(max-width: 1000px)').matches;
 const TIP_W = 300;
 
 /** Collapsible list of recent scans (newest first) with live status tooltips. */
-export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle, onEdit, onDuplicate, onRetry, onDiscard }: Props) {
+export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle, onEdit, onRetake, onDelete, retakingId, onDuplicate, onRetry, onDiscard }: Props) {
   const [open, setOpen] = useState<{ id: string; top: number; left: number; inline: boolean } | null>(null);
   const [details, setDetails] = useState<Record<string, ScanDetail>>({});
   const hideTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -170,7 +178,7 @@ export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle,
             </div>
             <div style={{ minWidth: 0 }}>
               <div className="truncate" style={{ fontWeight: 600, fontSize: 14 }}>
-                {p.status === 'failed' ? 'Upload rejected' : 'New capture'}
+                {p.status === 'failed' ? 'Upload rejected' : p.replaceScanId ? `Retake: ${p.label ?? 'scan'}` : 'New capture'}
               </div>
               <div className="faint truncate" style={{ fontSize: 12 }}>
                 {p.status === 'failed' ? p.error : p.status === 'uploading' ? 'Uploading…' : p.attempts ? 'Waiting for server…' : 'Queued on this device'}
@@ -207,11 +215,35 @@ export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle,
                 <div className="truncate" style={{ fontWeight: 600, fontSize: 14 }}>
                   {s.cardName ?? (NEEDS_REVIEW.includes(s.status) ? 'Unknown card' : 'Identifying…')}
                 </div>
-                <div className="faint" style={{ fontSize: 12 }}>
-                  {new Date(s.createdAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+                <div className="truncate" style={{ fontSize: 12 }}>
+                  <span className={`st-${statusTone(retakingId === s.id ? 'RETAKE' : s.status)}`}>{retakingId === s.id ? 'Retaking…' : (STATUS_LABEL[s.status] ?? s.status)}</span>
+                  <span className="faint"> · {new Date(s.createdAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>
                 </div>
               </div>
-              <StatusBadge status={s.status} />
+              <div className="row scan-actions" style={{ gap: 2 }}>
+                <button
+                  className={`btn ghost icon sm ${retakingId === s.id ? 'on' : ''}`}
+                  title="Retake photo"
+                  aria-label={`Retake photo of ${s.cardName ?? 'this scan'}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRetake(s);
+                  }}
+                >
+                  <CameraIcon />
+                </button>
+                <button
+                  className="btn ghost icon sm danger-hover"
+                  title="Delete scan"
+                  aria-label={`Delete scan of ${s.cardName ?? 'unknown card'}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(s);
+                  }}
+                >
+                  <TrashIcon />
+                </button>
+              </div>
             </div>
             {open?.id === s.id && open.inline && tip(s, true)}
           </div>

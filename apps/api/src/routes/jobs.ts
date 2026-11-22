@@ -79,12 +79,13 @@ export async function jobRoutes(app: FastifyInstance, ctx: AppContext) {
     if (job.userId && job.userId !== me.id && me.role !== 'ADMIN') throw forbidden();
     if (!['FAILED', 'CANCELLED', 'COMPLETED'].includes(job.status)) throw badRequest('Job is still active');
     const queue = job.queue === 'identification' ? ctx.queues.identification : ctx.queues.research;
-    const old = await queue.getJob(job.id);
+    const old = await queue.getJob(job.bullJobId ?? job.id);
     if (old) await old.remove().catch(() => undefined);
-    await ctx.db.update(researchJobs).set({ status: 'QUEUED', error: null, progress: 0, stage: 'Retry queued', completedAt: null }).where(eq(researchJobs.id, job.id));
+    if (job.bullJobId !== job.id) await (await queue.getJob(job.id))?.remove().catch(() => undefined);
+    await ctx.db.update(researchJobs).set({ status: 'QUEUED', error: null, progress: 0, stage: 'Retry queued', completedAt: null, bullJobId: job.id }).where(eq(researchJobs.id, job.id));
     if (job.queue === 'identification') {
       if (!job.scanId) throw badRequest('Job has no scan');
-      await ctx.queues.identification.add('identify', { scanId: job.scanId, userId: job.userId ?? me.id }, { jobId: job.id, priority: 2 });
+      await ctx.queues.identification.add('identify', { scanId: job.scanId, userId: job.userId ?? me.id, researchJobId: job.id }, { jobId: job.id, priority: 2 });
     } else {
       if (!job.cardId) throw badRequest('Job has no card');
       await ctx.queues.research.add('research', { researchJobId: job.id, cardId: job.cardId, scanId: job.scanId, userId: job.userId, priority: 2, reason: 'RETRY' }, { jobId: job.id, priority: 2 });
@@ -102,7 +103,7 @@ export async function jobRoutes(app: FastifyInstance, ctx: AppContext) {
     if (job.userId && job.userId !== me.id && me.role !== 'ADMIN') throw forbidden();
     if (TERMINAL_JOB_STATES.includes(job.status as JobState)) throw badRequest('Job already finished');
     const queue = job.queue === 'identification' ? ctx.queues.identification : ctx.queues.research;
-    const bull = await queue.getJob(job.id);
+    const bull = await queue.getJob(job.bullJobId ?? job.id);
     // Waiting jobs are removed; active jobs see CANCELLED at their next stage checkpoint
     if (bull && !(await bull.isActive())) await bull.remove().catch(() => undefined);
     await ctx.db.update(researchJobs).set({ status: 'CANCELLED', completedAt: new Date(), stage: 'Cancelled' }).where(eq(researchJobs.id, job.id));

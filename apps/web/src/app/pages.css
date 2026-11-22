@@ -139,3 +139,12 @@
   .scan-rail .rail-label { writing-mode: horizontal-tb; }
   .vp-status { right: 12px; top: 52px; }
 }
+.scan-item { grid-template-columns: 34px minmax(0, 1fr) auto; }
+.scan-actions .btn.icon.sm { width: 30px; height: 30px; color: var(--text-3); }
+.scan-actions .btn.icon.sm:hover { color: var(--text); }
+.scan-actions .btn.icon.sm.on { color: var(--accent); background: rgba(110,168,255,.14); }
+.scan-actions .danger-hover:hover { color: var(--bad); background: rgba(255,107,107,.1); }
+.st-good { color: var(--good); } .st-warn { color: var(--warn); } .st-bad { color: var(--bad); } .st-info { color: var(--accent); }
+.retake-banner { position: absolute; left: 50%; top: 52px; transform: translateX(-50%); z-index: 4; display: flex; align-items: center; gap: 10px; padding: 8px 8px 8px 14px; border-radius: 12px; background: rgba(110,168,255,.92); color: #0b1220; font-weight: 700; font-size: 14px; box-shadow: var(--shadow); white-space: nowrap; max-width: calc(100% - 24px); }
+.retake-banner span { overflow: hidden; text-overflow: ellipsis; }
+.retake-banner .btn { background: rgba(255,255,255,.85); color: #0b1220; border: 0; }

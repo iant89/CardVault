@@ -3,9 +3,9 @@ import { Link } from 'react-router';
 import { useOfflineQueue } from './offlineQueue';
 import { assessQuality, autoLevels, CARD_RATIO, detectCard, regionSignature, signatureDiff, toGray, warpCard, type Detection, type Quality, type Rect } from './vision';
 import { useLive } from '../../stores/live';
-import { StatusBadge } from '../../components/ui';
+import { StatusBadge, useConfirm } from '../../components/ui';
 import { toast } from '../../stores/toasts';
-import { api } from '../../services/api';
+import { api, ApiError } from '../../services/api';
 import { useAsync } from '../../hooks/useAsync';
 import { ScanSidebar } from './ScanSidebar';
 import { canEdit, useScanEdit } from './useScanEdit';
@@ -105,6 +105,14 @@ export default function ScanPage() {
   const [torch, setTorch] = useState<boolean | null>(null);
   /** single mode: the capture being shown after the camera closes */
   const [captured, setCaptured] = useState<{ localId: string; url: string } | null>(null);
+  /** retake mode: the next capture replaces this scan's photo */
+  const [retake, setRetakeState] = useState<{ scanId: string; name: string } | null>(null);
+  const retakeRef = useRef<{ scanId: string; name: string } | null>(null);
+  const setRetake = (v: { scanId: string; name: string } | null) => {
+    retakeRef.current = v;
+    setRetakeState(v);
+  };
+  const [confirm, confirmDialog] = useConfirm();
 
   const { items, add, resolveDuplicate, discard, retry, online, uploadedIds, uploaded } = useOfflineQueue();
   const jobs = useLive((s) => s.jobs);
@@ -245,10 +253,14 @@ export default function ScanPage() {
       setFlash((f) => f + 1);
       if (sound) beep();
       navigator.vibrate?.(30);
-      toast('Captured', 'success');
+      const target = retakeRef.current;
+      toast(target ? `Captured — replacing the photo of ${target.name}` : 'Captured', 'success');
+      setRetake(null);
 
       const localId = await add(blob, {
         gameHint: game || undefined,
+        replaceScanId: target?.scanId,
+        label: target?.name,
         quality: { source, detected: !!det, detectionConfidence: det?.confidence ?? null, ...(q ? { sharpness: Math.round(q.sharpness), brightness: Math.round(q.brightness), glare: q.glare } : {}) },
       });
 
@@ -266,6 +278,70 @@ export default function ScanPage() {
     },
     [add, game, guideInVideo, batch, sound],
   );
+
+  // ---- retake & delete from the scans sidebar
+  const startRetake = async (scan: ScanListItem) => {
+    const name = scan.cardName ?? 'this card';
+    const identified = IDENTIFIED.includes(scan.status);
+    const ok = await confirm({
+      title: 'Retake photo?',
+      message: identified ? (
+        <>
+          <p style={{ margin: 0 }}>
+            <strong>{name}</strong> has already been identified. Retaking removes that identification and the copy it added to your collection (including any condition, price or notes you edited), then identifies the card again from the new photo.
+          </p>
+          <p style={{ marginBottom: 0 }}>The current photo is kept until the new one is taken.</p>
+        </>
+      ) : (
+        <>
+          <p style={{ margin: 0 }}>The current photo will be replaced by the next one you take. The card stays in the queue and is identified from the new photo.</p>
+          <p style={{ marginBottom: 0 }}>The current photo is kept until the new one is taken.</p>
+        </>
+      ),
+      confirmLabel: 'Retake photo',
+    });
+    if (!ok) return;
+    setRetake({ scanId: scan.id, name });
+    if (captured) URL.revokeObjectURL(captured.url);
+    setCaptured(null);
+    // arm for the same card: a retake is allowed (expected) to show the card just scanned
+    clearTimeout(phaseTimer.current);
+    setPhase('idle');
+    lastSigRef.current = null;
+    Object.assign(detRef.current, { armed: true, stable: 0, newCard: 0, emptySince: null });
+    if (camState !== 'on') {
+      reopenDisarmed.current = false;
+      void startCamera();
+    }
+    vpRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); // on phones the list sits below the camera
+    toast(`Retaking ${name} — place the card in the frame`, 'info');
+  };
+
+  const deleteScan = async (scan: ScanListItem) => {
+    const name = scan.cardName ?? 'this card';
+    const identified = IDENTIFIED.includes(scan.status);
+    const ok = await confirm({
+      title: 'Delete scan?',
+      message: (
+        <p style={{ margin: 0 }}>
+          The photo of <strong>{name}</strong> and its place in the queue will be removed.
+          {identified ? ' The copy it added to your collection will be removed too.' : ''} This can't be undone.
+        </p>
+      ),
+      confirmLabel: 'Delete scan',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.del(`/api/scans/${scan.id}`);
+      if (retakeRef.current?.scanId === scan.id) setRetake(null);
+      toast(`Deleted scan of ${name}`, 'info');
+      scans.reload();
+    } catch (e) {
+      toast(e instanceof ApiError ? e.message : 'Delete failed', 'error');
+      scans.reload();
+    }
+  };
 
   const scanAnother = () => {
     if (captured) URL.revokeObjectURL(captured.url);
@@ -377,8 +453,10 @@ export default function ScanPage() {
                   : 'READY';
 
   const onFile = async (f: File) => {
-    const localId = await add(f, { gameHint: game || undefined, quality: { source: 'file' } });
-    toast('Captured', 'success');
+    const target = retakeRef.current;
+    const localId = await add(f, { gameHint: game || undefined, quality: { source: 'file' }, replaceScanId: target?.scanId, label: target?.name });
+    setRetake(null);
+    toast(target ? `Captured — replacing the photo of ${target.name}` : 'Captured', 'success');
     if (!batch && localId) {
       stopCamera();
       setCamState('paused');
@@ -432,6 +510,14 @@ export default function ScanPage() {
                     {found && <span className="badge good">Card detected</span>}
                   </>
                 )}
+              </div>
+            )}
+            {retake && !captured && (
+              <div className="retake-banner" role="status">
+                <span>📷 Retaking photo · {retake.name}</span>
+                <button className="btn sm" onClick={() => setRetake(null)}>
+                  Cancel
+                </button>
               </div>
             )}
             <div className="vp-mode" role="group" aria-label="Scan mode">
@@ -549,9 +635,13 @@ export default function ScanPage() {
           onDuplicate={(id, action) => void resolveDuplicate(id, action)}
           onRetry={(id) => void retry(id)}
           onDiscard={(id) => void discard(id)}
+          onRetake={(sc) => void startRetake(sc)}
+          onDelete={(sc) => void deleteScan(sc)}
+          retakingId={retake?.scanId ?? null}
         />
       </div>
       {dialog}
+      {confirmDialog}
     </div>
   );
 }

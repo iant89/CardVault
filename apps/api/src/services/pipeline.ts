@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { and, eq, sql, collectionItems, researchJobs, scans, cards, cardVariants } from '@cardvault/database';
-import { normalizeUpload, makeThumbnail, writeFileSafe } from '@cardvault/imaging';
+import { and, eq, inArray, sql, collectionItems, researchJobs, scans, cards, cardVariants, identifications } from '@cardvault/database';
+import { unlink } from 'node:fs/promises';
+import { normalizeUpload, makeThumbnail, writeFileSafe, resolveStoragePath } from '@cardvault/imaging';
 import type { SessionUser } from '@cardvault/shared';
 import type { AppContext } from '../context.js';
 
@@ -88,12 +89,12 @@ export async function createScan(ctx: AppContext, user: SessionUser, input: Crea
       quality: { ...img.quality, client: input.clientQuality ?? null },
       capturedAt: input.capturedAt ?? null,
     });
-    await tx.insert(researchJobs).values({ id: jobId, scanId: id, userId: user.id, queue: 'identification', label: 'New scan', stage: 'Queued for identification', priority: 3 });
+    await tx.insert(researchJobs).values({ id: jobId, bullJobId: jobId, scanId: id, userId: user.id, queue: 'identification', label: 'New scan', stage: 'Queued for identification', priority: 3 });
   });
 
   await ctx.queues.identification.add(
     'identify',
-    { scanId: id, userId: user.id, gameHint: input.gameHint, clientOcr: input.clientOcr?.slice(0, 4000) },
+    { scanId: id, userId: user.id, gameHint: input.gameHint, clientOcr: input.clientOcr?.slice(0, 4000), researchJobId: jobId },
     { jobId, priority: 3 },
   );
   await ctx.events.publish({ type: 'JOB_CREATED', userId: user.id, jobId, scanId: id, queue: 'identification', state: 'QUEUED', message: 'New scan queued' });
@@ -156,4 +157,153 @@ export async function addScanToCollection(
     .returning({ id: collectionItems.id });
   await ctx.db.update(scans).set({ collectionItemId: item!.id, cardId, variantId, updatedAt: new Date() }).where(eq(scans.id, scanId));
   return item!.id;
+}
+
+// ---------------------------------------------------------------- retake & delete
+
+const ACTIVE = ['QUEUED', 'PROCESSING', 'MATCHING', 'RESEARCHING', 'PRICING'] as const;
+const IDENTIFIED_STATUSES = ['IDENTIFIED', 'RESEARCHING', 'COMPLETED'];
+const WAITING_BULL = new Set(['waiting', 'delayed', 'prioritized', 'waiting-children']);
+
+async function removeFiles(ctx: AppContext, ...paths: (string | null | undefined)[]) {
+  for (const p of paths) {
+    if (!p) continue;
+    try {
+      await unlink(resolveStoragePath(ctx.storageDir, p));
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/**
+ * Cancel a scan's unfinished jobs. Waiting BullMQ jobs are removed; a job
+ * already running sees CANCELLED (or a changed image version) at its next
+ * checkpoint and discards its result.
+ */
+async function cancelScanJobs(ctx: AppContext, scanId: string, queues: ('identification' | 'research')[], stage: string) {
+  const rows = await ctx.db
+    .select()
+    .from(researchJobs)
+    .where(and(eq(researchJobs.scanId, scanId), inArray(researchJobs.queue, queues), inArray(researchJobs.status, [...ACTIVE])));
+  for (const r of rows) {
+    const q = r.queue === 'identification' ? ctx.queues.identification : ctx.queues.research;
+    const job = await q.getJob(r.bullJobId ?? r.id);
+    if (job && WAITING_BULL.has(await job.getState())) await job.remove().catch(() => undefined);
+    await ctx.db.update(researchJobs).set({ status: 'CANCELLED', stage, completedAt: new Date() }).where(eq(researchJobs.id, r.id));
+    await ctx.events.publish({ type: 'JOB_FAILED', userId: r.userId, jobId: r.id, scanId, state: 'CANCELLED', message: stage });
+  }
+}
+
+/** Remove the collection copy that this scan created (a copy added by hand is never touched). */
+async function removeScanCopy(ctx: AppContext, scanId: string) {
+  await ctx.db.delete(collectionItems).where(eq(collectionItems.scanId, scanId));
+}
+
+export type RetakeResult = { scanId: string; jobId: string; requeued: 'kept' | 'requeued' };
+
+/**
+ * Replace a scan's photo. The old photo is removed only after the new one is
+ * stored.
+ *  - Not identified yet: the scan keeps its place in the queue and is
+ *    identified from the new photo.
+ *  - Already identified: the identification (and the collection copy it
+ *    created) is removed and the scan is queued for identification again.
+ */
+export async function retakeScan(ctx: AppContext, scanId: string, buffer: Buffer, clientQuality?: Record<string, unknown>): Promise<RetakeResult> {
+  const [scan] = await ctx.db.select().from(scans).where(eq(scans.id, scanId));
+  if (!scan) throw new Error('scan not found');
+  const img = await normalizeUpload(buffer);
+  const version = scan.imageVersion + 1;
+  const rel = `scans/${scan.userId}/${month()}/${scan.id}-v${version}.jpg`;
+  const thumbRel = `thumbnails/scans/${scan.userId}/${month()}/${scan.id}-v${version}.webp`;
+  await writeFileSafe(ctx.storageDir, rel, img.buffer);
+  await writeFileSafe(ctx.storageDir, thumbRel, await makeThumbnail(img.buffer));
+
+  const wasIdentified = !!scan.cardId && IDENTIFIED_STATUSES.includes(scan.status);
+  // latest identification run for this scan (absent once identified: that row became the research job)
+  const [idRow] = wasIdentified
+    ? []
+    : await ctx.db
+        .select()
+        .from(researchJobs)
+        .where(and(eq(researchJobs.scanId, scanId), eq(researchJobs.queue, 'identification')))
+        .orderBy(sql`${researchJobs.createdAt} DESC`)
+        .limit(1);
+
+  if (wasIdentified) {
+    await cancelScanJobs(ctx, scanId, ['research'], 'Photo retaken');
+    await removeScanCopy(ctx, scanId);
+  }
+
+  await ctx.db.transaction(async (tx) => {
+    await tx
+      .update(scans)
+      .set({
+        imagePath: rel,
+        thumbnailPath: thumbRel,
+        imageHash: img.dhash,
+        contentHash: img.sha256,
+        width: img.width,
+        height: img.height,
+        sizeBytes: img.buffer.length,
+        mimeType: img.mimeType,
+        quality: { ...img.quality, client: clientQuality ?? null, retake: version },
+        imageVersion: version,
+        status: 'UPLOADED',
+        confidence: null,
+        cardId: null,
+        variantId: null,
+        collectionItemId: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(scans.id, scanId));
+    // old candidates were computed from the old photo
+    await tx.delete(identifications).where(eq(identifications.scanId, scanId));
+  });
+  await removeFiles(ctx, scan.imagePath, scan.thumbnailPath);
+
+  let jobId: string;
+  let requeued: RetakeResult['requeued'];
+  if (idRow) {
+    // keep its existing queue entry
+    jobId = idRow.id;
+    requeued = 'kept';
+    const current = await ctx.queues.identification.getJob(idRow.bullJobId ?? idRow.id);
+    const waiting = current && WAITING_BULL.has(await current.getState());
+    // a waiting job will simply read the new photo when it runs; otherwise start a fresh run on the same row
+    const bullJobId = waiting ? (idRow.bullJobId ?? idRow.id) : `${idRow.id}-v${version}`;
+    await ctx.db
+      .update(researchJobs)
+      .set({ status: 'QUEUED', stage: 'Photo retaken — queued for identification', progress: 0, error: null, completedAt: null, bullJobId, label: 'Retaken scan' })
+      .where(eq(researchJobs.id, idRow.id));
+    if (!waiting) {
+      await ctx.queues.identification.add(
+        'identify',
+        { scanId, userId: scan.userId, gameHint: scan.gameHint ?? undefined, researchJobId: idRow.id },
+        { jobId: bullJobId, priority: 2 },
+      );
+    }
+  } else {
+    jobId = randomUUID();
+    requeued = 'requeued';
+    await ctx.db.insert(researchJobs).values({ id: jobId, bullJobId: jobId, scanId, userId: scan.userId, queue: 'identification', label: 'Retaken scan', stage: 'Photo retaken — queued for identification', priority: 2 });
+    await ctx.queues.identification.add('identify', { scanId, userId: scan.userId, gameHint: scan.gameHint ?? undefined, researchJobId: jobId }, { jobId, priority: 2 });
+  }
+  await ctx.events.publish({ type: 'JOB_CREATED', userId: scan.userId, jobId, scanId, queue: 'identification', state: 'QUEUED', message: 'Photo retaken' });
+  return { scanId, jobId, requeued };
+}
+
+/** Delete a scan: its jobs, photos, identification history and the collection copy it created. */
+export async function deleteScan(ctx: AppContext, scanId: string): Promise<{ removedCopy: boolean }> {
+  const [scan] = await ctx.db.select().from(scans).where(eq(scans.id, scanId));
+  if (!scan) throw new Error('scan not found');
+  await cancelScanJobs(ctx, scanId, ['identification', 'research'], 'Scan deleted');
+  const copies = await ctx.db.select({ id: collectionItems.id }).from(collectionItems).where(eq(collectionItems.scanId, scanId));
+  await removeScanCopy(ctx, scanId);
+  // identifications and manual reviews cascade; job rows keep their history with scan_id = NULL
+  await ctx.db.delete(scans).where(eq(scans.id, scanId));
+  await removeFiles(ctx, scan.imagePath, scan.thumbnailPath);
+  await ctx.events.publish({ type: 'JOB_FAILED', userId: scan.userId, scanId, state: 'CANCELLED', message: 'Scan deleted' });
+  return { removedCopy: copies.length > 0 };
 }
