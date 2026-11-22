@@ -1,11 +1,12 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { desc, eq, inArray, ocrEvaluations, ocrExams, ocrSamples, sql, and, ne } from '@cardvault/database';
+import { desc, eq, inArray, ocrEvaluations, ocrExams, ocrModels, ocrSamples, sql, and, ne } from '@cardvault/database';
 import { GAME_MODULES } from '@cardvault/card-model';
 import { cropRegion, resolveStoragePath, simulateCapture, writeFileSafe } from '@cardvault/imaging';
 import { normalizeCollectorNumber, type GameSlug } from '@cardvault/shared';
 import type { WorkerContext } from '../context.js';
-import { ENGINE_ID, readLine } from '../identification/ocr.js';
+import { ENGINE_ID } from '../identification/ocr.js';
+import { engineFor } from '../identification/engines.js';
 import { cer, eraOf, fnv1a, metrics, namePrediction, nameNorm, numberPrediction, sliceReport, splitFor, type ScoredItem } from '../identification/ocr-data.js';
 import { labelScanSamples } from '../identification/samples.js';
 import { nameIndex } from '../identification/dictionary.js';
@@ -21,7 +22,8 @@ export async function labelReviewed(ctx: WorkerContext, data: { scanId: string; 
 // ------------------------------------------------------------------ evaluation
 
 /**
- * Score the current engine on the frozen exam and on the regression set.
+ * Score an engine (Tesseract, or a registered model) on the frozen exam and
+ * on the regression set.
  * Names are scored per line; numbers per scan (whatever its number spots
  * agree on), exactly as identification uses them.
  */
@@ -54,7 +56,8 @@ export async function evaluate(ctx: WorkerContext, data: { evaluationId: string 
     for (const rows of numberGroups.values()) units.push({ field: 'number', rows: rows.sort((a, b) => a.region - b.region) });
     units.sort((a, b) => fnv1a(a.rows[0]!.groupKey) - fnv1a(b.rows[0]!.groupKey));
 
-    await ctx.db.update(ocrEvaluations).set({ status: 'running', engine: ENGINE_ID, examId: exam.id, examVersion: exam.version, progress: { done: 0, total: units.length } }).where(eq(ocrEvaluations.id, ev.id));
+    const engine = await engineFor(ctx, ev.engine.startsWith('model:') ? ev.engine : 'tesseract');
+    await ctx.db.update(ocrEvaluations).set({ status: 'running', engine: engine.id, examId: exam.id, examVersion: exam.version, progress: { done: 0, total: units.length } }).where(eq(ocrEvaluations.id, ev.id));
 
     const items: ScoredItem[] = [];
     const misses: Record<string, unknown>[] = [];
@@ -74,7 +77,7 @@ export async function evaluate(ctx: WorkerContext, data: { evaluationId: string 
           break;
         }
         const t0 = Date.now();
-        const reading = await readLine(crop, u.field, { numberChars: layout?.numberChars, log: ctx.log, langPath: ctx.config.OCR_LANG_PATH });
+        const reading = await engine.read(crop, u.field, { numberChars: layout?.numberChars });
         readMs += Date.now() - t0;
         lines++;
         texts.push(reading.text);
@@ -122,11 +125,11 @@ export async function evaluate(ctx: WorkerContext, data: { evaluationId: string 
     const [prev] = await ctx.db
       .select()
       .from(ocrEvaluations)
-      .where(and(eq(ocrEvaluations.examVersion, exam.version), eq(ocrEvaluations.status, 'done'), ne(ocrEvaluations.id, ev.id)))
+      .where(and(eq(ocrEvaluations.examVersion, exam.version), eq(ocrEvaluations.status, 'done'), eq(ocrEvaluations.engine, engine.id), ne(ocrEvaluations.id, ev.id)))
       .orderBy(desc(ocrEvaluations.completedAt))
       .limit(1);
     const summary = {
-      engine: ENGINE_ID,
+      engine: engine.id,
       examVersion: exam.version,
       units: items.length,
       exam: items.filter((x) => x.exam).length,
@@ -219,7 +222,7 @@ export async function importHarvest(ctx: WorkerContext, data: { limit?: number; 
           region,
           cropPath,
           engine: 'none',
-          labelText: field === 'name' ? c.name : set?.official ? `${c.localId}/${set.official}` : c.localId,
+          labelText: field === 'name' ? c.name : set?.official ? printedNumber(`${c.localId}/${set.official}`) : c.localId,
           labelNorm: field === 'name' ? nameNorm(c.name) : number,
           labelSource: 'harvest',
           split,
@@ -237,6 +240,105 @@ export async function importHarvest(ctx: WorkerContext, data: { limit?: number; 
   }
   await status({ status: 'done', done: todo.length, total: todo.length, added, skipped, alreadyImported: existing.size });
   return { added, skipped };
+}
+
+// ------------------------------------------------------------------ training data export
+
+export const DATASET_KEY = 'ocr:dataset';
+
+/** "043/72" → "043/072": modern cards pad the set total to the number's width. */
+export function printedNumber(text: string): string {
+  const m = /^(\d+)\/(\d+)$/.exec(text);
+  if (!m || !m[1]!.startsWith('0')) return text;
+  return `${m[1]}/${m[2]!.padStart(m[1]!.length, '0')}`;
+}
+
+/**
+ * Write a versioned snapshot of trustworthy TRAINING lines for
+ * tools/ocr-trainer: storage/ocr/datasets/<id>/{train.jsonl, info.json}.
+ * Never included: exam-side lines (split = 'exam') and labels that only the
+ * engine itself vouched for ('self'). Lines a person corrected count triple.
+ * Crops are referenced, not copied (paths relative to the storage folder).
+ */
+export async function exportDataset(ctx: WorkerContext) {
+  const id = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '').replace('T', '-');
+  const rows = await ctx.db.execute(sql`
+    SELECT id, group_key, game, field, region, crop_path, label_text, label_norm, label_source, regression, meta
+    FROM ocr_samples
+    WHERE split = 'train' AND label_source IN ('review', 'corroborated', 'harvest') AND label_norm IS NOT NULL`);
+  type Row = { id: string; group_key: string; game: string; field: string; region: number; crop_path: string; label_text: string | null; label_norm: string; label_source: string; regression: boolean; meta: Record<string, unknown> };
+  const all = rows as unknown as Row[];
+
+  // which number spot carries the number, per harvested set (scans know it from their own reading)
+  const tess = await engineFor(ctx, 'tesseract');
+  const bySet = new Map<string, Row[]>();
+  for (const r of all) if (r.label_source === 'harvest' && r.field === 'number') (bySet.get(String(r.meta.set)) ?? bySet.set(String(r.meta.set), []).get(String(r.meta.set))!).push(r);
+  const numberRegion: Record<string, number | null> = {};
+  for (const [set, list] of bySet) {
+    const groups = [...new Set(list.map((r) => r.group_key))].sort((a, b) => fnv1a(a) - fnv1a(b)).slice(0, 6);
+    const votes = new Map<number, number>();
+    for (const g of groups) {
+      for (const r of list.filter((x) => x.group_key === g)) {
+        const crop = await readFile(resolveStoragePath(ctx.storageDir, r.crop_path)).catch(() => null);
+        if (!crop) continue;
+        const reading = await tess.read(crop, 'number', { numberChars: GAME_MODULES[r.game as GameSlug]?.ocrLayout?.numberChars });
+        if (numberPrediction(reading.text, r.game)?.norm === r.label_norm) votes.set(r.region, (votes.get(r.region) ?? 0) + 1);
+      }
+    }
+    const ranked = [...votes.entries()].sort((a, b) => b[1] - a[1]);
+    numberRegion[set] = ranked[0] && ranked[0][1] >= 2 && ranked[0][1] > (ranked[1]?.[1] ?? 0) ? ranked[0][0] : null;
+  }
+
+  const lines: string[] = [];
+  const counts: Record<string, number> = {};
+  for (const r of all) {
+    let text: string | null = null;
+    if (r.field === 'name') text = r.label_text;
+    else if (r.label_source === 'harvest') text = numberRegion[String(r.meta.set)] === r.region ? printedNumber(r.label_text ?? '') : null;
+    else text = r.label_text; // set only where that spot's own reading matched the card
+    if (!text) continue;
+    const weight = r.regression ? 3 : r.label_source === 'review' ? 2 : 1;
+    lines.push(JSON.stringify({ id: r.id, crop: r.crop_path, text, field: r.field, game: r.game, source: r.label_source, group: r.group_key, weight }));
+    const k = `${r.label_source} · ${r.field}`;
+    counts[k] = (counts[k] ?? 0) + 1;
+  }
+  const body = lines.join('\n') + '\n';
+  const { createHash } = await import('node:crypto');
+  const info = {
+    id,
+    createdAt: new Date().toISOString(),
+    rows: lines.length,
+    counts,
+    sha256: createHash('sha256').update(body).digest('hex'),
+    numberRegions: numberRegion,
+    storage: ctx.storageDir,
+    rules: 'split=train only; sources review/corroborated/harvest; review x2, regression x3',
+  };
+  await writeFileSafe(ctx.storageDir, `ocr/datasets/${id}/train.jsonl`, Buffer.from(body));
+  await writeFileSafe(ctx.storageDir, `ocr/datasets/${id}/info.json`, Buffer.from(JSON.stringify(info, null, 2)));
+  await ctx.redis.set(DATASET_KEY, JSON.stringify({ ...info, dir: path.join(ctx.storageDir, 'ocr', 'datasets', id) }));
+  ctx.log.info({ dataset: id, rows: lines.length }, 'OCR training data exported');
+  return info;
+}
+
+// ------------------------------------------------------------------ model registry
+
+/** Register models the trainer wrote to storage/ocr/models/<id>/ (model.onnx + card.json). */
+export async function scanModels(ctx: WorkerContext) {
+  const { readdir } = await import('node:fs/promises');
+  const root = path.join(ctx.storageDir, 'ocr', 'models');
+  const dirs = await readdir(root, { withFileTypes: true }).catch(() => []);
+  let added = 0;
+  for (const d of dirs) {
+    if (!d.isDirectory()) continue;
+    const card = JSON.parse(await readFile(path.join(root, d.name, 'card.json'), 'utf8').catch(() => 'null')) as { id?: string } | null;
+    const onnx = await readFile(path.join(root, d.name, 'model.onnx')).then(() => true, () => false);
+    if (!card?.id || !onnx) continue;
+    const r = await ctx.db.insert(ocrModels).values({ id: card.id, dir: `ocr/models/${d.name}`, card: card as Record<string, unknown> }).onConflictDoNothing().returning({ id: ocrModels.id });
+    added += r.length;
+  }
+  if (added) ctx.log.info({ added }, 'OCR models registered');
+  return { added };
 }
 
 export { ENGINE_ID, metrics };

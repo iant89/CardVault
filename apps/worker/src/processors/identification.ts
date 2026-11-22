@@ -9,6 +9,8 @@ import { ocrCard, type OcrResult } from '../identification/ocr.js';
 import { extractSignals } from '../identification/extract.js';
 import { nameIndex } from '../identification/dictionary.js';
 import { labelScanSamples, saveScanSamples } from '../identification/samples.js';
+import { liveEngine, shadowEngine } from '../identification/engines.js';
+import { GAME_MODULES } from '@cardvault/card-model';
 import { localCandidates, remoteCandidates, scoreCandidates } from '../identification/identify.js';
 import { run } from './common.js';
 
@@ -61,9 +63,19 @@ export async function processIdentification(ctx: WorkerContext, job: Job<Identif
     let ocr: OcrResult = { full: '', top: '', bottom: '', confidence: 0 };
     if (ctx.config.OCR_ENABLED) {
       try {
-        ocr = await ocrCard(image, ctx.log, ctx.config.OCR_LANG_PATH, job.data.gameHint ?? scan.gameHint ?? undefined);
+        const reader = await liveEngine(ctx);
+        ocr = await ocrCard(image, ctx.log, ctx.config.OCR_LANG_PATH, job.data.gameHint ?? scan.gameHint ?? undefined, reader ?? undefined);
       } catch (e) {
         ctx.log.warn({ err: (e as Error).message }, 'OCR failed; continuing with other signals');
+      }
+    }
+    // a model on live trial reads the same lines; recorded with the samples, never used here
+    const trial = ocr.lines?.length ? await shadowEngine(ctx) : null;
+    if (trial && ocr.layoutGame) {
+      const chars = GAME_MODULES[ocr.layoutGame as GameSlug]?.ocrLayout?.numberChars;
+      for (const l of ocr.lines!) {
+        const r = await trial.read(l.crop, l.field, { numberChars: chars }).catch(() => null);
+        if (r) l.shadow = { engine: trial.id, text: r.text, confidence: r.confidence };
       }
     }
     // keep the lines just read as (unlabelled) OCR samples; never let this break a scan

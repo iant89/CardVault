@@ -37,6 +37,14 @@ const schema = z.object({
   HARVESTER_OUT_DIR: z.string().optional(),
   /** Override the TCGdex API address (testing against tools/tcgdex-harvester/test/mock-tcgdex.mjs). */
   HARVESTER_API: z.string().url().optional(),
+  /** OCR model live trial: confirmed lines needed before a model may be promoted (0 = no trial required). */
+  OCR_TRIAL_MIN_LINES: z.coerce.number().int().min(0).default(40),
+  /** OCR live watch: confirmed lines / scans needed on each side before judging an active model. */
+  OCR_WATCH_MIN_LINES: z.coerce.number().int().min(1).default(30),
+  OCR_WATCH_MIN_SCANS: z.coerce.number().int().min(1).default(20),
+  /** Roll an active model back if live accuracy drops by more than this, or manual reviews rise by more than this. */
+  OCR_WATCH_MAX_DROP: z.coerce.number().min(0).max(1).default(0.05),
+  OCR_WATCH_MAX_REVIEW_RISE: z.coerce.number().min(0).max(1).default(0.15),
 });
 
 export type AppConfig = z.infer<typeof schema>;
