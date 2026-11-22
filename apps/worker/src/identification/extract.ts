@@ -24,9 +24,14 @@ const NAME_SUFFIX = /^(ex|gx|v|vmax|vstar|lv\.?x?|prime|break|star|δ|◇)$/i;
  */
 export function trimDebris(line: string): string {
   const t = line.split(' ').filter(Boolean);
+  // card names start with a capital: a lowercase (or symbol-led) first word
+  // followed by a capitalised one is a misread badge ("oasic Porygon")
+  const misreadLead = () => t.length > 1 && !/^\p{Lu}/u.test(t[0]!) && t.slice(1).some((w) => /^\p{Lu}/u.test(w));
+  // HP with its tiny "HP" misread as letters: "w90", "HP60"
+  const hpTail = (w: string) => /^[a-z]{0,2}\d{2,3}$/i.test(w) && !/^\p{Lu}\p{L}*\d$/u.test(w);
   const junk = (w: string) => /^[\d.,:\-]+$/.test(w) || /^hp$/i.test(w) || (w.length <= 2 && !NAME_SUFFIX.test(w) && !/^\p{Lu}\p{Ll}\.?$/u.test(w));
-  while (t.length && (junk(t[0]!) || LEAD_WORD.test(t[0]!))) t.shift();
-  while (t.length && junk(t[t.length - 1]!)) t.pop();
+  while (t.length && (junk(t[0]!) || LEAD_WORD.test(t[0]!) || misreadLead())) t.shift();
+  while (t.length && (junk(t[t.length - 1]!) || LEAD_WORD.test(t[t.length - 1]!) || hpTail(t[t.length - 1]!))) t.pop();
   return t.join(' ').replace(/[\s,.:\-]+$/, '');
 }
 
@@ -50,26 +55,51 @@ export function extractSignals(text: { full: string; top: string; bottom: string
   const lines: string[] = [];
   for (const l of raw) {
     const t = trimDebris(l);
-    if (t && t !== l) lines.push(t);
+    if (!t) continue; // nothing but labels and debris ("Supporter TRAINER")
+    if (t !== l) lines.push(t);
     lines.push(l);
   }
   const nameCandidates = [...new Set(lines.filter((l) => l.length >= 3 && l.length <= 48 && /\p{L}{3}/u.test(l) && !STOP.test(l)))].slice(0, 6);
 
-  // Collector numbers using every known game's patterns (prefer footer band)
-  const numbers: ExtractedSignals['numbers'] = [];
+  // Collector numbers using every known game's patterns (prefer footer band).
+  // The footer text holds several readings of the same spot, so a number seen
+  // in more of them ranks first.
+  const found = new Map<string, { raw: string; norm: string; total?: string; hits: number; order: number }>();
   const games = gameGuesses.length && gameGuesses[0]!.score > 0 ? [gameGuesses[0]!.game] : (Object.keys(GAME_MODULES) as GameSlug[]);
-  for (const src of [text.bottom, text.full]) {
-    for (const g of games) {
-      for (const re of GAME_MODULES[g].collectorNumberPatterns) {
-        const rg = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
-        for (const m of src.matchAll(rg)) {
-          const raw = m[0].replace(/\s+/g, '');
-          if (numbers.some((n) => n.raw === raw)) continue;
-          numbers.push({ raw, norm: normalizeCollectorNumber(m[1] ?? raw), total: m[2] });
+  const note = (rawIn: string, num: string, total: string | undefined, weight: number) => {
+    let numerator = num;
+    // "E086/193": letters glued on from the symbols beside the number. A numeric
+    // total means a numeric number (prefixed numbers have prefixed totals: TG05/TG30)
+    if (total && /^\d+$/.test(total)) numerator = numerator.replace(/^[A-Z]+(?=\d)/, '');
+    const norm = normalizeCollectorNumber(numerator);
+    const key = `${norm}/${total ?? ''}`;
+    const raw = total ? `${numerator}/${total}` : rawIn.replace(/\s+/g, '');
+    const cur = found.get(key);
+    if (cur) cur.hits += weight;
+    else found.set(key, { raw, norm, total, hits: weight, order: found.size });
+  };
+  for (const [src, weight] of [[text.bottom, 2], [text.full, 1]] as const) {
+    for (const line of src.split('\n')) {
+      let hit = false;
+      for (const g of games) {
+        for (const re of GAME_MODULES[g].collectorNumberPatterns) {
+          const rg = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+          for (const m of line.matchAll(rg)) {
+            hit = true;
+            note(m[0], m[1] ?? m[0], m[2], weight);
+          }
         }
+      }
+      // "0861193": the slash read as a 1 (only in the targeted number readings)
+      if (!hit && src === text.bottom && games.includes('pokemon' as GameSlug)) {
+        const m = /(?<!\d)(\d{3})[1lI|](\d{3})(?!\d)/.exec(line);
+        if (m) note(m[0], m[1]!, m[2], weight * 0.5);
       }
     }
   }
+  const numbers: ExtractedSignals['numbers'] = [...found.values()]
+    .sort((x, y) => y.hits - x.hits || x.order - y.order)
+    .map(({ raw, norm, total }) => (total ? { raw, norm, total } : { raw, norm }));
 
   const lower = all.toLowerCase();
   const variantHints: VariantType[] = [];

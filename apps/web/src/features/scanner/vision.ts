@@ -439,8 +439,12 @@ function locateAround(frame: ImageData, quad: Quad, pad: number, analysisW: numb
  * the card is searched for around the outline, then, wider, around the guide
  * the user placed it in. If it is found, a corrected crop is offered.
  */
-export function planCapture(frame: ImageData, live: Quad | null, guide: Rect, outW = 750, analysisW = 360): CapturePlan {
+export function planCapture(frame: ImageData, live: Quad | null, guide: Rect, minW = 750, analysisW = 360, maxW = minW): CapturePlan {
   const base = live ?? rectQuad(guide);
+  // keep the camera's detail: as wide as the card appears in the frame
+  // (between minW and maxW), so small print like collector numbers survives
+  const seen = (Math.hypot(base[1].x - base[0].x, base[1].y - base[0].y) + Math.hypot(base[2].x - base[3].x, base[2].y - base[3].y)) / 2;
+  const outW = Math.round(Math.min(maxW, Math.max(minW, seen)));
   const original = warpCard(frame, base, outW);
   let found = live ? locateAround(frame, live, LIVE_PAD, analysisW) : null;
   if (found && found.deviation <= MISALIGNED) return { original, adjusted: null, deviation: found.deviation, needsReview: false };

@@ -74,4 +74,6 @@ export interface CardProvider {
   getPrices?(card: NormalizedCard, ctx: ProviderContext): Promise<PriceObservationInput[]>;
   getSales?(card: NormalizedCard, ctx: ProviderContext): Promise<SaleObservation[]>;
   getImages?(card: NormalizedCard, ctx: ProviderContext): Promise<string[]>;
+  /** Every card name this source knows for a game (used to correct OCR'd names). */
+  listCardNames?(game: GameSlug, ctx: ProviderContext): Promise<string[]>;
 }

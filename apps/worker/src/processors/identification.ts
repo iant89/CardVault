@@ -5,8 +5,9 @@ import { resolveStoragePath } from '@cardvault/imaging';
 import { CONFIDENCE, decideConfidence, type GameSlug, type IdentificationJobData, type VariantType } from '@cardvault/shared';
 import type { WorkerContext } from '../context.js';
 import { JobCancelled, JobTracker } from '../jobs/state.js';
-import { ocrCard } from '../identification/ocr.js';
+import { ocrCard, type OcrResult } from '../identification/ocr.js';
 import { extractSignals } from '../identification/extract.js';
+import { nameIndex } from '../identification/dictionary.js';
 import { localCandidates, remoteCandidates, scoreCandidates } from '../identification/identify.js';
 import { run } from './common.js';
 
@@ -56,10 +57,10 @@ export async function processIdentification(ctx: WorkerContext, job: Job<Identif
 
     // 1. OCR
     await tracker.update('PROCESSING', 'Reading card text (OCR)', 20);
-    let ocr = { full: '', top: '', bottom: '', confidence: 0 };
+    let ocr: OcrResult = { full: '', top: '', bottom: '', confidence: 0 };
     if (ctx.config.OCR_ENABLED) {
       try {
-        ocr = await ocrCard(image, ctx.log, ctx.config.OCR_LANG_PATH);
+        ocr = await ocrCard(image, ctx.log, ctx.config.OCR_LANG_PATH, job.data.gameHint ?? scan.gameHint ?? undefined);
       } catch (e) {
         ctx.log.warn({ err: (e as Error).message }, 'OCR failed; continuing with other signals');
       }
@@ -72,6 +73,18 @@ export async function processIdentification(ctx: WorkerContext, job: Job<Identif
     const hint = job.data.gameHint ?? scan.gameHint ?? undefined;
     const sig = extractSignals(ocr, hint);
     const topGame = sig.gameGuesses[0] && sig.gameGuesses[0].score >= 0.34 ? sig.gameGuesses[0].game : null;
+    // correct OCR'd names against every known card name for the game
+    const dictGame = (hint as GameSlug | undefined) ?? topGame ?? ((ocr.layoutGame as GameSlug | undefined) ?? null);
+    if (dictGame) {
+      const index = await nameIndex(ctx, dictGame);
+      if (index) {
+        const fixed = index.correct([...ocr.top.split('\n').slice(0, 6), ...sig.nameCandidates]).map((m) => m.name);
+        if (fixed.length) {
+          ctx.log.debug({ scanId, read: sig.nameCandidates.slice(0, 3), corrected: fixed }, 'names corrected from dictionary');
+          sig.nameCandidates = [...new Set([...fixed, ...sig.nameCandidates])].slice(0, 6);
+        }
+      }
+    }
     const cands = await localCandidates(ctx, sig, scan.imageHash, (hint as GameSlug) ?? topGame);
     let scored = scoreCandidates(cands.values(), sig, `${ocr.top}\n${ocr.full}`, scan.imageHash);
 

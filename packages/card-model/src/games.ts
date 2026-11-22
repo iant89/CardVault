@@ -21,7 +21,26 @@ export interface GameModule {
   collectorNumberPatterns: RegExp[];
   /** Keywords that suggest an OCR'd card belongs to this game. */
   ocrKeywords: string[];
+  /** Where the name and collector number are printed, for targeted OCR. */
+  ocrLayout?: OcrLayout;
   theme: string;
+}
+
+/** A region of the card as fractions of its width/height (0–1). */
+export interface OcrRegion {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+export interface OcrLayout {
+  /** the title line (read as a single line) */
+  name: OcrRegion[];
+  /** spots where the collector number / set code can be printed */
+  number: OcrRegion[];
+  /** characters allowed when reading the number spots */
+  numberChars: string;
 }
 
 const attack = z.object({
@@ -136,6 +155,16 @@ export const GAME_MODULES: Record<GameSlug, GameModule> = {
     ],
     collectorNumberPatterns: [/\b([A-Z]{0,4}\d{1,3})\s*\/\s*([A-Z]{0,4}\d{1,3})\b/, /\b(SWSH\d{2,3}|SVP?\s?\d{2,3}|SM\d{2,3}|XY\d{2,3})\b/i],
     ocrKeywords: ['hp', 'weakness', 'resistance', 'retreat', 'pokemon', 'pokémon', 'evolves', 'basic', 'stage', 'trainer', 'energy'],
+    ocrLayout: {
+      // name sits right of the stage badge; HP and type icon are on the right
+      name: [{ left: 0.15, top: 0.035, width: 0.6, height: 0.07 }],
+      // bottom-left (Sword & Shield onwards) and bottom-right (older sets)
+      number: [
+        { left: 0.02, top: 0.915, width: 0.4, height: 0.05 },
+        { left: 0.58, top: 0.915, width: 0.4, height: 0.05 },
+      ],
+      numberChars: '0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+    },
     theme: 'pokemon',
   },
   magic: {
@@ -155,6 +184,13 @@ export const GAME_MODULES: Record<GameSlug, GameModule> = {
     ],
     collectorNumberPatterns: [/\b(\d{1,4})\s*\/\s*(\d{1,4})\b/, /\b(\d{3,4})\s+[CURMSLT]\b/],
     ocrKeywords: ['creature', 'instant', 'sorcery', 'enchantment', 'artifact', 'planeswalker', 'land', 'legendary', 'wizards of the coast', 'illus'],
+    ocrLayout: {
+      // title bar, left of the mana cost
+      name: [{ left: 0.06, top: 0.04, width: 0.62, height: 0.06 }],
+      // collector number + set code, bottom-left (two small lines)
+      number: [{ left: 0.03, top: 0.925, width: 0.42, height: 0.06 }],
+      numberChars: '0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZ ',
+    },
     theme: 'magic',
   },
   yugioh: {
@@ -175,6 +211,13 @@ export const GAME_MODULES: Record<GameSlug, GameModule> = {
     ],
     collectorNumberPatterns: [/\b([A-Z0-9]{2,5}-[A-Z]{0,2}\d{2,4})\b/],
     ocrKeywords: ['atk', 'def', 'effect', 'spell card', 'trap card', 'konami', 'dragon', 'warrior', 'spellcaster', 'fiend'],
+    ocrLayout: {
+      // name bar, left of the attribute icon
+      name: [{ left: 0.06, top: 0.035, width: 0.74, height: 0.065 }],
+      // set code just below the artwork, on the right
+      number: [{ left: 0.55, top: 0.715, width: 0.42, height: 0.045 }],
+      numberChars: '0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+    },
     theme: 'yugioh',
   },
   football: sports('football', 'Football', 'football', ['nfl', 'quarterback', 'touchdown', 'panini', 'topps', 'rookie']),

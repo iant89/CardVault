@@ -75,6 +75,12 @@ export const scryfallProvider: CardProvider = {
   allowedHosts: ['api.scryfall.com', 'cards.scryfall.io'],
   isConfigured: () => true,
 
+  /** Every English Magic card name (Scryfall's name catalog). */
+  async listCardNames(_game, ctx) {
+    const r = await ctx.http.getJson<{ data: string[] }>(`${BASE}/catalog/card-names`, { headers, timeoutMs: 60_000, maxBytes: 40 * 1024 * 1024 });
+    return r.data;
+  },
+
   async search(query, ctx) {
     const parts: string[] = [];
     if (query.name) parts.push(`!"${q(query.name)}"`);
