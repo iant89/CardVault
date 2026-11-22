@@ -372,3 +372,88 @@ export function refineCrop(gray: Float32Array, w: number, h: number, expected: R
   const deviation = Math.max(...d.corners.map((p, i) => Math.hypot(p.x - exp[i]!.x, p.y - exp[i]!.y))) / expected.w;
   return { corners: d.corners, deviation };
 }
+
+/** Grayscale, box-filtered down to `outW` pixels wide (no canvas needed). */
+export function grayDownscale(img: ImageData, outW: number): { g: Float32Array; w: number; h: number; sc: number } {
+  const sc = outW / img.width;
+  const w = outW, h = Math.max(1, Math.round(img.height * sc));
+  const sum = new Float32Array(w * h), cnt = new Float32Array(w * h);
+  const d = img.data, iw = img.width;
+  for (let y = 0; y < img.height; y++) {
+    const ty = Math.min(h - 1, (y * sc) | 0);
+    for (let x = 0; x < iw; x++) {
+      const j = (y * iw + x) * 4, t = ty * w + Math.min(w - 1, (x * sc) | 0);
+      sum[t] = sum[t]! + 0.299 * d[j]! + 0.587 * d[j + 1]! + 0.114 * d[j + 2]!;
+      cnt[t] = cnt[t]! + 1;
+    }
+  }
+  for (let i = 0; i < sum.length; i++) sum[i] = cnt[i] ? sum[i]! / cnt[i]! : 0;
+  return { g: sum, w, h, sc };
+}
+
+export interface CapturePlan {
+  /** the crop as captured: along the live outline, or the guide when there is none */
+  original: ImageData;
+  /** a crop along the card's re-found edges, when they differ from the original crop */
+  adjusted: ImageData | null;
+  /** how far the original crop was off (fraction of card width); null if it couldn't be checked */
+  deviation: number | null;
+  /** true unless the original crop was verified to sit on the card's real edges */
+  needsReview: boolean;
+}
+
+/** Margin searched around the live outline, and (wider) around the guide as a fallback. */
+export const LIVE_PAD = 0.08;
+export const GUIDE_PAD = 0.15;
+
+/**
+ * Re-find the card's edges inside `quad` grown by `pad`. Returns the card's
+ * corners in frame coordinates and how far they are from `quad`, or null.
+ */
+function locateAround(frame: ImageData, quad: Quad, pad: number, analysisW: number): { corners: Quad; deviation: number } | null {
+  const outW = 600; // working resolution of the padded crop
+  const padW = Math.round(outW * (1 + 2 * pad));
+  const big = expandQuad(quad, pad);
+  const padded = warpCard(frame, big, padW);
+  const { g, w, h, sc } = grayDownscale(padded, analysisW);
+  const outH = outW / CARD_RATIO;
+  const expected = { x: ((padded.width - outW) / 2) * sc, y: ((padded.height - outH) / 2) * sc, w: outW * sc, h: outH * sc };
+  const r = refineCrop(g, w, h, expected);
+  if (!r) return null;
+  // map the corners from padded-crop space back into the frame through the same homography warpCard used
+  const H = homography(
+    [{ x: 0, y: 0 }, { x: padW - 1, y: 0 }, { x: padW - 1, y: padded.height - 1 }, { x: 0, y: padded.height - 1 }],
+    big,
+  );
+  const toFrame = (p: Pt): Pt => {
+    const x = p.x / sc, y = p.y / sc, z = H[6]! * x + H[7]! * y + H[8]!;
+    return { x: (H[0]! * x + H[1]! * y + H[2]!) / z, y: (H[3]! * x + H[4]! * y + H[5]!) / z };
+  };
+  return { corners: r.corners.map(toFrame) as Quad, deviation: r.deviation };
+}
+
+/**
+ * Decide what a capture produces. The photo is saved without asking only when
+ * the card's real edges were re-found and match the crop. A wrong live outline
+ * (cut-off, angled crop) or one that can't be checked goes to review: first
+ * the card is searched for around the outline, then, wider, around the guide
+ * the user placed it in. If it is found, a corrected crop is offered.
+ */
+export function planCapture(frame: ImageData, live: Quad | null, guide: Rect, outW = 750, analysisW = 360): CapturePlan {
+  const base = live ?? rectQuad(guide);
+  const original = warpCard(frame, base, outW);
+  let found = live ? locateAround(frame, live, LIVE_PAD, analysisW) : null;
+  if (found && found.deviation <= MISALIGNED) return { original, adjusted: null, deviation: found.deviation, needsReview: false };
+  let deviation = found?.deviation ?? null;
+  if (!found) {
+    const g = locateAround(frame, rectQuad(guide), GUIDE_PAD, analysisW);
+    if (g) {
+      // compare against the crop actually taken
+      const dev = Math.max(...g.corners.map((p, i) => Math.hypot(p.x - base[i]!.x, p.y - base[i]!.y))) / Math.hypot(base[1].x - base[0].x, base[1].y - base[0].y);
+      if (dev <= MISALIGNED) return { original, adjusted: null, deviation: dev, needsReview: false };
+      found = { corners: g.corners, deviation: dev };
+      deviation = dev;
+    }
+  }
+  return { original, adjusted: found ? warpCard(frame, found.corners, outW) : null, deviation, needsReview: true };
+}

@@ -5,14 +5,10 @@ import {
   autoLevels,
   CARD_RATIO,
   detectCard,
-  expandQuad,
-  MISALIGNED,
-  rectQuad,
-  refineCrop,
+  planCapture,
   regionSignature,
   signatureDiff,
   toGray,
-  warpCard,
   type Detection,
   type Quad,
   type Quality,
@@ -54,8 +50,6 @@ type Phase = 'idle' | 'captured' | 'ready';
 
 /** Output width of a captured card image (height follows the 63:88 ratio). */
 const OUT_W = 750;
-/** Margin added around the crop so the alignment check can see the card's real edges. */
-const ALIGN_PAD = 0.08;
 
 interface AlignReview {
   original: { blob: Blob; url: string };
@@ -321,29 +315,11 @@ export default function ScanPage() {
       const det = detRef.current.det;
       const q = qualityRef.current;
 
-      // 1. the crop as captured: detected outline, or the on-screen guide
-      const quad: Quad = det ? (det.corners.map((p) => ({ x: p.x * k, y: p.y * k })) as Quad) : rectQuad(guide);
-      const original = warpCard(frame, quad, OUT_W);
-
-      // 2. alignment check: re-find the card's real edges inside a padded crop
-      const padW = Math.round(OUT_W * (1 + 2 * ALIGN_PAD));
-      const padded = warpCard(frame, expandQuad(quad, ALIGN_PAD), padW);
-      const a = document.createElement('canvas');
-      const aw = ANALYSIS_W, ah = Math.round((padded.height * aw) / padded.width), sc = aw / padded.width;
-      a.width = aw;
-      a.height = ah;
-      const pc = document.createElement('canvas');
-      pc.width = padded.width;
-      pc.height = padded.height;
-      pc.getContext('2d')!.putImageData(padded, 0, 0);
-      const actx = a.getContext('2d', { willReadFrequently: true })!;
-      actx.drawImage(pc, 0, 0, aw, ah);
-      const { g } = toGray(actx.getImageData(0, 0, aw, ah));
-      // where the original crop assumed the card was: centred in the padded crop
-      const outH = OUT_W / CARD_RATIO;
-      const expected = { x: ((padded.width - OUT_W) / 2) * sc, y: ((padded.height - outH) / 2) * sc, w: OUT_W * sc, h: outH * sc };
-      const refined = refineCrop(g, aw, ah, expected);
-      const misaligned = refined ? refined.deviation > MISALIGNED : !det; // no outline and no edges found → can't vouch for the crop
+      // the crop along the live outline (or guide), re-checked against the card's
+      // real edges; anything not verified goes to the keep/retake review
+      const live = det ? (det.corners.map((p) => ({ x: p.x * k, y: p.y * k })) as Quad) : null;
+      const plan = planCapture(frame, live, guide, OUT_W, ANALYSIS_W);
+      const original = plan.original;
 
       setFlash((f) => f + 1);
       if (sound) beep();
@@ -354,24 +330,23 @@ export default function ScanPage() {
         source,
         detected: !!det,
         detectionConfidence: det?.confidence ?? null,
-        alignment: refined ? Math.round(refined.deviation * 1000) / 1000 : null,
+        alignment: plan.deviation == null ? null : Math.round(plan.deviation * 1000) / 1000,
         ...(q ? { sharpness: Math.round(q.sharpness), brightness: Math.round(q.brightness), glare: q.glare } : {}),
       };
 
       autoLevels(original);
       const originalBlob = await toBlob(original);
       if (!originalBlob) return;
-      if (!misaligned) {
+      if (!plan.needsReview) {
         await commitCapture(originalBlob, quality, target);
         return;
       }
 
-      // 3. misaligned: try to fix it and ask
+      // not verified: offer the corrected crop (if the card was found) and ask
       let adjusted: { blob: Blob; url: string } | null = null;
-      if (refined && refined.deviation > MISALIGNED) {
-        const fixed = warpCard(padded, refined.corners.map((p) => ({ x: p.x / sc, y: p.y / sc })) as Quad, OUT_W);
-        autoLevels(fixed);
-        const b = await toBlob(fixed);
+      if (plan.adjusted) {
+        autoLevels(plan.adjusted);
+        const b = await toBlob(plan.adjusted);
         if (b) adjusted = { blob: b, url: URL.createObjectURL(b) };
       }
       setReview({
@@ -895,9 +870,9 @@ function AlignmentReview({
         </figure>
       </div>
       <div className="single-card panel">
-        <strong>{corrected ? 'This card looked misaligned, so we corrected it.' : 'This card looks misaligned and couldn’t be corrected automatically.'}</strong>
+        <strong>{corrected ? 'This card looked misaligned, so we corrected it.' : 'We couldn’t find the card’s edges to check this photo.'}</strong>
         <div className="faint" style={{ fontSize: 13 }}>
-          {corrected ? 'Compare the two and choose which photo to keep — or retake it.' : 'Keep this photo, or retake it?'}
+          {corrected ? 'Compare the two and choose which photo to keep — or retake it.' : 'Make sure the whole card is in the photo and straight. Keep it, or retake?'}
         </div>
         <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
           <button className="btn sm ghost" onClick={onRetake}>
