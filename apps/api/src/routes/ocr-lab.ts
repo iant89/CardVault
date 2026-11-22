@@ -1,6 +1,8 @@
-import { createReadStream } from 'node:fs';
+import { existsSync, createReadStream } from 'node:fs';
 import { readFile, readdir, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { and, auditLog, desc, eq, ocrEvaluations, ocrExams, ocrModels, ocrSamples, sql } from '@cardvault/database';
@@ -17,6 +19,7 @@ const IMPORT_KEY = 'ocr:import-harvest';
 const DATASET_KEY = 'ocr:dataset';
 const TRAIN_KEY = 'ocr:train';
 const TRAIN_CANCEL_KEY = 'ocr:train:cancel';
+const PYTHON_KEY = 'ocr:python';
 
 /** Training run in progress, mirroring apps/worker/src/processors/ocr-train.ts. */
 interface TrainStatus {
@@ -40,9 +43,87 @@ interface TrainStatus {
   updatedAt: string;
 }
 
+/** What the setup script does, in order — shown as a checklist while it runs. */
+const PYTHON_STEPS = [
+  'Virtual environment',
+  'PyTorch (CPU build)',
+  'Trainer packages',
+];
+
+interface TrainerPython {
+  status: 'unknown' | 'missing' | 'ready' | 'installing' | 'failed';
+  /** interpreter the app will use (or expects after setup) */
+  python?: string;
+  error?: string;
+  /** 1-based step being installed */
+  step?: number;
+  steps: string[];
+  venv: string;
+  /** OCR_TRAIN_PYTHON pins an interpreter; the setup button then only checks it */
+  configured: boolean;
+  manual: string;
+  setupScript: string | null;
+  updatedAt?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  log: string[];
+}
+
 const readTraining = async (ctx: AppContext): Promise<TrainStatus | null> => {
   const raw = await ctx.redis.get(TRAIN_KEY);
   return raw ? (JSON.parse(raw) as TrainStatus) : null;
+};
+
+/** Find scripts/ocr-python.sh by walking up from this file (src/ or dist/ layouts). */
+export function findSetupScript(): string | null {
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 7; i++) {
+    const candidate = path.join(dir, 'scripts', 'ocr-python.sh');
+    if (existsSync(candidate)) return candidate;
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return null;
+}
+
+/** The interpreter the app will use, from the same places the worker looks. */
+const expectedPython = (ctx: AppContext, venv: string): string => {
+  const explicit = ctx.config.OCR_TRAIN_PYTHON;
+  if (explicit) return explicit;
+  const candidates = [venv, path.join(homedir(), 'ocr-venv'), '/opt/cardvault/ocr-venv'].flatMap((v) => [path.join(v, 'bin', 'python'), path.join(v, 'bin', 'python3')]);
+  return candidates.find((p) => existsSync(p)) ?? path.join(venv, 'bin', 'python');
+};
+
+/**
+ * The trainer's Python, as the worker last saw it (ocr:python), plus the paths
+ * the setup uses. OCR Lab offers "Set up the OCR trainer" when it is missing.
+ * With no report yet (fresh install, worker not up), a configured interpreter
+ * or an existing venv is shown as ready — the worker re-checks before training.
+ */
+const trainerPython = async (ctx: AppContext): Promise<TrainerPython> => {
+  const raw = await ctx.redis.get(PYTHON_KEY);
+  const stored = raw ? (JSON.parse(raw) as Partial<TrainerPython>) : null;
+  const venv = ctx.config.OCR_TRAIN_VENV ?? path.join(ctx.storageDir, 'ocr', 'venv');
+  const setupScript = findSetupScript();
+  const python = expectedPython(ctx, venv);
+  const status = stored?.status ?? (existsSync(python) ? 'ready' : 'unknown');
+  return {
+    status,
+    python: stored?.python ?? python,
+    error: stored?.error,
+    step: stored?.step,
+    steps: PYTHON_STEPS,
+    venv,
+    configured: !!ctx.config.OCR_TRAIN_PYTHON,
+    /** what to run over SSH when the button cannot be used (no worker, no internet) */
+    manual: `bash scripts/ocr-python.sh   # then restart the worker, or set OCR_TRAIN_PYTHON=${path.join(venv, 'bin', 'python')}`,
+    setupScript,
+    updatedAt: stored?.updatedAt,
+    startedAt: stored?.startedAt,
+    finishedAt: stored?.finishedAt,
+    log: stored?.log ?? [],
+  };
 };
 
 /**
@@ -118,6 +199,7 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
       dataset: dataset ? JSON.parse(dataset) : null,
       datasets: await listDatasets(ctx),
       training: await readTraining(ctx),
+      python: await trainerPython(ctx),
       evaluations,
     };
   });
@@ -250,6 +332,22 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
   /** Ask the running trainer to stop (it exits at the next step). */
   app.post('/api/dev/ocr/train/cancel', guard, async () => {
     await ctx.redis.set(TRAIN_CANCEL_KEY, '1', 'EX', 300);
+    return { ok: true };
+  });
+
+  /**
+   * Install (or check) the Python the trainer runs on: scripts/ocr-python.sh
+   * builds a venv under storage with CPU PyTorch and the trainer's packages.
+   * Runs in the worker, like training itself; progress lands in `ocr:python`.
+   */
+  app.post('/api/dev/ocr/train/python', guard, async () => {
+    const py = await trainerPython(ctx);
+    if (!py.setupScript) throw badRequest('scripts/ocr-python.sh was not found on this server.');
+    if (py.status === 'installing') throw badRequest('The trainer setup is already running.');
+    const current = await readTraining(ctx);
+    if (current && ['queued', 'starting', 'running'].includes(current.status)) throw badRequest('Training is running; stop it before changing the trainer’s Python.');
+    await ctx.redis.del(PYTHON_KEY);
+    await ctx.queues.maintenance.add('ocr-python-setup', {}, { removeOnComplete: 20, removeOnFail: 20 });
     return { ok: true };
   });
 

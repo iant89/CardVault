@@ -49,7 +49,23 @@ interface Overview {
   dataset: { id: string; createdAt: string; rows: number; counts: Record<string, number>; dir: string; storage: string } | null;
   datasets: DatasetInfo[];
   training: Training | null;
+  python: TrainerPython;
   evaluations: Evaluation[];
+}
+interface TrainerPython {
+  status: 'unknown' | 'missing' | 'ready' | 'installing' | 'failed';
+  python?: string;
+  error?: string;
+  step?: number;
+  steps: string[];
+  venv: string;
+  configured: boolean;
+  manual: string;
+  setupScript: string | null;
+  updatedAt?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  log: string[];
 }
 interface Gate {
   id: string;
@@ -200,7 +216,7 @@ export default function OcrLabPage() {
   const [detail, setDetail] = useState<Evaluation | null>(null);
   const [filter, setFilter] = useState<{ source?: string; field?: string; regression?: string }>({});
   const samples = useAsync(() => api.get<{ samples: Sample[] }>(`/api/dev/ocr/samples?${new URLSearchParams(filter as Record<string, string>)}`), [JSON.stringify(filter)]);
-  const busy = !!ov.data && (ov.data.evaluations.some((e) => e.status === 'queued' || e.status === 'running') || ov.data.import?.status === 'running' || ov.data.import?.status === 'queued' || ['queued', 'starting', 'running'].includes(ov.data.training?.status ?? ''));
+  const busy = !!ov.data && (ov.data.evaluations.some((e) => e.status === 'queued' || e.status === 'running') || ov.data.import?.status === 'running' || ov.data.import?.status === 'queued' || ['queued', 'starting', 'running', 'installing'].includes(ov.data.training?.status ?? '') || ov.data.python?.status === 'installing');
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -452,6 +468,84 @@ export default function OcrLabPage() {
   );
 }
 
+/**
+ * The interpreter the trainer runs on. One press installs a venv with CPU
+ * PyTorch and the trainer's packages (scripts/ocr-python.sh, run by the
+ * worker); a healthy one shows its path instead. The environment lives under
+ * storage, so (in Docker, where it sits on the storage volume) it survives
+ * image updates.
+ */
+export function TrainerPythonPanel({ py, busy, trainActive, act }: { py: TrainerPython; busy: boolean; trainActive: boolean; act: (fn: () => Promise<unknown>, ok: string) => Promise<void> }) {
+  const installing = py.status === 'installing';
+  const ready = py.status === 'ready';
+  const missing = py.status === 'missing' || py.status === 'failed';
+  const [showLog, setShowLog] = useState(false);
+  return (
+    <div className={`ocr-python ${py.status}`}>
+      <div className="row between wrap" style={{ width: '100%', gap: 8 }}>
+        <div style={{ minWidth: 0 }}>
+          <strong style={{ fontSize: 13 }}>Trainer Python</strong>
+          <div className="faint" style={{ fontSize: 12 }}>
+            {installing
+              ? `Installing${py.step ? `: ${py.steps[py.step - 1] ?? ''}` : '…'}`
+              : ready
+                ? <><code>{py.python}</code>{py.configured ? ' (set in OCR_TRAIN_PYTHON)' : ''}</>
+                : missing
+                  ? 'Not installed — the trainer cannot start yet.'
+                  : 'Not checked yet. Training checks it, or set it up now.'}
+          </div>
+        </div>
+        {installing ? (
+          <span className="faint" style={{ fontSize: 12 }}>A few minutes, once…</span>
+        ) : (
+          <button
+            className="btn sm"
+            disabled={busy || trainActive}
+            title={trainActive ? 'Stop training first' : 'Install (or check) the Python the trainer runs on'}
+            onClick={() => void act(() => api.post('/api/dev/ocr/train/python', {}), ready ? 'Checking the trainer’s Python' : 'Setting up the trainer’s Python')}
+          >
+            {ready ? 'Check again' : 'Set up the OCR trainer'}
+          </button>
+        )}
+      </div>
+      {installing && (
+        <ul className="ocr-python-steps">
+          {py.steps.map((label, i) => {
+            const step = py.step ?? 0;
+            const state = i + 1 < step ? 'done' : i + 1 === step ? 'now' : 'next';
+            return <li key={label} className={state}>{state === 'done' ? '✓' : state === 'now' ? '•' : '·'} {label}</li>;
+          })}
+        </ul>
+      )}
+      {ready && py.finishedAt && <div className="faint" style={{ fontSize: 11 }}>Last checked {new Date(py.finishedAt).toLocaleString()}</div>}
+      {missing && !py.error && <div className="faint" style={{ fontSize: 11 }}>One-time download of a few hundred MB; it stays in <code>{py.venv}</code>.</div>}
+      {py.error && (
+        <div style={{ fontSize: 12, color: 'var(--bad)', whiteSpace: 'pre-wrap' }}>
+          {py.error}
+          {!py.configured && (
+            <details style={{ marginTop: 4 }}>
+              <summary className="faint" style={{ cursor: 'pointer' }}>Run it yourself over SSH</summary>
+              <div className="ocr-cmd" style={{ marginTop: 4 }}>
+                <code>{py.manual}</code>
+                <button className="btn sm ghost" onClick={() => void navigator.clipboard?.writeText(py.manual).then(() => toast('Copied', 'success'))}>Copy</button>
+              </div>
+              <div className="faint" style={{ marginTop: 4 }}>Needs internet access to PyPI. The environment goes in <code>{py.venv}</code>; the worker finds it by itself.</div>
+            </details>
+          )}
+        </div>
+      )}
+      {py.log?.length ? (
+        <div style={{ width: '100%' }}>
+          <button className="btn sm ghost" style={{ padding: '2px 6px', fontSize: 12 }} onClick={() => setShowLog(!showLog)}>
+            {showLog ? 'Hide setup log' : 'Show setup log'}
+          </button>
+          {showLog && <pre className="ocr-log">{py.log.slice(-40).join('\n')}</pre>}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | null; busy: boolean; act: (fn: () => Promise<unknown>, ok: string) => Promise<void>; onDetails: (id: string) => void }) {
   const active = m?.models.find((x) => x.status === 'active');
   const storage = d.dataset?.storage ?? '<STORAGE_DIR>';
@@ -459,6 +553,10 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
   const [form, setForm] = useState({ dataset: 'latest', epochs: 30, synthetic: 20000, maxMinutes: 0 });
   const t = d.training;
   const trainActive = !!t && ['queued', 'starting', 'running'].includes(t.status);
+  const py = d.python;
+  const pyInstalling = py.status === 'installing';
+  const pyReady = py.status === 'ready';
+  const pyMissing = py.status === 'missing' || py.status === 'failed';
   return (
     <div className="panel">
       <div className="panel-head">
@@ -495,7 +593,8 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
         </div>
         <div>
           <strong>2. Train</strong>
-          <p className="faint">Runs on this server (CPU is enough). Needs Python with the packages in tools/ocr-trainer/requirements.txt.</p>
+          <p className="faint">Runs on this server (CPU is enough). Needs a Python with PyTorch; CardVault can install one here.</p>
+          <TrainerPythonPanel py={py} busy={busy} trainActive={trainActive} act={act} />
           {t && (
             <div className="ocr-training">
               {t.status === 'failed' ? (
@@ -526,6 +625,15 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
           )}
           {!trainActive && (
             <div className="ocr-form">
+              {!pyReady && (
+                <p className="faint" style={{ fontSize: 12, margin: 0 }}>
+                  {pyMissing
+                    ? 'The trainer needs its Python first: press “Set up the OCR trainer” above.'
+                    : pyInstalling
+                      ? 'Setting up the trainer’s Python — training unlocks when it finishes.'
+                      : 'If training reports a missing Python, set it up above (takes a few minutes once).'}
+                </p>
+              )}
               <label>
                 Dataset
                 <select className="select" value={form.dataset} onChange={(e) => setForm({ ...form, dataset: e.target.value })}>
@@ -547,7 +655,7 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
                 Stop after minutes (0 = no limit)
                 <input className="input" type="number" min={0} max={10080} value={form.maxMinutes} onChange={(e) => setForm({ ...form, maxMinutes: +e.target.value })} />
               </label>
-              <button className="btn sm primary" disabled={busy || !d.datasets.length} onClick={() => void act(() => api.post('/api/dev/ocr/train', form), 'Training started')}>
+              <button className="btn sm primary" disabled={busy || !d.datasets.length || pyInstalling} title={pyInstalling ? 'Wait for the Python setup to finish' : undefined} onClick={() => void act(() => api.post('/api/dev/ocr/train', form), 'Training started')}>
                 Start training
               </button>
               {!d.datasets.length && <span className="faint">Export training data first.</span>}

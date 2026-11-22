@@ -28,18 +28,22 @@ getting worse anywhere (see *Promotion gates*).
    accuracy), or on the server by hand:
 
    ```bash
-   python3 -m venv ~/ocr-venv
-   ~/ocr-venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-   ~/ocr-venv/bin/pip install -r tools/ocr-trainer/requirements.txt
-   ~/ocr-venv/bin/python tools/ocr-trainer/train.py --storage /path/to/storage
+   bash scripts/ocr-python.sh          # the Python the trainer needs (once)
+   storage/ocr/venv/bin/python tools/ocr-trainer/train.py --storage /path/to/storage
    ```
+
+   `scripts/ocr-python.sh` builds a virtual environment in
+   `storage/ocr/venv` with the CPU build of PyTorch and everything in
+   `requirements.txt`. The native installer runs it, and OCR Lab offers the
+   same as **Set up the OCR trainer** — the worker does the download, so no
+   shell is needed. It only needs python3 (3.9+) and internet access to PyPI /
+   pytorch.org; the CPU wheels are a few hundred MB. Without the venv, training
+   falls back to `~/ocr-venv`, then `python3`/`python` on PATH.
 
    Options: `--dataset <id>` (default: latest), `--epochs 30`,
    `--synthetic 20000` (generated lines per epoch), `--max-minutes 60`,
    `--threads N`. The model, its ONNX export and a model card land in
-   `storage/ocr/models/<model id>/`. The *Train* button needs a Python that can
-   import torch (it looks at `~/ocr-venv/bin/python`, then `python3`; set
-   `OCR_TRAIN_PYTHON` in `.env` to point elsewhere) and registers the finished
+   `storage/ocr/models/<model id>/`. The *Train* button registers the finished
    model for scoring by itself.
 4. **Score** (OCR Lab → Models → *Look for new models*, then *Score on exam*).
 5. **Live trial** (*Start live trial*): the model reads every new scan
@@ -104,9 +108,10 @@ threshold. The watch rolled it back on the rise in manual reviews.
 ## Files
 
 ```
-train.py              CLI: load export, train, pick best epoch on a dev slice, export ONNX + card
-ocrtrainer/data.py    preprocessing, augmentation, synthetic lines, dataset
-ocrtrainer/model.py   CRNN and CTC greedy decoding
+train.py                      CLI: load export, train, pick best epoch on a dev slice, export ONNX + card
+ocrtrainer/data.py            preprocessing, augmentation, synthetic lines, dataset
+ocrtrainer/model.py           CRNN and CTC greedy decoding
+../../scripts/ocr-python.sh   builds the Python above (venv, CPU PyTorch, requirements)
 ```
 
 `card.json` records the dataset id and checksum, training settings, the dev
