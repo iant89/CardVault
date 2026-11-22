@@ -53,6 +53,22 @@ export type RequestLogSink = (e: RequestLogEntry) => void;
 
 const RETRYABLE = new Set([408, 425, 429, 500, 502, 503, 504]);
 
+/** Longest Retry-After we will sit through; a provider asking for more is treated as down. */
+export const MAX_RETRY_AFTER_MS = 15_000;
+
+/**
+ * How long to wait before retrying. Retry-After is honoured only where it
+ * means something (429 rate limit, 503 maintenance) and is capped, so a
+ * crashing upstream that sends "Retry-After: 60" with a 500/502 doesn't stall
+ * a job for minutes; those use the normal short exponential backoff.
+ */
+export function retryWait(err: unknown, attempt: number): number {
+  if (err instanceof HttpError && (err.status === 429 || err.status === 503) && err.retryAfterMs) {
+    return Math.min(err.retryAfterMs, MAX_RETRY_AFTER_MS);
+  }
+  return backoffDelay(attempt);
+}
+
 /**
  * Per-provider HTTP client enforcing: SSRF validation with DNS pinning,
  * host allowlist, rate limiting, timeout, bounded retries with exponential
@@ -99,7 +115,7 @@ export class HttpClient {
           throw err;
         }
         if (attempt === retries) break;
-        const wait = err instanceof HttpError && err.retryAfterMs ? Math.min(err.retryAfterMs, 60_000) : backoffDelay(attempt);
+        const wait = retryWait(err, attempt);
         this.opts.log.warn({ provider: this.opts.providerId, attempt, wait, err: String(err) }, 'retrying request');
         await new Promise((r) => setTimeout(r, wait));
       }

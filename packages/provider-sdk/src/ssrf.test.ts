@@ -30,3 +30,19 @@ describe('robots', () => {
     expect(robotsAllows(rules, '/cards/1')).toBe(true);
   });
 });
+
+import { HttpError, MAX_RETRY_AFTER_MS, retryWait } from './http.js';
+
+describe('retryWait', () => {
+  it('ignores Retry-After on server errors (pokemontcg.io sends 60 s with 502s)', () => {
+    expect(retryWait(new HttpError(502, 'bad gateway', 60_000), 0)).toBeLessThan(1_000);
+    expect(retryWait(new HttpError(500, 'error', 60_000), 1)).toBeLessThan(2_000);
+  });
+  it('honours Retry-After for rate limits and maintenance, capped', () => {
+    expect(retryWait(new HttpError(429, 'slow down', 4_000), 0)).toBe(4_000);
+    expect(retryWait(new HttpError(503, 'maintenance', 120_000), 0)).toBe(MAX_RETRY_AFTER_MS);
+  });
+  it('falls back to exponential backoff for network errors', () => {
+    expect(retryWait(new Error('ECONNRESET'), 0)).toBeLessThan(1_000);
+  });
+});
