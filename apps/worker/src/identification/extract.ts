@@ -12,23 +12,48 @@ export interface ExtractedSignals {
 
 const STOP = /^(basic|stage ?\d|trainer|item|supporter|energy|evolves from.*|hp ?\d*|pokemon|pokémon|creature.*|instant|sorcery|level ?\d*|\W+)$/i;
 
+/** Stage / type words printed beside the name (BASIC badge, often misread as "BAS"). */
+const LEAD_WORD = /^(basic|bas|stage\s?\d?|stg|item|supporter|trainer|tool|stadium|energy)$/i;
+/** Suffixes that are part of a card's name and must be kept. */
+const NAME_SUFFIX = /^(ex|gx|v|vmax|vstar|lv\.?x?|prime|break|star|δ|◇)$/i;
+
+/**
+ * Trim OCR debris from the ends of a title line: leading stage words, numbers
+ * and stray marks, trailing HP values, "HP" and stray marks. Inner tokens are
+ * kept, so names like "Number 39: Utopia" survive.
+ */
+export function trimDebris(line: string): string {
+  const t = line.split(' ').filter(Boolean);
+  const junk = (w: string) => /^[\d.,:\-]+$/.test(w) || /^hp$/i.test(w) || (w.length <= 2 && !NAME_SUFFIX.test(w) && !/^\p{Lu}\p{Ll}\.?$/u.test(w));
+  while (t.length && (junk(t[0]!) || LEAD_WORD.test(t[0]!))) t.shift();
+  while (t.length && junk(t[t.length - 1]!)) t.pop();
+  return t.join(' ').replace(/[\s,.:\-]+$/, '');
+}
+
 /** Turn raw OCR text into structured identification signals. */
 export function extractSignals(text: { full: string; top: string; bottom: string }, gameHint?: string): ExtractedSignals {
   const all = `${text.top}\n${text.full}\n${text.bottom}`;
   const gameGuesses = gameHint ? [{ game: gameHint as GameSlug, score: 1 }] : guessGameFromText(all);
 
-  // Name candidates: the cleaner lines of the title band, then full text first lines
-  const lines = [...text.top.split('\n'), ...text.full.split('\n').slice(0, 6)]
-    .map((l) =>
-      l
-        .replace(/\b\d{2,3}\s*HP\b.*$/i, '')
-        .replace(/\bHP\s*\d{2,3}\b.*$/i, '')
-        .replace(/[^\p{L}\p{N}'’\-., &:]/gu, ' ')
-        .replace(/\s+/g, ' ')
-        .trim(),
-    )
-    .filter((l) => l.length >= 3 && l.length <= 48 && /\p{L}{3}/u.test(l) && !STOP.test(l));
-  const nameCandidates = [...new Set(lines)].slice(0, 6);
+  // Name candidates: the cleaner lines of the title band, then full text first lines.
+  // Each line is also offered with OCR debris trimmed from its ends (stage
+  // badges, an "HP" too small to read leaving its number behind, stray marks):
+  // "5 Fletchling 60" → "Fletchling".
+  const raw = [...text.top.split('\n'), ...text.full.split('\n').slice(0, 6)].map((l) =>
+    l
+      .replace(/\b\d{2,3}\s*HP\b.*$/i, '')
+      .replace(/\bHP\s*\d{2,3}\b.*$/i, '')
+      .replace(/[^\p{L}\p{N}'’\-., &:]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim(),
+  );
+  const lines: string[] = [];
+  for (const l of raw) {
+    const t = trimDebris(l);
+    if (t && t !== l) lines.push(t);
+    lines.push(l);
+  }
+  const nameCandidates = [...new Set(lines.filter((l) => l.length >= 3 && l.length <= 48 && /\p{L}{3}/u.test(l) && !STOP.test(l)))].slice(0, 6);
 
   // Collector numbers using every known game's patterns (prefer footer band)
   const numbers: ExtractedSignals['numbers'] = [];
