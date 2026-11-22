@@ -29,7 +29,11 @@ export async function buildApp(ctx: AppContext) {
     bodyLimit: 1024 * 1024,
   });
 
-  await app.register(helmet, { contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'same-origin' } });
+  // No HSTS: CardVault is served over plain HTTP on the LAN (port 8080) *and*
+  // optionally over HTTPS via Caddy. An HSTS header seen once over HTTPS would
+  // make browsers rewrite http://host:8080 to https://host:8080 for a year
+  // ("SSL received a record that exceeded the maximum permissible length").
+  await app.register(helmet, { contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'same-origin' }, strictTransportSecurity: false });
   await app.register(cookie);
   await app.register(rateLimit, { max: 1200, timeWindow: '1 minute' });
   await app.register(multipart, { limits: { fileSize: ctx.config.MAX_UPLOAD_MB * 1024 * 1024, files: 1, fields: 20 } });
