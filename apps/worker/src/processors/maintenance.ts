@@ -11,7 +11,7 @@ import { snapshotCollectionValues } from '../pricing/compute.js';
  */
 async function recoverStale(ctx: WorkerContext): Promise<number> {
   const rows = await ctx.db.execute(sql`
-    SELECT id, queue, scan_id, card_id, user_id, priority FROM research_jobs
+    SELECT id, queue, bull_job_id, scan_id, card_id, user_id, priority FROM research_jobs
     WHERE status IN ('QUEUED','PROCESSING','MATCHING','RESEARCHING','PRICING')
       AND COALESCE(heartbeat_at, created_at) < now() - interval '15 minutes'
     LIMIT 200`);
@@ -19,7 +19,7 @@ async function recoverStale(ctx: WorkerContext): Promise<number> {
   for (const r of rows) {
     const id = String(r.id);
     const q = r.queue === 'identification' ? ctx.queues.identification : ctx.queues.research;
-    const existing = await q.getJob(id);
+    const existing = await q.getJob(String(r.bull_job_id ?? id));
     const state = existing ? await existing.getState() : 'missing';
     if (['active', 'waiting', 'delayed', 'prioritized', 'waiting-children'].includes(state)) continue;
     if (state === 'failed') {
@@ -29,7 +29,8 @@ async function recoverStale(ctx: WorkerContext): Promise<number> {
     if (existing) await existing.remove().catch(() => undefined);
     await ctx.db.update(researchJobs).set({ status: 'QUEUED', stage: 'Recovered after interruption', heartbeatAt: new Date() }).where(eq(researchJobs.id, id));
     if (r.queue === 'identification' && r.scan_id) {
-      await ctx.queues.identification.add('identify', { scanId: String(r.scan_id), userId: String(r.user_id) }, { jobId: id, priority: Number(r.priority) });
+      await ctx.db.update(researchJobs).set({ bullJobId: id }).where(eq(researchJobs.id, id));
+      await ctx.queues.identification.add('identify', { scanId: String(r.scan_id), userId: String(r.user_id), researchJobId: id }, { jobId: id, priority: Number(r.priority) });
     } else if (r.card_id) {
       await ctx.queues.research.add(
         'research',

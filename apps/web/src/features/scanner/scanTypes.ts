@@ -17,6 +17,8 @@ export interface ScanDetail {
   card: CardDTO | null;
   identifications: { cardId: string | null; confidence: number; rank: number; name: string | null; collectorNumber: string | null; setName: string | null; ocrTop: string | null }[];
   jobs: { status: string; stage: string | null; progress: number; error: string | null }[];
+  /** copies of this card the scan's owner has (they all share the card's pricing) */
+  owned: { copies: number; sameVariant: number } | null;
 }
 
 export const STATUS_LABEL: Record<string, string> = {

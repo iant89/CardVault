@@ -5,6 +5,8 @@ export interface IdentificationJobData {
   gameHint?: string;
   /** Client-side OCR text (optional extra signal) */
   clientOcr?: string;
+  /** research_jobs row this run reports to (defaults to the BullMQ job id) */
+  researchJobId?: string;
 }
 
 export interface ResearchJobData {

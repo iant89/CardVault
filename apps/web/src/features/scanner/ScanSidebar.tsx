@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Link } from 'react-router';
 import { api, money } from '../../services/api';
 import { StatusBadge } from '../../components/ui';
+import { CameraIcon, TrashIcon } from '../../components/icons';
 import type { PendingView } from './offlineQueue';
 import { canEdit } from './useScanEdit';
 import { IDENTIFIED, IN_PROGRESS, NEEDS_REVIEW, STATUS_LABEL, type ScanDetail, type ScanListItem } from './scanTypes';
@@ -14,26 +15,31 @@ interface Props {
   collapsed: boolean;
   onToggle: () => void;
   onEdit: (scan: ScanListItem) => void;
-  onDuplicate: (id: string, action: 'add' | 'cancel') => void;
+  onRetake: (scan: ScanListItem) => void;
+  onDelete: (scan: ScanListItem) => void;
+  /** scan currently being retaken (camera armed for it) */
+  retakingId: string | null;
   onRetry: (id: string) => void;
   onDiscard: (id: string) => void;
 }
+
+const statusTone = (s: string) =>
+  IDENTIFIED.includes(s) ? 'good' : NEEDS_REVIEW.includes(s) ? 'warn' : s === 'FAILED' || s === 'REJECTED' ? 'bad' : 'info';
 
 const narrow = () => window.matchMedia('(max-width: 1000px)').matches;
 const TIP_W = 300;
 
 /** Collapsible list of recent scans (newest first) with live status tooltips. */
-export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle, onEdit, onDuplicate, onRetry, onDiscard }: Props) {
+export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle, onEdit, onRetake, onDelete, retakingId, onRetry, onDiscard }: Props) {
   const [open, setOpen] = useState<{ id: string; top: number; left: number; inline: boolean } | null>(null);
   const [details, setDetails] = useState<Record<string, ScanDetail>>({});
   const hideTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   // session running totals (local captures not yet uploaded count as processing)
   const session = scans.filter((s) => new Date(s.createdAt).getTime() >= sessionStart);
-  const waiting = pending.filter((p) => p.status !== 'duplicate' && p.status !== 'failed').length;
-  const undecided = pending.filter((p) => p.status === 'duplicate').length;
+  const waiting = pending.filter((p) => p.status !== 'failed').length;
   const totals = {
-    scanned: session.length + waiting + undecided,
+    scanned: session.length + waiting,
     identified: session.filter((s) => IDENTIFIED.includes(s.status)).length,
     review: session.filter((s) => NEEDS_REVIEW.includes(s.status)).length,
     processing: session.filter((s) => IN_PROGRESS.includes(s.status)).length + waiting,
@@ -82,8 +88,7 @@ export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle,
     );
   }
 
-  const dupes = pending.filter((p) => p.status === 'duplicate');
-  const queued = pending.filter((p) => p.status !== 'duplicate');
+  const queued = pending;
   const tipScan = open ? scans.find((s) => s.id === open.id) : undefined;
 
   const tip = (s: ScanListItem, inline: boolean) => (
@@ -136,33 +141,6 @@ export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle,
       </div>
 
       <div className="scan-list">
-        {dupes.map((d) => (
-          <div key={d.id} className="scan-dupe">
-            <div className="row" style={{ alignItems: 'flex-start', gap: 10 }}>
-              <img src={d.url} alt="" />
-              <div className="grow" style={{ minWidth: 0 }}>
-                <strong style={{ fontSize: 13 }}>You already scanned this card.</strong>
-                <div className="faint truncate" style={{ fontSize: 12 }}>
-                  {d.duplicate?.cardName ?? 'Earlier scan'}
-                </div>
-                <div className="row wrap" style={{ gap: 4, marginTop: 6 }}>
-                  <button className="btn sm primary" onClick={() => onDuplicate(d.id, 'add')}>
-                    Add copy
-                  </button>
-                  {d.duplicate?.cardId && (
-                    <Link className="btn sm" to={`/collection?card=${d.duplicate.cardId}`}>
-                      View
-                    </Link>
-                  )}
-                  <button className="btn sm ghost" onClick={() => onDuplicate(d.id, 'cancel')}>
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        ))}
-
         {queued.map((p) => (
           <div key={p.id} className="scan-item" title={p.error}>
             <div className="thumb">
@@ -170,7 +148,7 @@ export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle,
             </div>
             <div style={{ minWidth: 0 }}>
               <div className="truncate" style={{ fontWeight: 600, fontSize: 14 }}>
-                {p.status === 'failed' ? 'Upload rejected' : 'New capture'}
+                {p.status === 'failed' ? 'Upload rejected' : p.replaceScanId ? `Retake: ${p.label ?? 'scan'}` : 'New capture'}
               </div>
               <div className="faint truncate" style={{ fontSize: 12 }}>
                 {p.status === 'failed' ? p.error : p.status === 'uploading' ? 'Uploading…' : p.attempts ? 'Waiting for server…' : 'Queued on this device'}
@@ -207,11 +185,35 @@ export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle,
                 <div className="truncate" style={{ fontWeight: 600, fontSize: 14 }}>
                   {s.cardName ?? (NEEDS_REVIEW.includes(s.status) ? 'Unknown card' : 'Identifying…')}
                 </div>
-                <div className="faint" style={{ fontSize: 12 }}>
-                  {new Date(s.createdAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+                <div className="truncate" style={{ fontSize: 12 }}>
+                  <span className={`st-${statusTone(retakingId === s.id ? 'RETAKE' : s.status)}`}>{retakingId === s.id ? 'Retaking…' : (STATUS_LABEL[s.status] ?? s.status)}</span>
+                  <span className="faint"> · {new Date(s.createdAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>
                 </div>
               </div>
-              <StatusBadge status={s.status} />
+              <div className="row scan-actions" style={{ gap: 2 }}>
+                <button
+                  className={`btn ghost icon sm ${retakingId === s.id ? 'on' : ''}`}
+                  title="Retake photo"
+                  aria-label={`Retake photo of ${s.cardName ?? 'this scan'}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRetake(s);
+                  }}
+                >
+                  <CameraIcon />
+                </button>
+                <button
+                  className="btn ghost icon sm danger-hover"
+                  title="Delete scan"
+                  aria-label={`Delete scan of ${s.cardName ?? 'unknown card'}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(s);
+                  }}
+                >
+                  <TrashIcon />
+                </button>
+              </div>
             </div>
             {open?.id === s.id && open.inline && tip(s, true)}
           </div>
@@ -281,6 +283,15 @@ function ScanTip({ scan, detail, onEdit }: { scan: ScanListItem; detail?: ScanDe
           )}
           <dt>Market</dt>
           <dd>{card.price?.market != null ? money(card.price.market) : status === 'RESEARCHING' ? 'researching…' : '—'}</dd>
+          {detail.owned && detail.owned.copies > 0 && (
+            <>
+              <dt>You own</dt>
+              <dd>
+                {detail.owned.copies} {detail.owned.copies === 1 ? 'copy' : 'copies'}
+                {detail.owned.copies > 1 && <span className="faint"> · shared pricing</span>}
+              </dd>
+            </>
+          )}
         </dl>
       ) : (
         <div style={{ fontSize: 13 }}>

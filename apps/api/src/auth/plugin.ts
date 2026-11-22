@@ -3,6 +3,7 @@ import { CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE } from '@cardvault/shared';
 import type { AppContext } from '../context.js';
 import { loadSession, safeEqual, type LoadedSession } from './sessions.js';
 import { forbidden, unauthorized } from '../errors.js';
+import { isSameOrigin, parseAllowedOrigins } from './origin.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -26,6 +27,7 @@ export function cookieOptions(ctx: AppContext, httpOnly: boolean, expires?: Date
 
 export function registerAuth(app: FastifyInstance, ctx: AppContext): void {
   app.decorateRequest('session', null);
+  const allowedOrigins = parseAllowedOrigins(ctx.config.WEB_ORIGIN);
 
   app.addHook('onRequest', async (req) => {
     const token = req.cookies[SESSION_COOKIE];
@@ -35,15 +37,12 @@ export function registerAuth(app: FastifyInstance, ctx: AppContext): void {
 
     // Origin check (defence in depth; SameSite=Strict already blocks most CSRF)
     const origin = req.headers.origin;
-    if (origin) {
-      const host = req.headers['x-forwarded-host'] ?? req.headers.host;
-      let ok = origin === ctx.config.WEB_ORIGIN;
-      try {
-        ok ||= new URL(origin).host === host;
-      } catch {
-        ok = false;
-      }
-      if (!ok) throw forbidden('Cross-origin request rejected');
+    if (origin && !isSameOrigin(origin, [req.headers['x-forwarded-host'], req.headers.host], allowedOrigins)) {
+      req.log.warn({ origin, host: req.headers.host, forwardedHost: req.headers['x-forwarded-host'] }, 'cross-origin request rejected');
+      throw forbidden(
+        `Cross-origin request rejected: this page was opened at ${origin}, which the server doesn't recognise. ` +
+          `If that is how you reach CardVault, add it to WEB_ORIGIN in .env (comma-separate several addresses) and restart.`,
+      );
     }
 
     const path = req.url.split('?')[0]!;

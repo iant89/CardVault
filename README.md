@@ -12,7 +12,7 @@ Supported: **Pokémon · Magic: The Gathering · Yu-Gi-Oh! · Football · Baseba
 
 ```bash
 cp .env.example .env
-# fill in POSTGRES_PASSWORD, SESSION_SECRET (openssl rand -base64 48), ADMIN_PASSWORD, WEB_ORIGIN
+# fill in POSTGRES_PASSWORD, SESSION_SECRET (openssl rand -base64 48), ADMIN_PASSWORD
 docker compose up -d --build
 docker compose exec api node apps/api/dist/cli/create-user.js --bootstrap   # first admin from ADMIN_* vars
 ```
@@ -26,6 +26,8 @@ Open `http://<server>:8080` and sign in. Add the rest of the family from the use
 | `backup` | `docker compose --profile backup up -d` | nightly DB dumps, weekly image archives |
 
 Only the web port is published. PostgreSQL, Redis and the worker stay on the internal Docker network.
+
+**"Cross-origin request rejected" on the sign-in screen?** The API only accepts sign-ins and changes from pages served by CardVault itself. It compares the page's address (`Origin`) with the address the browser used (`Host`), port included. The bundled nginx forwards the full host, so any address you use works: IP, hostname, `:8080`. If you put another proxy in front that rewrites the `Host` header, list the address(es) you use in `WEB_ORIGIN` (comma-separated) and restart. The error message names the address it saw.
 
 ### HTTPS (needed for phone cameras)
 
@@ -68,7 +70,13 @@ sudo cardvault-setup
 
 If CardVault is already installed, the script goes straight to the menu. If it isn't, it simply asks whether you want to install it. Use menu option 14 to check for upgrades.
 
-nginx listens on all interfaces and is configured with the PC's hostname and private LAN IP addresses, so other devices can open `http://<hostname>:8080` or `http://<lan-ip>:8080`. A `cardvault-lan.service` unit refreshes those names and the firewall rules at boot (when LAN access was accepted during install). Use menu option 16 to change this later, option 17 for network diagnostics (listening port, services, firewall rules), and option 18 to enable/disable HTTPS. Both `ufw` and `firewalld` are supported.
+nginx listens on all interfaces and is configured with the PC's hostname and private LAN IP addresses, so other devices can open `http://<hostname>:8080` or `http://<lan-ip>:8080`. Both addresses work for sign-in, because nginx passes the full address (port included) to the API's same-origin check.
+
+**Upgrading from an install that showed "Cross-origin request rejected":** earlier versions of the generated nginx config dropped the port, so only the one address in `WEB_ORIGIN` could sign in. To apply the fix:
+1. Run `sudo cardvault-setup` and upgrade (option 14). This fetches the new code and console.
+2. Run `sudo cardvault-setup` **again** and choose **16 → 1** (refresh addresses, firewall and nginx). This rewrites nginx from the fixed template.
+
+Step 2 is needed once because, during the upgrade, the previous console regenerates nginx before replacing itself. A `cardvault-lan.service` unit refreshes those names and the firewall rules at boot (when LAN access was accepted during install). Use menu option 16 to change this later, option 17 for network diagnostics (listening port, services, firewall rules), and option 18 to enable/disable HTTPS. Both `ufw` and `firewalld` are supported.
 
 Defaults can be overridden with `CARDVAULT_REPO`, `CARDVAULT_BRANCH`, `CARDVAULT_DIR`, `CARDVAULT_PORT` and `CARDVAULT_USER`. The installer pins the overall progress bar to the bottom row of the terminal, with steps and tasks scrolling above it, and shows a per-task bar for long commands. Full command output is written to `/tmp/cardvault-setup.log`, and `CARDVAULT_VERBOSE=1` streams it live instead. Backups written by the menu land in `/opt/cardvault/backups`.
 
@@ -136,8 +144,24 @@ scripts/         backup.sh, restore.sh
 
    Auto-capture re-arms when the frame has been empty for 0.7 s, or when a clearly different card has been steady for about 1 s (a quick swap). A hand passing over the card doesn't re-trigger it.
 
-   A collapsible sidebar lists recent scans, newest first, with running session totals. Hovering (or tapping on a phone) shows each scan's live state and parsed details, with an **Edit** button. Uploads retry with backoff, and the server ignores repeats of the same `clientScanId`, so scanning keeps working through server outages.
-2. **On upload** the API decodes the image to validate it (it doesn't trust the MIME type), re-encodes it (stripping EXIF), makes a thumbnail, and computes a 256-bit perceptual hash. If you already scanned a near-identical image, it answers *"You already scanned this card"* with **Add another copy / View existing / Cancel**.
+   **Alignment check:** each capture is also cropped with an 8% margin, and the card's real edges are found again inside that crop. If a corner is off by more than 2% of the card width, the capture is misaligned. That typically happens when the shutter is pressed while the card is still moving, or before the outline has locked on. Then:
+   - The scanner straightens the card using the refined edges and shows the **corrected** and **original** crops side by side, with one choice: **Keep corrected**, **Keep original** or **Retake**.
+   - If the card's edges can't be found to correct it, only the original is shown, with **Keep original** or **Retake**.
+
+   Well-aligned captures (about 1% deviation in testing) skip the check, and auto-capture pauses while a question is open. The decision and measured deviation are stored with the scan (`quality.adjusted`, `quality.alignment`).
+
+   A collapsible sidebar lists recent scans, newest first, with running session totals. Hovering (or tapping on a phone) shows each scan's live state and parsed details, with an **Edit** button. Each entry also has:
+   - **Retake** (camera icon): after confirmation, the next capture replaces that scan's photo. The old photo is kept until the new one uploads. An unidentified scan keeps its place in the queue and is identified from the new photo. An identified scan loses that identification and the collection copy it created, and is queued again.
+   - **Delete** (trash icon): after confirmation, removes the scan, its photos, its pending jobs and the collection copy it created.
+
+   Each scan has an image version number. An identification run still working on a replaced or deleted photo discards its result. Uploads retry with backoff, and the server ignores repeats of the same `clientScanId`, so scanning keeps working through server outages.
+2. **On upload** the API decodes the image to validate it (it doesn't trust the MIME type), re-encodes it (stripping EXIF), makes a thumbnail, and computes a 256-bit perceptual hash (used for visual matching).
+
+   **Scanning a card you already own adds another copy automatically.** Prices, sold/listed observations, history and trends belong to the catalog card and its variant, so every copy shares them:
+   - The new copy takes the variant of your existing copies (unless the card itself prints a different one, such as "1st Edition"), so it joins the same pricing line.
+   - If the card was researched within `RESEARCH_REFRESH_HOURS`, no new research runs. The copy is "Done" immediately with the shared price.
+   - The toast says "Added another Pikachu — you now have 3 copies" with **Undo**, in case it was an accidental double capture.
+   - Condition, grading, purchase price and notes stay per copy.
 3. **The worker** combines several signals rather than relying on OCR alone:
    - Tesseract OCR on the whole card plus the title and footer bands. The English model ships with the worker, so no CDN is needed.
    - Game guess from keywords, name candidates, and collector numbers matched with each game's patterns.
@@ -148,7 +172,7 @@ scripts/         backup.sh, restore.sh
 
    | Confidence | Result |
    |---|---|
-   | ≥ 95% | Auto-accepted and added to the collection; research starts |
+   | ≥ 95% | Auto-accepted and added to the collection; research starts (skipped while the card's shared prices are fresh) |
    | 80–94% | Verification queue with one-click "Confirm" |
    | < 80% | Manual processing |
 

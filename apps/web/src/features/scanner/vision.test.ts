@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectCard, regionSignature, signatureDiff, CARD_RATIO, type Pt } from './vision';
+import { detectCard, expandQuad, refineCrop, regionSignature, signatureDiff, CARD_RATIO, MISALIGNED, type Pt, type Quad } from './vision';
 
 /**
  * Synthetic analysis frame: a card rotated by `deg` on a flat table, with a
@@ -76,5 +76,35 @@ describe('card signatures', () => {
     const sa = regionSignature(a.g, a.W, a.guide);
     expect(signatureDiff(sa, regionSignature(a2.g, a2.W, a2.guide))).toBeLessThan(12);
     expect(signatureDiff(sa, regionSignature(b.g, b.W, b.guide))).toBeGreaterThanOrEqual(12);
+  });
+});
+
+describe('alignment check', () => {
+  // the original crop assumed the card was exactly upright and centred
+  const expectedFor = (f: ReturnType<typeof frame>) => {
+    const ch = 158, cw = ch * CARD_RATIO;
+    return { x: f.W / 2 - cw / 2, y: f.H / 2 - ch / 2, w: cw, h: ch };
+  };
+
+  it('passes a well-aligned crop', () => {
+    const f = frame({ deg: 0, bg: 21, border: 230, body: 245, title: 20 });
+    const r = refineCrop(f.g, f.W, f.H, expectedFor(f));
+    expect(r).not.toBeNull();
+    expect(r!.deviation).toBeLessThan(MISALIGNED);
+  });
+
+  it('flags a tilted crop and finds the real corners', () => {
+    const f = frame({ deg: 4, bg: 21, border: 230, body: 245, title: 20 });
+    const r = refineCrop(f.g, f.W, f.H, expectedFor(f));
+    expect(r).not.toBeNull();
+    expect(r!.deviation).toBeGreaterThan(MISALIGNED);
+    expect(maxCornerError(r!.corners, f.truth)).toBeLessThan(3);
+  });
+
+  it('expands a quad evenly about its centre', () => {
+    const q: Quad = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 20 }, { x: 0, y: 20 }];
+    const e = expandQuad(q, 0.1);
+    expect(e[0]).toEqual({ x: -1, y: -2 });
+    expect(e[2]).toEqual({ x: 11, y: 22 });
   });
 });

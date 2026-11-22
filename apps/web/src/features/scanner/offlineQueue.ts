@@ -15,12 +15,15 @@ export interface PendingScan {
   gameHint?: string;
   capturedAt: string;
   quality?: Record<string, unknown>;
+  /** 'duplicate' only appears on captures stored by older versions; they now upload normally */
   status: 'pending' | 'uploading' | 'duplicate' | 'failed';
   attempts: number;
   nextAttemptAt: number;
   error?: string;
-  allowDuplicate?: boolean;
-  duplicate?: { scanId: string; cardId: string | null; cardName: string | null; createdAt: string };
+  /** set for a retake: replaces this server scan's photo instead of creating a scan */
+  replaceScanId?: string;
+  /** what is being retaken, for display */
+  label?: string;
 }
 export type PendingView = Omit<PendingScan, 'blob'> & { url: string };
 
@@ -62,9 +65,7 @@ interface QueueState {
   /** local capture id → server scan id, filled in as uploads succeed */
   uploadedIds: Record<string, string>;
   online: boolean;
-  add: (blob: Blob, meta: { gameHint?: string; quality?: Record<string, unknown> }) => Promise<string | null>;
-  /** returns the new local id when re-queued as an extra copy */
-  resolveDuplicate: (id: string, action: 'add' | 'cancel') => Promise<string | null>;
+  add: (blob: Blob, meta: { gameHint?: string; quality?: Record<string, unknown>; replaceScanId?: string; label?: string }) => Promise<string | null>;
   retry: (id: string) => Promise<void>;
   discard: (id: string) => Promise<void>;
   start: () => () => void;
@@ -86,7 +87,7 @@ export const useOfflineQueue = create<QueueState>((set, get) => {
     try {
       const rows = await reload();
       for (const p of rows) {
-        if (p.status === 'duplicate' || p.status === 'failed' || p.nextAttemptAt > Date.now()) continue;
+        if (p.status === 'failed' || p.nextAttemptAt > Date.now()) continue;
         await put({ ...p, status: 'uploading' });
         await reload();
         const fd = new FormData();
@@ -94,18 +95,15 @@ export const useOfflineQueue = create<QueueState>((set, get) => {
         fd.append('capturedAt', p.capturedAt);
         if (p.gameHint) fd.append('gameHint', p.gameHint);
         if (p.quality) fd.append('quality', JSON.stringify(p.quality).slice(0, 1900));
-        if (p.allowDuplicate) fd.append('allowDuplicate', 'true');
         fd.append('image', p.blob, `${p.id}.jpg`); // file last so fields are read first
         try {
-          const r = await api.upload<{ scanId: string }>('/api/scans', fd);
+          const r = await api.upload<{ scanId: string }>(p.replaceScanId ? `/api/scans/${p.replaceScanId}/retake` : '/api/scans', fd);
           await remove(p.id);
           URL.revokeObjectURL(urls.get(p.id) ?? '');
           urls.delete(p.id);
           set((s) => ({ uploaded: s.uploaded + 1, online: true, uploadedIds: { ...s.uploadedIds, [p.id]: r.scanId } }));
         } catch (e) {
-          if (e instanceof ApiError && e.status === 409 && e.body.error === 'DUPLICATE_SCAN') {
-            await put({ ...p, status: 'duplicate', duplicate: e.body.duplicate as PendingScan['duplicate'] });
-          } else if (e instanceof ApiError && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429 && e.status !== 401) {
+          if (e instanceof ApiError && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429 && e.status !== 401) {
             await put({ ...p, status: 'failed', error: e.message });
             toast(`Scan rejected: ${e.message}`, 'error');
           } else {
@@ -132,25 +130,10 @@ export const useOfflineQueue = create<QueueState>((set, get) => {
       const uid = useSession.getState().user?.id;
       if (!uid) return null;
       const id = crypto.randomUUID();
-      await put({ id, userId: uid, blob, gameHint: meta.gameHint, quality: meta.quality, capturedAt: new Date().toISOString(), status: 'pending', attempts: 0, nextAttemptAt: 0 });
+      await put({ id, userId: uid, blob, gameHint: meta.gameHint, quality: meta.quality, replaceScanId: meta.replaceScanId, label: meta.label, capturedAt: new Date().toISOString(), status: 'pending', attempts: 0, nextAttemptAt: 0 });
       await reload();
       void pump();
       return id;
-    },
-    resolveDuplicate: async (id, action) => {
-      const p = (await all()).find((x) => x.id === id);
-      if (!p) return null;
-      let next: string | null = null;
-      if (action === 'cancel') await get().discard(id);
-      else {
-        // a new client id so the server treats it as a deliberate extra copy
-        await remove(id);
-        next = crypto.randomUUID();
-        await put({ ...p, id: next, status: 'pending', allowDuplicate: true, duplicate: undefined, nextAttemptAt: 0 });
-        void pump();
-      }
-      await reload();
-      return next;
     },
     retry: async (id) => {
       const p = (await all()).find((x) => x.id === id);

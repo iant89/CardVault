@@ -1,15 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router';
 import { useOfflineQueue } from './offlineQueue';
-import { assessQuality, autoLevels, CARD_RATIO, detectCard, regionSignature, signatureDiff, toGray, warpCard, type Detection, type Quality, type Rect } from './vision';
+import {
+  assessQuality,
+  autoLevels,
+  CARD_RATIO,
+  detectCard,
+  expandQuad,
+  MISALIGNED,
+  rectQuad,
+  refineCrop,
+  regionSignature,
+  signatureDiff,
+  toGray,
+  warpCard,
+  type Detection,
+  type Quad,
+  type Quality,
+  type Rect,
+} from './vision';
 import { useLive } from '../../stores/live';
-import { StatusBadge } from '../../components/ui';
+import { StatusBadge, useConfirm } from '../../components/ui';
 import { toast } from '../../stores/toasts';
-import { api } from '../../services/api';
+import { api, ApiError } from '../../services/api';
 import { useAsync } from '../../hooks/useAsync';
 import { ScanSidebar } from './ScanSidebar';
 import { canEdit, useScanEdit } from './useScanEdit';
-import { beep, IDENTIFIED, NEEDS_REVIEW, STATUS_LABEL, type ScanListItem } from './scanTypes';
+import { beep, IDENTIFIED, NEEDS_REVIEW, STATUS_LABEL, type ScanDetail, type ScanListItem } from './scanTypes';
 
 const GAMES = [
   { slug: '', label: 'Auto-detect' },
@@ -35,6 +51,19 @@ const SAME_CARD_DIFF = 12;
 const NEW_CARD_FRAMES = 8;
 
 type Phase = 'idle' | 'captured' | 'ready';
+
+/** Output width of a captured card image (height follows the 63:88 ratio). */
+const OUT_W = 750;
+/** Margin added around the crop so the alignment check can see the card's real edges. */
+const ALIGN_PAD = 0.08;
+
+interface AlignReview {
+  original: { blob: Blob; url: string };
+  /** the straightened crop; null when the card's edges couldn't be found to correct it */
+  adjusted: { blob: Blob; url: string } | null;
+  quality: Record<string, unknown>;
+  target: { scanId: string; name: string } | null;
+}
 
 const pref = (k: string, d: string) => {
   try {
@@ -130,8 +159,23 @@ export default function ScanPage() {
   const [torch, setTorch] = useState<boolean | null>(null);
   /** single mode: the capture being shown after the camera closes */
   const [captured, setCaptured] = useState<{ localId: string; url: string } | null>(null);
+  /** retake mode: the next capture replaces this scan's photo */
+  const [retake, setRetakeState] = useState<{ scanId: string; name: string } | null>(null);
+  const retakeRef = useRef<{ scanId: string; name: string } | null>(null);
+  const setRetake = (v: { scanId: string; name: string } | null) => {
+    retakeRef.current = v;
+    setRetakeState(v);
+  };
+  const [confirm, confirmDialog] = useConfirm();
+  /** alignment review after a misaligned capture */
+  const [review, setReviewState] = useState<AlignReview | null>(null);
+  const reviewRef = useRef<AlignReview | null>(null);
+  const setReview = (v: AlignReview | null) => {
+    reviewRef.current = v;
+    setReviewState(v);
+  };
 
-  const { items, add, resolveDuplicate, discard, retry, online, uploadedIds, uploaded } = useOfflineQueue();
+  const { items, add, discard, retry, online, uploadedIds, uploaded } = useOfflineQueue();
   const jobs = useLive((s) => s.jobs);
   const scans = useAsync(() => api.get<{ scans: ScanListItem[] }>('/api/scans?limit=50'), []);
   const { edit, dialog } = useScanEdit();
@@ -230,53 +274,19 @@ export default function ScanPage() {
   }, []);
 
   // ---- capture
-  const capture = useCallback(
-    async (source: 'auto' | 'manual') => {
-      const v = videoRef.current;
-      const guide = guideInVideo();
-      if (!v || !guide) return;
-      detRef.current.armed = false; // wait for the card to be removed before the next auto shot
-      detRef.current.emptySince = null;
-      detRef.current.newCard = 0;
-      lastSigRef.current = lastFrameSig.current;
-      const c = document.createElement('canvas');
-      c.width = v.videoWidth;
-      c.height = v.videoHeight;
-      const ctx = c.getContext('2d', { willReadFrequently: true })!;
-      ctx.drawImage(v, 0, 0);
-      const k = v.videoWidth / ANALYSIS_W;
-      const det = detRef.current.det;
-      const q = qualityRef.current;
-      let out: ImageData;
-      if (det) {
-        // crop + perspective + rotation correction from detected corners
-        out = warpCard(ctx.getImageData(0, 0, c.width, c.height), det.corners.map((p) => ({ x: p.x * k, y: p.y * k })) as Detection['corners']);
-      } else {
-        // fallback: crop the guide rectangle
-        const t = document.createElement('canvas');
-        t.width = 750;
-        t.height = Math.round(750 / CARD_RATIO);
-        t.getContext('2d')!.drawImage(c, Math.max(0, guide.x), Math.max(0, guide.y), guide.w, guide.h, 0, 0, t.width, t.height);
-        out = t.getContext('2d')!.getImageData(0, 0, t.width, t.height);
-      }
-      autoLevels(out);
-      const oc = document.createElement('canvas');
-      oc.width = out.width;
-      oc.height = out.height;
-      oc.getContext('2d')!.putImageData(out, 0, 0);
-      const blob = await new Promise<Blob | null>((r) => oc.toBlob(r, 'image/jpeg', 0.92));
-      if (!blob) return;
+  const toBlob = (img: ImageData) => {
+    const oc = document.createElement('canvas');
+    oc.width = img.width;
+    oc.height = img.height;
+    oc.getContext('2d')!.putImageData(img, 0, 0);
+    return new Promise<Blob | null>((res) => oc.toBlob(res, 'image/jpeg', 0.92));
+  };
 
-      setFlash((f) => f + 1);
-      if (sound) beep();
-      navigator.vibrate?.(30);
-      toast('Captured', 'success');
-
-      const localId = await add(blob, {
-        gameHint: game || undefined,
-        quality: { source, detected: !!det, detectionConfidence: det?.confidence ?? null, ...(q ? { sharpness: Math.round(q.sharpness), brightness: Math.round(q.brightness), glare: q.glare } : {}) },
-      });
-
+  /** Queue a final image and continue the single/batch flow. */
+  const commitCapture = useCallback(
+    async (blob: Blob, quality: Record<string, unknown>, target: { scanId: string; name: string } | null) => {
+      toast(target ? `Captured — replacing the photo of ${target.name}` : 'Captured', 'success');
+      const localId = await add(blob, { gameHint: game || undefined, replaceScanId: target?.scanId, label: target?.name, quality });
       if (batch) {
         // "✓ Captured" → 2 s later "Ready for the next card…"
         clearTimeout(phaseTimer.current);
@@ -289,8 +299,186 @@ export default function ScanPage() {
         setCaptured({ localId, url: URL.createObjectURL(blob) });
       }
     },
-    [add, game, guideInVideo, batch, sound],
+    [add, game, batch],
   );
+
+  const capture = useCallback(
+    async (source: 'auto' | 'manual') => {
+      const v = videoRef.current;
+      const guide = guideInVideo();
+      if (!v || !guide || reviewRef.current) return;
+      detRef.current.armed = false; // wait for the card to be removed before the next auto shot
+      detRef.current.emptySince = null;
+      detRef.current.newCard = 0;
+      lastSigRef.current = lastFrameSig.current;
+      const c = document.createElement('canvas');
+      c.width = v.videoWidth;
+      c.height = v.videoHeight;
+      const ctx = c.getContext('2d', { willReadFrequently: true })!;
+      ctx.drawImage(v, 0, 0);
+      const frame = ctx.getImageData(0, 0, c.width, c.height);
+      const k = v.videoWidth / ANALYSIS_W;
+      const det = detRef.current.det;
+      const q = qualityRef.current;
+
+      // 1. the crop as captured: detected outline, or the on-screen guide
+      const quad: Quad = det ? (det.corners.map((p) => ({ x: p.x * k, y: p.y * k })) as Quad) : rectQuad(guide);
+      const original = warpCard(frame, quad, OUT_W);
+
+      // 2. alignment check: re-find the card's real edges inside a padded crop
+      const padW = Math.round(OUT_W * (1 + 2 * ALIGN_PAD));
+      const padded = warpCard(frame, expandQuad(quad, ALIGN_PAD), padW);
+      const a = document.createElement('canvas');
+      const aw = ANALYSIS_W, ah = Math.round((padded.height * aw) / padded.width), sc = aw / padded.width;
+      a.width = aw;
+      a.height = ah;
+      const pc = document.createElement('canvas');
+      pc.width = padded.width;
+      pc.height = padded.height;
+      pc.getContext('2d')!.putImageData(padded, 0, 0);
+      const actx = a.getContext('2d', { willReadFrequently: true })!;
+      actx.drawImage(pc, 0, 0, aw, ah);
+      const { g } = toGray(actx.getImageData(0, 0, aw, ah));
+      // where the original crop assumed the card was: centred in the padded crop
+      const outH = OUT_W / CARD_RATIO;
+      const expected = { x: ((padded.width - OUT_W) / 2) * sc, y: ((padded.height - outH) / 2) * sc, w: OUT_W * sc, h: outH * sc };
+      const refined = refineCrop(g, aw, ah, expected);
+      const misaligned = refined ? refined.deviation > MISALIGNED : !det; // no outline and no edges found → can't vouch for the crop
+
+      setFlash((f) => f + 1);
+      if (sound) beep();
+      navigator.vibrate?.(30);
+      const target = retakeRef.current;
+      setRetake(null);
+      const quality = {
+        source,
+        detected: !!det,
+        detectionConfidence: det?.confidence ?? null,
+        alignment: refined ? Math.round(refined.deviation * 1000) / 1000 : null,
+        ...(q ? { sharpness: Math.round(q.sharpness), brightness: Math.round(q.brightness), glare: q.glare } : {}),
+      };
+
+      autoLevels(original);
+      const originalBlob = await toBlob(original);
+      if (!originalBlob) return;
+      if (!misaligned) {
+        await commitCapture(originalBlob, quality, target);
+        return;
+      }
+
+      // 3. misaligned: try to fix it and ask
+      let adjusted: { blob: Blob; url: string } | null = null;
+      if (refined && refined.deviation > MISALIGNED) {
+        const fixed = warpCard(padded, refined.corners.map((p) => ({ x: p.x / sc, y: p.y / sc })) as Quad, OUT_W);
+        autoLevels(fixed);
+        const b = await toBlob(fixed);
+        if (b) adjusted = { blob: b, url: URL.createObjectURL(b) };
+      }
+      setReview({
+        original: { blob: originalBlob, url: URL.createObjectURL(originalBlob) },
+        adjusted,
+        quality,
+        target,
+      });
+    },
+    [add, game, guideInVideo, batch, sound, commitCapture],
+  );
+
+  // ---- alignment review decisions
+  const closeReview = () => {
+    const rv = reviewRef.current;
+    if (rv) {
+      URL.revokeObjectURL(rv.original.url);
+      if (rv.adjusted) URL.revokeObjectURL(rv.adjusted.url);
+    }
+    setReview(null);
+  };
+  const acceptAdjusted = async () => {
+    const rv = reviewRef.current;
+    if (!rv?.adjusted) return;
+    closeReview();
+    await commitCapture(rv.adjusted.blob, { ...rv.quality, adjusted: true }, rv.target);
+  };
+  const useOriginal = async () => {
+    const rv = reviewRef.current;
+    if (!rv) return;
+    closeReview();
+    await commitCapture(rv.original.blob, { ...rv.quality, adjusted: false }, rv.target);
+  };
+  const retakeCapture = () => {
+    const rv = reviewRef.current;
+    closeReview();
+    if (rv?.target) setRetake(rv.target); // a sidebar retake stays a retake
+    // the same card is expected back in frame: arm for it immediately
+    lastSigRef.current = null;
+    Object.assign(detRef.current, { armed: true, stable: 0, newCard: 0, emptySince: null });
+    setPhase('idle');
+    toast('Retake — adjust the card and hold it steady', 'info');
+  };
+
+  // ---- retake & delete from the scans sidebar
+  const startRetake = async (scan: ScanListItem) => {
+    const name = scan.cardName ?? 'this card';
+    const identified = IDENTIFIED.includes(scan.status);
+    const ok = await confirm({
+      title: 'Retake photo?',
+      message: identified ? (
+        <>
+          <p style={{ margin: 0 }}>
+            <strong>{name}</strong> has already been identified. Retaking removes that identification and the copy it added to your collection (including any condition, price or notes you edited), then identifies the card again from the new photo.
+          </p>
+          <p style={{ marginBottom: 0 }}>The current photo is kept until the new one is taken.</p>
+        </>
+      ) : (
+        <>
+          <p style={{ margin: 0 }}>The current photo will be replaced by the next one you take. The card stays in the queue and is identified from the new photo.</p>
+          <p style={{ marginBottom: 0 }}>The current photo is kept until the new one is taken.</p>
+        </>
+      ),
+      confirmLabel: 'Retake photo',
+    });
+    if (!ok) return;
+    setRetake({ scanId: scan.id, name });
+    if (captured) URL.revokeObjectURL(captured.url);
+    setCaptured(null);
+    // arm for the same card: a retake is allowed (expected) to show the card just scanned
+    clearTimeout(phaseTimer.current);
+    setPhase('idle');
+    lastSigRef.current = null;
+    Object.assign(detRef.current, { armed: true, stable: 0, newCard: 0, emptySince: null });
+    if (camState !== 'on') {
+      reopenDisarmed.current = false;
+      void startCamera();
+    }
+    vpRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); // on phones the list sits below the camera
+    toast(`Retaking ${name} — place the card in the frame`, 'info');
+  };
+
+  const deleteScan = async (scan: ScanListItem) => {
+    const name = scan.cardName ?? 'this card';
+    const identified = IDENTIFIED.includes(scan.status);
+    const ok = await confirm({
+      title: 'Delete scan?',
+      message: (
+        <p style={{ margin: 0 }}>
+          The photo of <strong>{name}</strong> and its place in the queue will be removed.
+          {identified ? ' The copy it added to your collection will be removed too.' : ''} This can't be undone.
+        </p>
+      ),
+      confirmLabel: 'Delete scan',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.del(`/api/scans/${scan.id}`);
+      if (retakeRef.current?.scanId === scan.id) setRetake(null);
+      toast(`Deleted scan of ${name}`, 'info');
+      scans.reload();
+    } catch (e) {
+      toast(e instanceof ApiError ? e.message : 'Delete failed', 'error');
+      scans.reload();
+    }
+  };
 
   const scanAnother = () => {
     if (captured) URL.revokeObjectURL(captured.url);
@@ -352,7 +540,7 @@ export default function ScanPage() {
       setQuality(q);
       setFound(!!det);
       drawOverlay(det, s);
-      if (auto && st.armed && det && q.ok && st.stable >= STABLE_FRAMES) void capture('auto');
+      if (auto && st.armed && det && q.ok && st.stable >= STABLE_FRAMES && !reviewRef.current) void capture('auto');
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
@@ -402,15 +590,18 @@ export default function ScanPage() {
                   : 'READY';
 
   const onFile = async (f: File) => {
+    // a sidebar retake also applies to an uploaded photo
+    const target = retakeRef.current;
     try {
       toast('Preparing photo…', 'info');
       const blob = await preparePhoto(f);
-      const localId = await add(blob, { gameHint: game || undefined, quality: { source: 'file' } });
+      const localId = await add(blob, { gameHint: game || undefined, quality: { source: 'file' }, replaceScanId: target?.scanId, label: target?.name });
       if (!localId) {
         toast('Not signed in — sign in again and retry.', 'error');
         return;
       }
-      toast('Captured — uploading now', 'success');
+      setRetake(null);
+      toast(target ? `Captured — replacing the photo of ${target.name}` : 'Captured — uploading now', 'success');
       if (!batch) {
         stopCamera();
         setCamState('paused');
@@ -469,6 +660,14 @@ export default function ScanPage() {
                 )}
               </div>
             )}
+            {retake && !captured && (
+              <div className="retake-banner" role="status">
+                <span>📷 Retaking photo · {retake.name}</span>
+                <button className="btn sm" onClick={() => setRetake(null)}>
+                  Cancel
+                </button>
+              </div>
+            )}
             <div className="vp-mode" role="group" aria-label="Scan mode">
               <button className={!batch ? 'on' : ''} onClick={() => setMode(false)} title="Close the camera after each card">
                 Single
@@ -484,18 +683,16 @@ export default function ScanPage() {
               </div>
             )}
 
-            {captured ? (
+            {review && (
+              <AlignmentReview review={review} onKeepCorrected={() => void acceptAdjusted()} onKeepOriginal={() => void useOriginal()} onRetake={retakeCapture} />
+            )}
+            {review ? null : captured ? (
               <SingleResult
                 captured={captured}
                 pending={items.find((i) => i.id === captured.localId)}
                 scan={scanList.find((s) => s.id === uploadedIds[captured.localId])}
                 onAnother={scanAnother}
                 onEdit={(s) => void edit(s)}
-                onDuplicate={async (action) => {
-                  const next = await resolveDuplicate(captured.localId, action);
-                  if (next) setCaptured({ ...captured, localId: next });
-                  else scanAnother();
-                }}
               />
             ) : (
               <div className="vp-bottom">
@@ -591,12 +788,15 @@ export default function ScanPage() {
             });
           }}
           onEdit={(s) => void edit(s)}
-          onDuplicate={(id, action) => void resolveDuplicate(id, action)}
           onRetry={(id) => void retry(id)}
           onDiscard={(id) => void discard(id)}
+          onRetake={(sc) => void startRetake(sc)}
+          onDelete={(sc) => void deleteScan(sc)}
+          retakingId={retake?.scanId ?? null}
         />
       </div>
       {dialog}
+      {confirmDialog}
     </div>
   );
 }
@@ -608,70 +808,108 @@ function SingleResult({
   scan,
   onAnother,
   onEdit,
-  onDuplicate,
 }: {
   captured: { url: string };
-  pending?: { status: string; error?: string; duplicate?: { cardId: string | null; cardName: string | null } };
+  pending?: { status: string; error?: string };
   scan?: ScanListItem;
   onAnother: () => void;
   onEdit: (s: ScanListItem) => void;
-  onDuplicate: (action: 'add' | 'cancel') => void;
 }) {
-  const dup = pending?.status === 'duplicate';
-  const title = dup
-    ? 'You already scanned this card.'
-    : pending?.status === 'failed'
+  // once identified, show how many copies the owner now has (they share pricing)
+  const identified = !!scan && IDENTIFIED.includes(scan.status);
+  const owned = useAsync(
+    () => (identified ? api.get<ScanDetail>(`/api/scans/${scan!.id}`).then((d) => d.owned) : Promise.resolve(null)),
+    [scan?.id, identified],
+  ).data;
+  const title =
+    pending?.status === 'failed'
       ? 'Upload rejected'
       : scan
         ? (scan.cardName ?? (NEEDS_REVIEW.includes(scan.status) ? 'Needs a quick review' : 'Identifying…'))
         : 'Uploading…';
+  const copies = owned?.copies ?? 0;
   return (
     <div className="single-result">
       <img src={captured.url} alt="Captured card" />
       <div className="single-card panel">
         <div className="row between" style={{ gap: 8 }}>
           <strong className="truncate">{title}</strong>
-          {scan && !dup && <StatusBadge status={scan.status} />}
+          {scan && <StatusBadge status={scan.status} />}
         </div>
         <div className="faint" style={{ fontSize: 13 }}>
-          {dup
-            ? (pending?.duplicate?.cardName ?? 'An earlier scan looks the same.')
-            : pending?.status === 'failed'
-              ? pending.error
-              : scan
-                ? IDENTIFIED.includes(scan.status)
-                  ? `${STATUS_LABEL[scan.status]}${scan.confidence != null ? ` · ${(scan.confidence * 100).toFixed(0)}% match` : ''}`
-                  : STATUS_LABEL[scan.status]
-                : pending?.error
-                    ? `Waiting to upload: ${pending.error}`
-                    : 'Saved on this device — it uploads automatically.'}
+          {pending?.status === 'failed'
+            ? pending.error
+            : scan
+              ? identified
+                ? `${STATUS_LABEL[scan.status]}${scan.confidence != null ? ` · ${(scan.confidence * 100).toFixed(0)}% match` : ''}${
+                    copies > 1 ? ` · you now have ${copies} copies (shared pricing)` : ''
+                  }`
+                : STATUS_LABEL[scan.status]
+              : pending?.error
+                ? `Waiting to upload: ${pending.error}`
+                : 'Saved on this device — it uploads automatically.'}
         </div>
         <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
-          {dup ? (
-            <>
-              <button className="btn sm primary" onClick={() => onDuplicate('add')}>
-                Add another copy
-              </button>
-              {pending?.duplicate?.cardId && (
-                <Link className="btn sm" to={`/collection?card=${pending.duplicate.cardId}`}>
-                  View existing
-                </Link>
-              )}
-              <button className="btn sm ghost" onClick={() => onDuplicate('cancel')}>
-                Cancel
-              </button>
-            </>
-          ) : (
-            <>
-              {scan && canEdit(scan.status, scan.collectionItemId) && (
-                <button className="btn sm" onClick={() => onEdit(scan)}>
-                  Edit
-                </button>
-              )}
-              <button className="btn sm primary" onClick={onAnother}>
-                ◉ Scan another card
-              </button>
-            </>
+          {scan && canEdit(scan.status, scan.collectionItemId) && (
+            <button className="btn sm" onClick={() => onEdit(scan)}>
+              Edit
+            </button>
+          )}
+          <button className="btn sm primary" onClick={onAnother}>
+            ◉ Scan another card
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Shown when a capture looked misaligned: the corrected and original crops
+ * side by side, with one choice — keep corrected, keep original or retake.
+ */
+function AlignmentReview({
+  review,
+  onKeepCorrected,
+  onKeepOriginal,
+  onRetake,
+}: {
+  review: AlignReview;
+  onKeepCorrected: () => void;
+  onKeepOriginal: () => void;
+  onRetake: () => void;
+}) {
+  const corrected = review.adjusted;
+  return (
+    <div className="single-result align-review" role="dialog" aria-label="Check card alignment">
+      <div className={`align-pair ${corrected ? '' : 'single'}`}>
+        {corrected && (
+          <figure className="align-option recommended">
+            <img src={corrected.url} alt="Corrected card" />
+            <figcaption>Corrected</figcaption>
+          </figure>
+        )}
+        <figure className="align-option">
+          <img src={review.original.url} alt="Original capture" />
+          <figcaption>Original</figcaption>
+        </figure>
+      </div>
+      <div className="single-card panel">
+        <strong>{corrected ? 'This card looked misaligned, so we corrected it.' : 'This card looks misaligned and couldn’t be corrected automatically.'}</strong>
+        <div className="faint" style={{ fontSize: 13 }}>
+          {corrected ? 'Compare the two and choose which photo to keep — or retake it.' : 'Keep this photo, or retake it?'}
+        </div>
+        <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
+          <button className="btn sm ghost" onClick={onRetake}>
+            Retake
+          </button>
+          <button className={`btn sm ${corrected ? '' : 'primary'}`} onClick={onKeepOriginal} autoFocus={!corrected}>
+            Keep original
+          </button>
+          {corrected && (
+            <button className="btn sm primary" onClick={onKeepCorrected} autoFocus>
+              Keep corrected
+            </button>
           )}
         </div>
       </div>
