@@ -152,6 +152,23 @@ textarea.input { height: auto; min-height: 80px; padding: 10px 12px; resize: ver
 .menu a, .menu button { display: flex; width: 100%; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 8px; color: var(--text); background: none; border: 0; font: inherit; cursor: pointer; text-align: left; }
 .menu a:hover, .menu button:hover { background: var(--panel-2); text-decoration: none; }
 .menu hr { border: 0; border-top: 1px solid var(--line); margin: 6px 0; }
+/* developer menu */
+.dev-menu { position: relative; }
+.dev-btn { display: inline-flex; align-items: center; gap: 7px; padding: 6px 11px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel-2); color: var(--text-2, var(--text)); font: inherit; font-size: 13px; cursor: pointer; }
+.dev-btn:hover, .dev-btn.on { border-color: var(--line-strong); color: var(--text); }
+.dev-ico { font-family: ui-monospace, Menlo, monospace; font-weight: 700; font-size: 12px; color: var(--accent); }
+.menu.dev-panel { width: min(380px, calc(100vw - 24px)); padding: 8px; }
+.dev-head { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); padding: 4px 8px 8px; font-weight: 600; }
+.dev-empty { padding: 8px; }
+.dev-tool { display: flex; flex-direction: column; gap: 10px; padding: 10px; border-radius: 10px; background: var(--panel-2); border: 1px solid var(--line); }
+.dev-tool-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.dev-status { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.dev-desc { font-size: 12px; }
+.dev-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.menu .dev-actions button { width: auto; display: inline-flex; padding: 6px 12px; }
+.menu .dev-actions .btn.primary { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: var(--accent-ink); }
+.menu .dev-actions .btn.primary:hover { background: linear-gradient(135deg, var(--accent), var(--accent-2)); filter: brightness(1.08); }
+.menu .dev-actions button:disabled { opacity: .5; cursor: not-allowed; }
 
 /* mobile bottom nav (phone = scanner-first) */
 .bottom-nav { display: none; }

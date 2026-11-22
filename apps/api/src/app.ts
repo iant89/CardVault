@@ -17,6 +17,7 @@ import { searchRoutes } from './routes/search.js';
 import { adminRoutes } from './routes/admin.js';
 import { fileRoutes } from './routes/files.js';
 import { eventRoutes } from './websocket/events.js';
+import { devRoutes } from './routes/dev.js';
 
 export async function buildApp(ctx: AppContext) {
   const app = Fastify({
@@ -52,7 +53,7 @@ export async function buildApp(ctx: AppContext) {
     return reply.code(status).send({ error: status >= 500 ? 'Internal server error' : err.message });
   });
 
-  for (const r of [authRoutes, userRoutes, scanRoutes, cardRoutes, collectionRoutes, jobRoutes, manualReviewRoutes, searchRoutes, adminRoutes, fileRoutes, eventRoutes]) {
+  for (const r of [authRoutes, userRoutes, scanRoutes, cardRoutes, collectionRoutes, jobRoutes, manualReviewRoutes, searchRoutes, adminRoutes, fileRoutes, eventRoutes, devRoutes]) {
     await r(app, ctx);
   }
   return app;

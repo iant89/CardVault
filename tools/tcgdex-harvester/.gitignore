@@ -1,0 +1,5 @@
+# downloaded card images and data: never commit these (the artwork is
+# copyrighted by The Pokémon Company and its artists)
+tcgdex-data/
+demo-data/
+*.part

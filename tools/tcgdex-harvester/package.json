@@ -1,0 +1,14 @@
+{
+  "name": "tcgdex-harvester",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local web app that downloads every card image and its data from the TCGdex API, politely, with a live dashboard.",
+  "type": "module",
+  "engines": { "node": ">=20.10" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "mock": "node test/mock-tcgdex.mjs",
+    "demo": "node test/mock-tcgdex.mjs --port 4778 & node src/server.mjs --api http://127.0.0.1:4778/v2 --out ./demo-data",
+    "test": "node --test test/harvester.test.mjs"
+  }
+}
