@@ -169,3 +169,9 @@
   /* phones: only the two newest toasts, so they can't bury on-screen choices */
   .toasts .toast:nth-last-child(n + 3) { display: none; }
 }
+/* login: keep the clock clear of the sign-in tile on shorter screens */
+@media (max-height: 880px) and (min-width: 761px) {
+  .login .clock { top: 4vh; }
+  .login .clock .t { font-size: 76px; }
+  .login .center { margin-top: 14vh; }
+}

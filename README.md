@@ -12,7 +12,7 @@ Supported: **Pokémon · Magic: The Gathering · Yu-Gi-Oh! · Football · Baseba
 
 ```bash
 cp .env.example .env
-# fill in POSTGRES_PASSWORD, SESSION_SECRET (openssl rand -base64 48), ADMIN_PASSWORD, WEB_ORIGIN
+# fill in POSTGRES_PASSWORD, SESSION_SECRET (openssl rand -base64 48), ADMIN_PASSWORD
 docker compose up -d --build
 docker compose exec api node apps/api/dist/cli/create-user.js --bootstrap   # first admin from ADMIN_* vars
 ```
@@ -26,6 +26,8 @@ Open `http://<server>:8080` and sign in. Add the rest of the family from the use
 | `backup` | `docker compose --profile backup up -d` | nightly DB dumps, weekly image archives |
 
 Only the web port is published. PostgreSQL, Redis and the worker stay on the internal Docker network.
+
+**"Cross-origin request rejected" on the sign-in screen?** The API only accepts sign-ins and changes from pages served by CardVault itself. It compares the page's address (`Origin`) with the address the browser used (`Host`), port included. The bundled nginx forwards the full host, so any address you use works: IP, hostname, `:8080`. If you put another proxy in front that rewrites the `Host` header, list the address(es) you use in `WEB_ORIGIN` (comma-separated) and restart. The error message names the address it saw.
 
 ### HTTPS (needed for phone cameras)
 
