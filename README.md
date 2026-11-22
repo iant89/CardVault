@@ -203,8 +203,8 @@ Each source implements `CardProvider` (`search / getCard / getPrices / getSales 
 
 | Provider | Games | Provides | Notes |
 |---|---|---|---|
-| TCGdex | Pokémon | identity, images | free, no key |
-| Pokémon TCG API | Pokémon | identity, TCGplayer market prices | deprecated, keys end 2027-03-01, so it isn't a hard dependency |
+| TCGdex | Pokémon | identity, images, TCGplayer market prices (USD) | free, no key; the main Pokémon price source |
+| Pokémon TCG API | Pokémon | identity, TCGplayer market prices | deprecated (keys end 2027-03-01) and often returns 500/502, so it's a second source only |
 | Scryfall | Magic | identity, images, USD/foil/etched prices | 8 req/s |
 | YGOPRODeck | Yu-Gi-Oh! | identity, images, set prices | images are cached locally, per their guidelines |
 | eBay Browse API | all | active listings (Buy It Now / auction) | needs `EBAY_CLIENT_ID/SECRET`. Sold data needs eBay's restricted Marketplace Insights API; add `getSales()` if you're granted access |

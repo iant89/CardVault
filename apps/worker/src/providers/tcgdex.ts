@@ -1,10 +1,10 @@
 import type { CardProvider } from '@cardvault/provider-sdk';
-import type { NormalizedCard } from '@cardvault/card-model';
+import type { NormalizedCard, PriceObservationInput } from '@cardvault/card-model';
 import type { VariantType } from '@cardvault/shared';
 import { similarity, normalizeCollectorNumber } from '@cardvault/shared';
-import { isoDate } from './util.js';
+import { dayStamp, isoDate, toNum } from './util.js';
 
-/** TCGdex — free, open Pokémon card database (no key). Used for identity data. */
+/** TCGdex — free, open Pokémon card database (no key). Identity data and TCGplayer market prices. */
 interface TcgdexBrief {
   id: string;
   localId: string;
@@ -26,6 +26,64 @@ interface TcgdexCard extends TcgdexBrief {
   retreat?: number;
   variants?: { normal?: boolean; reverse?: boolean; holo?: boolean; firstEdition?: boolean };
   set: { id: string; name: string; cardCount?: { official?: number; total?: number } };
+  /** market data TCGdex mirrors from TCGplayer (USD) and Cardmarket (EUR) */
+  pricing?: { tcgplayer?: Record<string, unknown> | null; cardmarket?: Record<string, unknown> | null } | null;
+}
+
+/** TCGplayer price-group keys → CardVault variants. Keys are compared lowercased with separators removed. */
+const TCGPLAYER_VARIANT: Record<string, VariantType> = {
+  normal: 'NORMAL',
+  holofoil: 'HOLO',
+  holo: 'HOLO',
+  reverseholofoil: 'REVERSE_HOLO',
+  reverse: 'REVERSE_HOLO',
+  '1steditionholofoil': 'FIRST_EDITION',
+  '1steditionnormal': 'FIRST_EDITION',
+  '1stedition': 'FIRST_EDITION',
+  firsteditionholofoil: 'FIRST_EDITION',
+  firstedition: 'FIRST_EDITION',
+  unlimitedholofoil: 'UNLIMITED',
+  unlimited: 'UNLIMITED',
+};
+
+const pick = (o: Record<string, unknown>, ...keys: string[]) => {
+  for (const k of keys) {
+    const v = toNum(o[k]);
+    if (v != null) return v;
+  }
+  return null;
+};
+
+/**
+ * TCGplayer market prices from a TCGdex card's `pricing.tcgplayer` block.
+ * Written defensively: each price group (normal, holofoil, reverse-holofoil…)
+ * is an object holding market/mid prices, under camelCase or plain names.
+ * Cardmarket (EUR) is deliberately ignored so currencies never mix.
+ */
+export function parseTcgdexPricing(cardId: string, pricing: TcgdexCard['pricing'], day = dayStamp()): PriceObservationInput[] {
+  const tp = pricing?.tcgplayer;
+  if (!tp || typeof tp !== 'object') return [];
+  const unit = typeof tp.unit === 'string' ? tp.unit.toUpperCase() : 'USD';
+  if (unit !== 'USD') return [];
+  const date = day.toISOString().slice(0, 10);
+  const out: PriceObservationInput[] = [];
+  for (const [key, group] of Object.entries(tp)) {
+    if (!group || typeof group !== 'object' || Array.isArray(group)) continue;
+    const g = group as Record<string, unknown>;
+    const price = pick(g, 'marketPrice', 'market', 'midPrice', 'mid');
+    if (!price) continue;
+    const norm = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    out.push({
+      source: 'tcgplayer-via-tcgdex',
+      sourceItemId: `${cardId}:${norm}:${date}`,
+      variant: TCGPLAYER_VARIANT[norm] ?? null,
+      price,
+      currency: 'USD',
+      saleType: 'MARKET',
+      observedAt: day.toISOString(),
+    });
+  }
+  return out;
 }
 
 const BASE = 'https://api.tcgdex.net/v2/en';
@@ -69,7 +127,7 @@ export const tcgdexProvider: CardProvider = {
   name: 'TCGdex',
   type: 'CARD_DATABASE',
   games: ['pokemon'],
-  capabilities: { identify: true, search: true, prices: false, sales: false, images: true },
+  capabilities: { identify: true, search: true, prices: true, sales: false, images: true },
   rateLimit: { requests: 2, intervalMs: 1000 },
   allowedHosts: ['api.tcgdex.net', 'assets.tcgdex.net'],
   isConfigured: () => true,
@@ -99,6 +157,21 @@ export const tcgdexProvider: CardProvider = {
       return normalize(await ctx.http.getJson<TcgdexCard>(`${BASE}/cards/${encodeURIComponent(externalId)}`));
     } catch (e) {
       if ((e as { status?: number }).status === 404) return null;
+      throw e;
+    }
+  },
+
+  /** TCGplayer market prices mirrored by TCGdex (a second Pokémon price source besides pokemontcg.io). */
+  async getPrices(card, ctx) {
+    const id = card.externalIds.tcgdex;
+    if (!id) return [];
+    try {
+      const c = await ctx.http.getJson<TcgdexCard>(`${BASE}/cards/${encodeURIComponent(id)}`);
+      const prices = parseTcgdexPricing(id, c.pricing);
+      if (!prices.length) ctx.log.info({ provider: 'tcgdex', card: id, hasPricing: !!c.pricing }, 'no TCGplayer prices on TCGdex card');
+      return prices;
+    } catch (e) {
+      if ((e as { status?: number }).status === 404) return [];
       throw e;
     }
   },
