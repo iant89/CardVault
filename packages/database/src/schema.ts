@@ -416,3 +416,88 @@ export const auditLog = pgTable(
   },
   (t) => [index('audit_log_created_idx').on(t.createdAt), index('audit_log_entity_idx').on(t.entity, t.entityId)],
 );
+
+// ---------------------------------------------------------------- OCR training data
+/**
+ * One text line cut from a card (its title or a collector-number spot), what
+ * the OCR engine read, and, once known, the correct answer. These feed the
+ * fixed exam and, later, training.
+ *
+ * label_source (how far the label can be trusted):
+ *   pending       the scan isn't identified yet
+ *   review        a person confirmed or corrected it in manual review
+ *   corroborated  auto-identified, and evidence independent of this line agreed
+ *   self          auto-identified mainly on this line's own reading: never trained on
+ *   harvest       official card image from TCGdex (correct label, not a camera photo)
+ *   excluded      unusable (e.g. cut with another game's layout)
+ */
+export const ocrSamples = pgTable(
+  'ocr_samples',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    scanId: uuid('scan_id').references(() => scans.id, { onDelete: 'cascade' }),
+    imageVersion: integer('image_version').notNull().default(0),
+    /** samples read together (a scan's number spots) share a group: scored as one */
+    groupKey: text('group_key').notNull(),
+    game: text('game').notNull(),
+    field: text('field').notNull(),
+    region: integer('region').notNull().default(0),
+    cropPath: text('crop_path').notNull(),
+    width: integer('width'),
+    height: integer('height'),
+    engine: text('engine').notNull(),
+    predicted: text('predicted').notNull().default(''),
+    predictedConfidence: real('predicted_confidence'),
+    cardId: uuid('card_id').references(() => cards.id, { onDelete: 'set null' }),
+    /** the exact printed text, when known */
+    labelText: text('label_text'),
+    /** what scoring compares against: normalized name, or the normalized collector number */
+    labelNorm: text('label_norm'),
+    labelSource: text('label_source').notNull().default('pending'),
+    /** train or exam, fixed per card so one card never lands on both sides; null until labelled */
+    split: text('split'),
+    /** a misread a person corrected: must stay fixed in every future model */
+    regression: boolean('regression').notNull().default(false),
+    meta: jsonb('meta').$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: created(),
+    labeledAt: ts('labeled_at'),
+  },
+  (t) => [
+    index('ocr_samples_scan_idx').on(t.scanId, t.imageVersion),
+    index('ocr_samples_split_idx').on(t.split, t.labelSource),
+    index('ocr_samples_group_idx').on(t.groupKey),
+    uniqueIndex('ocr_samples_harvest_uq').on(t.groupKey, t.field, t.region),
+  ],
+);
+
+/** A frozen exam: the exact samples every engine is scored on until a new version is frozen. */
+export const ocrExams = pgTable('ocr_exams', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  version: integer('version').notNull(),
+  sampleIds: jsonb('sample_ids').$type<string[]>().notNull(),
+  counts: jsonb('counts').$type<Record<string, number>>().notNull().default({}),
+  note: text('note'),
+  createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: created(),
+});
+
+/** One engine scored on one exam version (plus the regression set). */
+export const ocrEvaluations = pgTable(
+  'ocr_evaluations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    examId: uuid('exam_id').references(() => ocrExams.id, { onDelete: 'set null' }),
+    examVersion: integer('exam_version'),
+    engine: text('engine').notNull(),
+    status: text('status').notNull().default('queued'),
+    progress: jsonb('progress').$type<{ done: number; total: number }>().notNull().default({ done: 0, total: 0 }),
+    summary: jsonb('summary').$type<Record<string, unknown>>().notNull().default({}),
+    slices: jsonb('slices').$type<Record<string, unknown>[]>().notNull().default([]),
+    misses: jsonb('misses').$type<Record<string, unknown>[]>().notNull().default([]),
+    error: text('error'),
+    requestedBy: uuid('requested_by').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: created(),
+    completedAt: ts('completed_at'),
+  },
+  (t) => [index('ocr_evaluations_created_idx').on(t.createdAt)],
+);

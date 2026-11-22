@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router';
 import { api, ApiError } from '../services/api';
 import { toast } from '../stores/toasts';
 
@@ -123,6 +124,13 @@ export function DevMenu() {
       {open && (
         <div className="menu dev-panel" role="menu">
           <div className="dev-head">Developer tools</div>
+          <Link to="/dev/ocr" className="dev-link" onClick={() => setOpen(false)}>
+            <span className="dev-link-ico" aria-hidden="true">Aa</span>
+            <span>
+              <strong>OCR Lab</strong>
+              <span className="faint dev-desc">Collected lines, the frozen exam and engine scores.</span>
+            </span>
+          </Link>
           {!tools && <div className="dev-empty faint">Loading…</div>}
           {tools?.map((t) => {
             const s = statusLine(t);

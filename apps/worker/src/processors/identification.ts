@@ -8,6 +8,7 @@ import { JobCancelled, JobTracker } from '../jobs/state.js';
 import { ocrCard, type OcrResult } from '../identification/ocr.js';
 import { extractSignals } from '../identification/extract.js';
 import { nameIndex } from '../identification/dictionary.js';
+import { labelScanSamples, saveScanSamples } from '../identification/samples.js';
 import { localCandidates, remoteCandidates, scoreCandidates } from '../identification/identify.js';
 import { run } from './common.js';
 
@@ -65,6 +66,10 @@ export async function processIdentification(ctx: WorkerContext, job: Job<Identif
         ctx.log.warn({ err: (e as Error).message }, 'OCR failed; continuing with other signals');
       }
     }
+    // keep the lines just read as (unlabelled) OCR samples; never let this break a scan
+    await saveScanSamples(ctx, { id: scanId, imageVersion: version, quality: scan.quality }, ocr.layoutGame, ocr.lines).catch((e) =>
+      ctx.log.warn({ scanId, err: (e as Error).message }, 'could not store OCR samples'),
+    );
     if (job.data.clientOcr) ocr.full = `${ocr.full}\n${job.data.clientOcr}`;
 
     // 2. Signals + local catalog
@@ -143,6 +148,9 @@ export async function processIdentification(ctx: WorkerContext, job: Job<Identif
         'research',
         { researchJobId: rowId, cardId: best.cardId, scanId, userId, priority: 3, reason: 'SCAN' },
         { jobId: rowId, priority: 3 },
+      );
+      await labelScanSamples(ctx, scanId, best.cardId, 'auto', best.signals).catch((e) =>
+        ctx.log.warn({ scanId, err: (e as Error).message }, 'could not label OCR samples'),
       );
       return { decision, cardId: best.cardId, confidence };
     }

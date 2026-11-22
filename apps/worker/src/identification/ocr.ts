@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import { prepareForOcr, prepareOcrRegion } from '@cardvault/imaging';
+import { cropRegion, prepareForOcr, prepareLine } from '@cardvault/imaging';
 import { GAME_MODULES, guessGameFromText } from '@cardvault/card-model';
 import type { Logger } from 'pino';
 
@@ -56,6 +56,30 @@ export interface OcrResult {
   confidence: number;
   /** the game whose layout was used for the targeted reads */
   layoutGame?: string;
+  /** each targeted line with its crop: the raw material for the exam and training */
+  lines?: OcrLine[];
+}
+
+export type LineField = 'name' | 'number';
+
+export interface OcrLine {
+  field: LineField;
+  /** index of the spot in the game's layout */
+  region: number;
+  crop: Buffer;
+  text: string;
+  readings: string[];
+  confidence: number;
+}
+
+/** Identifies what read a line: stored with every sample and every score. */
+export const ENGINE_ID = 'tesseract-5/lines-v1';
+
+export interface LineReading {
+  text: string;
+  readings: string[];
+  /** 0–1 */
+  confidence: number;
 }
 
 /** Page-segmentation modes: 3 = automatic layout, 6 = one block, 7 = one line. */
@@ -75,12 +99,34 @@ function read(w: TWorker, img: Buffer, psm: string, chars = ''): Promise<{ text:
 }
 
 /**
+ * Read one cropped line, the way live scans do: the title as a single line;
+ * a number spot twice (block and line modes) with only number characters
+ * allowed. Used by scans and by the exam, so the exam measures exactly what
+ * scans experience.
+ */
+export async function readLine(crop: Buffer, field: LineField, opts: { numberChars?: string; log: Logger; langPath?: string }): Promise<LineReading> {
+  const w = await getWorker(opts.log, opts.langPath);
+  const img = await prepareLine(crop, 110);
+  if (field === 'name') {
+    const t = await read(w, img, PSM.line);
+    return { text: t.text.trim(), readings: [t.text.trim()], confidence: t.confidence / 100 };
+  }
+  const readings: string[] = [];
+  let conf = 0;
+  for (const psm of [PSM.block, PSM.line]) {
+    const t = await read(w, img, psm, opts.numberChars ?? '');
+    readings.push(t.text.trim());
+    conf += t.confidence / 100 / 2;
+  }
+  return { text: readings.filter(Boolean).join('\n'), readings, confidence: conf };
+}
+
+/**
  * Two passes. First the whole card and its title band, as before (any game).
  * Then, once the game is known (given, or guessed from the first pass), the
  * spots where that game prints the name and collector number are cropped,
- * enlarged and read on their own: one line for the name, and the number with
- * only the characters a number can contain. Without a known layout the footer
- * is read in two magnified halves.
+ * enlarged and read on their own. Without a known layout every game's title
+ * spot is tried and the footer is read in two magnified halves.
  */
 export async function ocrCard(image: Buffer, log: Logger, langPath?: string, gameHint?: string): Promise<OcrResult> {
   const w = await getWorker(log, langPath);
@@ -97,20 +143,26 @@ export async function ocrCard(image: Buffer, log: Logger, langPath?: string, gam
 
   const names: string[] = [];
   const numbers: string[] = [];
-  // the title spot of the known game, or of every game with a layout when the
-  // first pass couldn't tell (cards with little rules text)
-  const nameSpots = layout ? layout.name : Object.values(GAME_MODULES).flatMap((m) => m.ocrLayout?.name ?? []);
-  for (const r of nameSpots) {
-    const t = await read(w, await prepareOcrRegion(image, r, 110), PSM.line);
-    if (t.text.trim()) names.push(t.text.trim());
-  }
+  const lines: OcrLine[] = [];
   if (layout) {
-    for (const r of layout.number) {
-      const img = await prepareOcrRegion(image, r, 110);
-      // two readings of the same spot; the number is taken from whichever agree
-      for (const psm of [PSM.block, PSM.line]) numbers.push((await read(w, img, psm, layout.numberChars)).text.trim());
+    for (const [i, r] of layout.name.entries()) {
+      const crop = await cropRegion(image, r);
+      const t = await readLine(crop, 'name', { log, langPath });
+      if (t.text) names.push(t.text);
+      lines.push({ field: 'name', region: i, crop, ...t });
+    }
+    for (const [i, r] of layout.number.entries()) {
+      const crop = await cropRegion(image, r);
+      const t = await readLine(crop, 'number', { numberChars: layout.numberChars, log, langPath });
+      numbers.push(...t.readings);
+      lines.push({ field: 'number', region: i, crop, ...t });
     }
   } else {
+    // the game couldn't be told: try every game's title spot (no samples kept)
+    for (const r of Object.values(GAME_MODULES).flatMap((m) => m.ocrLayout?.name ?? [])) {
+      const t = await readLine(await cropRegion(image, r), 'name', { log, langPath });
+      if (t.text) names.push(t.text);
+    }
     const [footL, footR] = await Promise.all([
       prepareForOcr(image, { top: 0.86, height: 0.14, left: 0, width: 0.55 }),
       prepareForOcr(image, { top: 0.86, height: 0.14, left: 0.45, width: 0.55 }),
@@ -123,6 +175,7 @@ export async function ocrCard(image: Buffer, log: Logger, langPath?: string, gam
     bottom: numbers.filter(Boolean).join('\n'),
     confidence: a.confidence / 100,
     layoutGame: layout ? game : undefined,
+    lines,
   };
 }
 
