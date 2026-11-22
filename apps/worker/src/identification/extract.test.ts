@@ -18,3 +18,24 @@ describe('extractSignals', () => {
     expect(s.variantHints).toContain('FIRST_EDITION');
   });
 });
+
+describe('name cleanup', () => {
+  it('drops a stray badge digit and an HP whose "HP" was too small to read', () => {
+    const s = extractSignals({ top: '5 Fletchling 60\n', full: 'BAS : : \nFletchling 60 x\nSurprise Attack 30', bottom: '' });
+    expect(s.nameCandidates[0]).toBe('Fletchling');
+  });
+  it('keeps name suffixes and inner numbers', () => {
+    const s = extractSignals({ top: 'BASIC Pikachu ex 200\n', full: '', bottom: '' }, 'pokemon');
+    expect(s.nameCandidates[0]).toBe('Pikachu ex');
+    const y = extractSignals({ top: 'Number 39: Utopia\n', full: '', bottom: '' }, 'yugioh');
+    expect(y.nameCandidates[0]).toBe('Number 39: Utopia');
+  });
+});
+
+describe('trimDebris', () => {
+  it('keeps short capitalised words', async () => {
+    const { trimDebris } = await import('./extract.js');
+    expect(trimDebris('Mr Mime 70')).toBe('Mr Mime');
+    expect(trimDebris('x Charizard VMAX 330 .')).toBe('Charizard VMAX');
+  });
+});

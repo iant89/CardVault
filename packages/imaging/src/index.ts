@@ -141,12 +141,19 @@ export async function makeThumbnail(input: Buffer, width = 300): Promise<Buffer>
 }
 
 /** Preprocess for OCR: grayscale, upscale, normalize contrast, sharpen. */
-export async function prepareForOcr(input: Buffer, region?: { top: number; height: number }): Promise<Buffer> {
+export async function prepareForOcr(input: Buffer, region?: { top: number; height: number; left?: number; width?: number }): Promise<Buffer> {
   let img = sharp(input);
   if (region) {
     const m = await img.metadata();
-    const h = m.height ?? 0;
-    img = sharp(input).extract({ left: 0, top: Math.round(h * region.top), width: m.width ?? 0, height: Math.max(1, Math.round(h * region.height)) });
+    const H = m.height ?? 0, W = m.width ?? 0;
+    const left = Math.round(W * (region.left ?? 0));
+    const top = Math.round(H * region.top);
+    img = sharp(input).extract({
+      left,
+      top,
+      width: Math.max(1, Math.min(W - left, Math.round(W * (region.width ?? 1)))),
+      height: Math.max(1, Math.min(H - top, Math.round(H * region.height))),
+    });
   }
   return img.grayscale().resize({ width: 1400, withoutEnlargement: false }).normalize().sharpen().png().toBuffer();
 }

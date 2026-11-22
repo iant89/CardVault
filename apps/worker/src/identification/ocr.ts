@@ -50,21 +50,25 @@ export interface OcrResult {
 }
 
 /**
- * OCR three regions: whole card, the title band (top 18%) and the footer
- * band (bottom 14%) where collector numbers / set codes usually live.
+ * OCR the whole card, the title band (top 18%) and the footer (bottom 14%),
+ * where collector numbers / set codes live. The footer is read as two
+ * overlapping halves so each is magnified twice as much: the number on newer
+ * Pokémon cards is only a few pixels tall at full-footer scale.
  */
 export async function ocrCard(image: Buffer, log: Logger, langPath?: string): Promise<OcrResult> {
   const w = await getWorker(log, langPath);
-  const [full, top, bottom] = await Promise.all([
+  const [full, top, footL, footR] = await Promise.all([
     prepareForOcr(image),
     prepareForOcr(image, { top: 0, height: 0.18 }),
-    prepareForOcr(image, { top: 0.86, height: 0.14 }),
+    prepareForOcr(image, { top: 0.86, height: 0.14, left: 0, width: 0.55 }),
+    prepareForOcr(image, { top: 0.86, height: 0.14, left: 0.45, width: 0.55 }),
   ]);
   const rec = (b: Buffer) => withTimeout(w.recognize(b), 45_000, 'OCR');
   const a = await rec(full);
   const b = await rec(top);
-  const c = await rec(bottom);
-  return { full: a.data.text, top: b.data.text, bottom: c.data.text, confidence: a.data.confidence / 100 };
+  const c = await rec(footL);
+  const d = await rec(footR);
+  return { full: a.data.text, top: b.data.text, bottom: `${c.data.text}\n${d.data.text}`, confidence: a.data.confidence / 100 };
 }
 
 export async function shutdownOcr(): Promise<void> {
