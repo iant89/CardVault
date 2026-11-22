@@ -144,3 +144,87 @@ export function sliceReport(items: ScoredItem[]): SliceMetrics[] {
   for (const [k, v] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) out.push(metrics(k, v));
   return out;
 }
+
+// ------------------------------------------------------------------ live trial & live watch
+
+/** One scored unit (a title line, or a scan's number spots) from live scans. */
+export interface LiveUnit {
+  field: 'name' | 'number';
+  /** the live engine read it correctly */
+  live: boolean;
+  /** the trial model read it correctly (trial only) */
+  shadow?: boolean;
+}
+
+export interface TrialStats {
+  lines: number;
+  liveAccuracy: number | null;
+  shadowAccuracy: number | null;
+  /** the trial model right where the live engine was wrong */
+  wins: number;
+  /** the trial model wrong where the live engine was right */
+  losses: number;
+  byField: Record<string, { lines: number; live: number | null; shadow: number | null }>;
+}
+
+const ratio = (a: number, b: number) => (b ? Math.round((a / b) * 10000) / 10000 : null);
+
+/** Compare live and trial readings on the same labelled lines. */
+export function compareTrial(units: LiveUnit[]): TrialStats {
+  const u = units.filter((x) => x.shadow !== undefined);
+  const byField: TrialStats['byField'] = {};
+  for (const f of ['name', 'number'] as const) {
+    const g = u.filter((x) => x.field === f);
+    byField[f] = { lines: g.length, live: ratio(g.filter((x) => x.live).length, g.length), shadow: ratio(g.filter((x) => x.shadow).length, g.length) };
+  }
+  return {
+    lines: u.length,
+    liveAccuracy: ratio(u.filter((x) => x.live).length, u.length),
+    shadowAccuracy: ratio(u.filter((x) => x.shadow).length, u.length),
+    wins: u.filter((x) => x.shadow && !x.live).length,
+    losses: u.filter((x) => !x.shadow && x.live).length,
+    byField,
+  };
+}
+
+export interface WatchWindow {
+  /** labelled lines read by the engine in this window, and how many it got right */
+  lines: number;
+  correct: number;
+  /** scans in this window, and how many needed manual review */
+  scans: number;
+  reviewed: number;
+}
+
+export interface WatchRules {
+  minLines: number;
+  minScans: number;
+  /** roll back if line accuracy falls by more than this (0.05 = 5 points) */
+  maxAccuracyDrop: number;
+  /** roll back if the share of scans needing manual review rises by more than this */
+  maxReviewRise: number;
+}
+
+export const DEFAULT_WATCH: WatchRules = { minLines: 30, minScans: 20, maxAccuracyDrop: 0.05, maxReviewRise: 0.15 };
+
+/**
+ * Should an active model be rolled back? Compares its live results since
+ * promotion with the previous engine's in the same length of time before it.
+ * Only judges once both windows hold enough data; never on a handful of scans.
+ */
+export function rollbackDecision(after: WatchWindow, before: WatchWindow, rules: WatchRules = DEFAULT_WATCH): { rollback: boolean; reasons: string[]; judged: string[] } {
+  const reasons: string[] = [];
+  const judged: string[] = [];
+  const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
+  if (after.lines >= rules.minLines && before.lines >= rules.minLines) {
+    judged.push('accuracy');
+    const a = after.correct / after.lines, b = before.correct / before.lines;
+    if (a < b - rules.maxAccuracyDrop) reasons.push(`live reading accuracy fell to ${pct(a)} from ${pct(b)} (${after.lines} vs ${before.lines} confirmed lines)`);
+  }
+  if (after.scans >= rules.minScans && before.scans >= rules.minScans) {
+    judged.push('reviews');
+    const a = after.reviewed / after.scans, b = before.reviewed / before.scans;
+    if (a > b + rules.maxReviewRise) reasons.push(`scans needing manual review rose to ${pct(a)} from ${pct(b)} (${after.scans} vs ${before.scans} scans)`);
+  }
+  return { rollback: reasons.length > 0, reasons, judged };
+}

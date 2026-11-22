@@ -41,6 +41,33 @@ export const CONFIDENT_MIN_N = 20;
 const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
 const find = (e: EvalLike, slice: string) => e.slices.find((s) => s.slice === slice);
 
+export interface TrialLike {
+  lines: number;
+  liveAccuracy: number | null;
+  shadowAccuracy: number | null;
+  wins: number;
+  losses: number;
+}
+
+/**
+ * The live trial: on the same real scans, now confirmed, the candidate must
+ * read at least as well as the live engine and not lose more lines than it wins.
+ */
+export function trialGate(trial: TrialLike | null | undefined, minLines: number): Gate | null {
+  if (minLines <= 0) return null;
+  const label = 'Live trial on real scans';
+  if (!trial || trial.lines < minLines) {
+    return { id: 'trial', label, pass: false, detail: `${trial?.lines ?? 0} of ${minLines} confirmed lines so far${trial ? '' : ': start a live trial'}` };
+  }
+  const ok = (trial.shadowAccuracy ?? 0) >= (trial.liveAccuracy ?? 0) && trial.losses <= trial.wins;
+  return {
+    id: 'trial',
+    label,
+    pass: ok,
+    detail: `${pct(trial.shadowAccuracy ?? 0)} vs ${pct(trial.liveAccuracy ?? 0)} live on ${trial.lines} lines · ${trial.wins} better, ${trial.losses} worse`,
+  };
+}
+
 export function gates(candidate: EvalLike, champion: EvalLike | null): Gate[] {
   const out: Gate[] = [];
   if (candidate.status !== 'done') return [{ id: 'scored', label: 'Scored on the current exam', pass: false, detail: 'Score it first.' }];

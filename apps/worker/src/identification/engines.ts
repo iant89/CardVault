@@ -153,3 +153,19 @@ export async function liveEngine(ctx: WorkerContext): Promise<LineEngine | null>
 export function resetLiveEngine() {
   active = { at: 0, engine: null };
 }
+
+let shadow: { at: number; engine: LineEngine | null } = { at: 0, engine: null };
+
+/** The model on live trial, if any (no Tesseract fallback: it is judged as it is). */
+export async function shadowEngine(ctx: WorkerContext): Promise<LineEngine | null> {
+  if (Date.now() - shadow.at < 30_000) return shadow.engine;
+  let engine: LineEngine | null = null;
+  try {
+    const [m] = await ctx.db.select({ id: ocrModels.id }).from(ocrModels).where(eq(ocrModels.status, 'shadow')).limit(1);
+    if (m) engine = await engineFor(ctx, `model:${m.id}`);
+  } catch (e) {
+    ctx.log.warn({ err: (e as Error).message }, 'OCR trial model unavailable');
+  }
+  shadow = { at: Date.now(), engine };
+  return engine;
+}

@@ -256,3 +256,13 @@ textarea.input { height: auto; min-height: 80px; padding: 10px 12px; resize: ver
 .ocr-gates li.ok span { color: var(--good); }
 .ocr-gates li.no span { color: var(--bad); }
 .ocr-gates em { font-style: normal; font-size: 12px; margin-left: 4px; }
+.ocr-status.shadow { color: var(--warn); border-color: var(--warn); }
+.ocr-model.shadow { border-color: rgba(255, 193, 7, .45); }
+.ocr-trial, .ocr-watch, .ocr-retired { margin-top: 10px; font-size: 13px; padding: 10px 12px; border-radius: 10px; background: rgba(0,0,0,.2); border: 1px solid var(--line); }
+.ocr-retired { color: var(--text-2); }
+.ocr-watch-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) auto auto auto; gap: 4px 14px; margin-top: 8px; align-items: baseline; }
+.ocr-watch-grid em { font-style: normal; font-size: 12px; }
+@media (max-width: 640px) { .ocr-watch-grid { grid-template-columns: minmax(0, 1fr) auto; } }
+.ocr-events { list-style: none; padding: 0; margin: 6px 0 0; display: grid; gap: 4px; font-size: 13px; }
+.ocr-events li.bad { color: var(--bad); }
+.ocr-events em { font-style: normal; font-size: 12px; }

@@ -504,8 +504,10 @@ export const ocrEvaluations = pgTable(
 
 /**
  * Trained line-reader models (tools/ocr-trainer output under storage/ocr/models).
- * status: candidate (registered, may be scored) → active (reads live scans; at
- * most one) → retired. Promotion to active is gated on exam results.
+ * status: candidate (registered, may be scored) → shadow (live trial: reads
+ * scans alongside the live engine, at most one) → active (reads live scans,
+ * at most one) → retired. Promotion is gated on exam results and the trial;
+ * an active model is watched and rolled back automatically if it does worse.
  */
 export const ocrModels = pgTable('ocr_models', {
   id: text('id').primaryKey(),
@@ -516,4 +518,13 @@ export const ocrModels = pgTable('ocr_models', {
   activatedAt: ts('activated_at'),
   activatedBy: uuid('activated_by').references(() => users.id, { onDelete: 'set null' }),
   note: text('note'),
+  /** what read live scans before this model was promoted ('tesseract' or a model id): where a rollback returns to */
+  previousEngine: text('previous_engine'),
+  /** live trial (status 'shadow'): reads every scan alongside the live engine without affecting it */
+  trialStartedAt: ts('trial_started_at'),
+  trial: jsonb('trial').$type<Record<string, unknown>>(),
+  /** live watch while active: accuracy since promotion vs the previous engine before it */
+  watch: jsonb('watch').$type<Record<string, unknown>>(),
+  retiredAt: ts('retired_at'),
+  retiredReason: text('retired_reason'),
 });

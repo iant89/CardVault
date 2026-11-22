@@ -55,9 +55,38 @@ interface Gate {
   pass: boolean;
   detail: string;
 }
+interface Trial {
+  lines: number;
+  liveAccuracy: number | null;
+  shadowAccuracy: number | null;
+  wins: number;
+  losses: number;
+  updatedAt?: string;
+}
+interface WatchSide {
+  lines: number;
+  correct: number;
+  scans: number;
+  reviewed: number;
+}
+interface Watch {
+  after: WatchSide;
+  before: WatchSide;
+  previousEngine: string;
+  rules: { minLines: number; minScans: number; maxAccuracyDrop: number; maxReviewRise: number };
+  judged: string[];
+  reasons: string[];
+  updatedAt: string;
+}
 interface Model {
   id: string;
-  status: 'candidate' | 'active' | 'retired';
+  status: 'candidate' | 'shadow' | 'active' | 'retired';
+  trial: Trial | null;
+  trialStartedAt: string | null;
+  watch: Watch | null;
+  previousEngine: string | null;
+  retiredAt: string | null;
+  retiredReason: string | null;
   createdAt: string;
   activatedAt: string | null;
   dataset: { id: string; rows: number } | null;
@@ -70,7 +99,40 @@ interface Model {
 interface Models {
   examVersion: number | null;
   champion: { engine: string; evaluationId: string | null } | null;
+  trialMinLines: number;
   models: Model[];
+  events: { action: string; entityId: string; metadata: Record<string, unknown>; createdAt: string }[];
+}
+
+const EVENT_LABEL: Record<string, string> = {
+  'ocr.promote': 'Promoted',
+  'ocr.rollback': 'Rolled back by hand',
+  'ocr.auto_rollback': 'Rolled back automatically',
+  'ocr.trial_start': 'Live trial started',
+};
+const ratioText = (a: number, b: number) => (b ? pct(a / b) : '—');
+
+function WatchView({ w }: { w: Watch }) {
+  const enoughLines = w.after.lines >= w.rules.minLines && w.before.lines >= w.rules.minLines;
+  const enoughScans = w.after.scans >= w.rules.minScans && w.before.scans >= w.rules.minScans;
+  return (
+    <div className="ocr-watch">
+      <strong>Live watch</strong> <span className="faint">vs {w.previousEngine.startsWith('model:') ? w.previousEngine.slice(6) : 'Tesseract'} before the switch · updated {new Date(w.updatedAt).toLocaleTimeString()}</span>
+      <div className="ocr-watch-grid">
+        <span>Reading accuracy on confirmed lines</span>
+        <span><strong>{ratioText(w.after.correct, w.after.lines)}</strong> <em className="faint">of {w.after.lines}</em></span>
+        <span className="faint">before: {ratioText(w.before.correct, w.before.lines)} of {w.before.lines}</span>
+        <span>{enoughLines ? (w.reasons.some((x) => x.includes('accuracy')) ? '✗' : '✓') : <em className="faint">needs {w.rules.minLines} each side</em>}</span>
+        <span>Scans needing manual review</span>
+        <span><strong>{ratioText(w.after.reviewed, w.after.scans)}</strong> <em className="faint">of {w.after.scans}</em></span>
+        <span className="faint">before: {ratioText(w.before.reviewed, w.before.scans)} of {w.before.scans}</span>
+        <span>{enoughScans ? (w.reasons.some((x) => x.includes('review')) ? '✗' : '✓') : <em className="faint">needs {w.rules.minScans} each side</em>}</span>
+      </div>
+      <p className="faint" style={{ margin: '6px 0 0', fontSize: 12 }}>
+        Rolled back automatically if accuracy drops by more than {pct(w.rules.maxAccuracyDrop)} or manual reviews rise by more than {pct(w.rules.maxReviewRise)}. Checked every 15 minutes.
+      </p>
+    </div>
+  );
 }
 
 interface Sample {
@@ -374,11 +436,15 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
         <div className="row" style={{ gap: 8 }}>
           <span className="faint" style={{ fontSize: 13 }}>
             Reading scans now: <strong style={{ color: 'var(--text)' }}>{active ? active.id : 'Tesseract'}</strong>
+            {m?.models.some((x) => x.status === 'shadow') && <> · on trial: <strong style={{ color: 'var(--text)' }}>{m.models.find((x) => x.status === 'shadow')!.id}</strong></>}
             {active && ' (Tesseract for lines it isn’t sure of)'}
           </span>
+          <button className="btn sm ghost" onClick={() => void act(() => api.post('/api/dev/ocr/models/watch', {}), 'Refreshing trial and watch')}>
+            Refresh
+          </button>
           {active && (
-            <button className="btn sm danger" onClick={() => void act(() => api.post('/api/dev/ocr/models/rollback', {}), 'Rolled back to Tesseract')}>
-              Roll back to Tesseract
+            <button className="btn sm danger" onClick={() => void act(() => api.post('/api/dev/ocr/models/rollback', {}), 'Rolled back')}>
+              Roll back to {active.previousEngine?.startsWith('model:') ? active.previousEngine.slice(6) : 'Tesseract'}
             </button>
           )}
         </div>
@@ -406,8 +472,8 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
           </div>
         </div>
         <div>
-          <strong>3. Score, then promote</strong>
-          <p className="faint">A model can only start reading scans when every gate below passes on the same exam version as the current engine.</p>
+          <strong>3. Score, trial, promote</strong>
+          <p className="faint">Score it on the exam, then run a live trial: it reads real scans alongside the current engine without affecting them. It can only be promoted when every gate passes, and is watched afterwards.</p>
           <button className="btn sm ghost" onClick={() => void act(() => api.post('/api/dev/ocr/models/rescan', {}), 'Looking for new models')}>
             Look for new models
           </button>
@@ -434,6 +500,11 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
                     <button className="btn sm" disabled={busy || m.examVersion == null} onClick={() => void act(() => api.post(`/api/dev/ocr/models/${x.id}/evaluate`, {}), 'Scoring started')}>
                       {x.evaluation ? 'Score again' : `Score on exam v${m.examVersion ?? '?'}`}
                     </button>
+                    {x.status === 'shadow' ? (
+                      <button className="btn sm ghost" onClick={() => void act(() => api.post(`/api/dev/ocr/models/${x.id}/trial/stop`, {}), 'Live trial stopped')}>Stop trial</button>
+                    ) : x.status !== 'active' && m.trialMinLines > 0 && x.evaluation ? (
+                      <button className="btn sm" disabled={busy} onClick={() => void act(() => api.post(`/api/dev/ocr/models/${x.id}/trial`, {}), 'Live trial started: new scans are read by this model too')}>Start live trial</button>
+                    ) : null}
                     {x.status !== 'active' && (
                       <button className="btn sm primary" disabled={!x.canPromote} title={x.canPromote ? 'Use this model for live scans' : 'Every gate must pass'} onClick={() => void act(() => api.post(`/api/dev/ocr/models/${x.id}/promote`, {}), 'Promoted: live scans use this model within 30 seconds')}>
                         Promote
@@ -441,6 +512,24 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
                     )}
                   </div>
                 </div>
+                {x.status === 'retired' && x.retiredReason && (
+                  <div className="ocr-retired">Retired {x.retiredAt ? new Date(x.retiredAt).toLocaleString() : ''}: {x.retiredReason}</div>
+                )}
+                {x.status === 'shadow' && (
+                  <div className="ocr-trial">
+                    <strong>On live trial</strong> since {x.trialStartedAt ? new Date(x.trialStartedAt).toLocaleString() : '—'}
+                    {x.trial ? (
+                      <span>
+                        {' · '}{x.trial.lines} confirmed lines{m.trialMinLines ? ` of ${m.trialMinLines} needed` : ''} · this model {pct(x.trial.shadowAccuracy)} vs live {pct(x.trial.liveAccuracy)} · {x.trial.wins} better, {x.trial.losses} worse
+                      </span>
+                    ) : (
+                      <span className="faint"> · waiting for scans to be confirmed</span>
+                    )}
+                    {m.trialMinLines > 0 && <div className="ocr-bar"><i style={{ width: `${Math.min(100, ((x.trial?.lines ?? 0) / m.trialMinLines) * 100)}%` }} /></div>}
+                  </div>
+                )}
+                {x.status === 'active' && x.watch && <WatchView w={x.watch} />}
+                {x.status === 'active' && !x.watch && <p className="faint" style={{ fontSize: 13, margin: '8px 0 0' }}>Live watch starts with the next check (every 15 minutes).</p>}
                 {s && (
                   <div className="row wrap" style={{ gap: 18, marginTop: 8, fontSize: 13 }}>
                     <span>Exam v{x.evaluation!.examVersion}: names <strong>{pct(s.name?.accuracy)}</strong>, numbers <strong>{pct(s.number?.accuracy)}</strong>, {s.msPerLine} ms/line</span>
@@ -463,6 +552,20 @@ function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | 
       ) : (
         <p className="faint" style={{ margin: '14px 0 0' }}>No models yet. Export training data, train on the server, then press Look for new models.</p>
       )}
+      {m?.events.length ? (
+        <div style={{ marginTop: 14 }}>
+          <strong style={{ fontSize: 13 }}>History</strong>
+          <ul className="ocr-events">
+            {m.events.map((e, i) => (
+              <li key={i} className={e.action === 'ocr.auto_rollback' ? 'bad' : ''}>
+                <span className="faint">{new Date(e.createdAt).toLocaleString()}</span> {EVENT_LABEL[e.action] ?? e.action} <code>{e.entityId}</code>
+                {typeof e.metadata.reason === 'string' && <em className="faint"> · {e.metadata.reason}</em>}
+                {typeof e.metadata.restored === 'string' && <em className="faint"> · back to {e.metadata.restored}</em>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </div>
   );
 }

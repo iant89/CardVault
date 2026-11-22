@@ -37,8 +37,17 @@ getting worse anywhere (see *Promotion gates*).
    `--threads N`. The model, its ONNX export and a model card land in
    `storage/ocr/models/<model id>/`.
 4. **Score** (OCR Lab → Models → *Look for new models*, then *Score on exam*).
-5. **Promote** when every gate passes. Live scans switch within 30 seconds;
-   *Roll back to Tesseract* undoes it just as fast.
+5. **Live trial** (*Start live trial*): the model reads every new scan
+   alongside the live engine. Its readings are only recorded; identification
+   never uses them. As scans are confirmed, both readings are compared.
+6. **Promote** when every gate passes, the trial included. Live scans switch
+   within 30 seconds.
+7. **Live watch**: every 15 minutes the active model's live accuracy on
+   confirmed lines, and the share of scans needing manual review, are compared
+   with the previous engine's over the same length of time before the switch.
+   If either is clearly worse, CardVault switches back to the previous engine
+   by itself and records why (OCR Lab → Models → History). *Roll back* does the
+   same by hand.
 
 ## What the model sees
 
@@ -65,10 +74,27 @@ On the **same exam version** as the current engine, a candidate must:
 | Fixed stays fixed | at least as many human-corrected misreads (regression set) read right |
 | Speed | at most 1.5× slower per line (or under 50 ms) |
 | Honest confidence | when ≥90% sure (20+ such reads), right at least 95% of the time |
+| Live trial | on real scans confirmed since the trial started (40+ lines): at least as accurate as the live engine, and no more lines lost than won |
 
 The server re-checks the gates when *Promote* is pressed. While a model is
 active, any line it reads with under 50% confidence is read by Tesseract
 instead.
+
+## After promotion: the live watch
+
+| Rule | Default |
+|---|---|
+| Judge only with enough data on both sides | 30 confirmed lines, 20 scans |
+| Roll back if live line accuracy drops by more than | 5 points |
+| Roll back if scans needing manual review rise by more than | 15 points |
+
+Settings in `.env`: `OCR_TRIAL_MIN_LINES`, `OCR_WATCH_MIN_LINES`,
+`OCR_WATCH_MIN_SCANS`, `OCR_WATCH_MAX_DROP`, `OCR_WATCH_MAX_REVIEW_RISE`.
+
+The watch matters because the per-line safety net can't catch everything: a
+broken model can be confidently wrong. In testing, a deliberately undertrained
+model returned empty readings at about 65% confidence, above the 50% fallback
+threshold. The watch rolled it back on the rise in manual reviews.
 
 ## Files
 

@@ -43,7 +43,7 @@ export async function saveScanSamples(ctx: WorkerContext, scan: { id: string; im
       engine: l.engine ?? ENGINE_ID,
       predicted: l.text,
       predictedConfidence: l.confidence,
-      meta: { readings: l.readings, source: 'scan', capture: scan.quality ?? {} },
+      meta: { readings: l.readings, source: 'scan', capture: scan.quality ?? {}, ...(l.shadow ? { shadow: l.shadow } : {}) },
     });
   }
   await ctx.db.insert(ocrSamples).values(rows);
@@ -136,7 +136,7 @@ export async function pruneSamples(ctx: WorkerContext) {
     .from(ocrSamples)
     .where(and(eq(ocrSamples.labelSource, 'pending'), lt(ocrSamples.createdAt, cutoff)));
   if (!stale.length) return 0;
-  await ctx.db.execute(sql`DELETE FROM ocr_samples WHERE label_source = 'pending' AND created_at < ${cutoff}`);
+  await ctx.db.execute(sql`DELETE FROM ocr_samples WHERE label_source = 'pending' AND created_at < ${cutoff.toISOString()}::timestamptz`);
   await removeFiles(ctx, stale.map((s) => s.path));
   return stale.length;
 }

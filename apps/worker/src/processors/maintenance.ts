@@ -5,6 +5,7 @@ import type { WorkerContext } from '../context.js';
 import { snapshotCollectionValues } from '../pricing/compute.js';
 import { evaluate, exportDataset, importHarvest, labelReviewed, scanModels } from './ocr-lab.js';
 import { pruneSamples } from '../identification/samples.js';
+import { runWatch } from './ocr-watch.js';
 
 /**
  * Recover abandoned jobs. BullMQ already re-queues *stalled* jobs whose worker
@@ -78,6 +79,8 @@ export async function processMaintenance(ctx: WorkerContext, job: Job) {
       return evaluate(ctx, job.data as { evaluationId: string });
     case 'ocr-export-dataset':
       return exportDataset(ctx);
+    case 'ocr-watch':
+      return runWatch(ctx);
     case 'ocr-scan-models':
       return scanModels(ctx);
     case 'ocr-import-harvest':
@@ -99,6 +102,8 @@ export async function scheduleMaintenance(ctx: WorkerContext) {
   await m.upsertJobScheduler('refresh-research', { every: 60 * 60_000 }, { name: 'refresh-research' });
   await m.upsertJobScheduler('value-snapshots', { every: 60 * 60_000 }, { name: 'value-snapshots' });
   await m.upsertJobScheduler('prune', { pattern: '17 3 * * *' }, { name: 'prune' });
+  // live trial statistics and the active model's watch (may roll it back)
+  await m.upsertJobScheduler('ocr-watch', { every: 15 * 60_000 }, { name: 'ocr-watch' });
   // pick up models the trainer wrote since the last start
   await m.add('ocr-scan-models', {}, { removeOnComplete: 10, removeOnFail: 10 });
 }

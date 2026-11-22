@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { autoLabelSource, cer, eraOf, metrics, namePrediction, numberPrediction, sliceReport, splitFor, type ScoredItem } from './ocr-data.js';
+import { autoLabelSource, cer, compareTrial, eraOf, metrics, namePrediction, numberPrediction, rollbackDecision, sliceReport, splitFor, type ScoredItem } from './ocr-data.js';
 
 describe('exam split', () => {
   it('is stable per card and close to the target share', () => {
@@ -72,5 +72,43 @@ describe('scoring', () => {
     expect(get('game pokemon · name')!.accuracy).toBe(1);
     expect(get('source harvest · number')!.n).toBe(1);
     expect(get('regression set · name')!.accuracy).toBe(0);
+  });
+});
+
+describe('live trial', () => {
+  it('counts wins and losses on the same lines', () => {
+    const t = compareTrial([
+      { field: 'name', live: true, shadow: true },
+      { field: 'name', live: false, shadow: true },
+      { field: 'number', live: false, shadow: true },
+      { field: 'number', live: true, shadow: false },
+      { field: 'name', live: true }, // no trial reading: not counted
+    ]);
+    expect(t.lines).toBe(4);
+    expect(t.wins).toBe(2);
+    expect(t.losses).toBe(1);
+    expect(t.liveAccuracy).toBe(0.5);
+    expect(t.shadowAccuracy).toBe(0.75);
+    expect(t.byField.number!.lines).toBe(2);
+  });
+});
+
+describe('automatic rollback', () => {
+  const w = (lines: number, correct: number, scans = 0, reviewed = 0) => ({ lines, correct, scans, reviewed });
+  it('rolls back when live accuracy falls clearly', () => {
+    const d = rollbackDecision(w(40, 28), w(40, 36));
+    expect(d.rollback).toBe(true);
+    expect(d.reasons[0]).toMatch(/accuracy fell to 70.0% from 90.0%/);
+  });
+  it('rolls back when far more scans need manual review', () => {
+    expect(rollbackDecision(w(0, 0, 30, 15), w(0, 0, 30, 3)).rollback).toBe(true);
+  });
+  it('a small dip is not a reason', () => {
+    expect(rollbackDecision(w(40, 35), w(40, 36)).rollback).toBe(false);
+  });
+  it('never judges on too little data', () => {
+    const d = rollbackDecision(w(5, 0, 3, 3), w(40, 40, 30, 0));
+    expect(d.rollback).toBe(false);
+    expect(d.judged).toEqual([]);
   });
 });

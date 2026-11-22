@@ -72,6 +72,8 @@ export interface OcrLine {
   confidence: number;
   /** the engine that produced this reading */
   engine: string;
+  /** a model on live trial read the same line (recorded only, never used) */
+  shadow?: { engine: string; text: string; confidence: number };
 }
 
 /** Reads one line: a trained model, or Tesseract (see engines.ts). */

@@ -2,12 +2,12 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { and, desc, eq, ocrEvaluations, ocrExams, ocrModels, ocrSamples, sql } from '@cardvault/database';
+import { and, auditLog, desc, eq, ocrEvaluations, ocrExams, ocrModels, ocrSamples, sql } from '@cardvault/database';
 import { resolveStoragePath } from '@cardvault/imaging';
 import type { AppContext } from '../context.js';
 import { requireAdmin, user as currentUser } from '../auth/plugin.js';
 import { badRequest, notFound } from '../errors.js';
-import { gates, type EvalLike } from '../services/ocr-gates.js';
+import { gates, trialGate, type EvalLike, type TrialLike } from '../services/ocr-gates.js';
 
 /** Most groups (a scan's lines, or a harvested card's) an exam takes from each kind of source. */
 const EXAM_CAP = { real: 1500, harvest: 500 };
@@ -199,6 +199,8 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     for (const m of models) {
       const ev = exam ? await latestEval(`model:${m.id}`, exam.version) : null;
       const g = ev && m.status !== 'active' ? gates(ev, champ?.eval ?? null) : [];
+      const tg = ev && m.status !== 'active' ? trialGate(m.trial as TrialLike | null, ctx.config.OCR_TRIAL_MIN_LINES) : null;
+      if (tg) g.push(tg);
       const card = m.card as Record<string, unknown>;
       rows.push({
         id: m.id,
@@ -211,9 +213,27 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
         evaluation: ev ? { id: ev.id, examVersion: ev.examVersion, summary: ev.summary } : null,
         gates: g,
         canPromote: m.status !== 'active' && g.length > 0 && g.every((x) => x.pass),
+        trial: m.trial ?? null,
+        trialStartedAt: m.trialStartedAt,
+        watch: m.watch ?? null,
+        previousEngine: m.previousEngine,
+        retiredAt: m.retiredAt,
+        retiredReason: m.retiredReason,
       });
     }
-    return { examVersion: exam?.version ?? null, champion: champ ? { engine: champ.engine, evaluationId: champ.eval?.id ?? null } : null, models: rows };
+    const events = await ctx.db
+      .select({ action: auditLog.action, entityId: auditLog.entityId, metadata: auditLog.metadata, createdAt: auditLog.createdAt })
+      .from(auditLog)
+      .where(eq(auditLog.entity, 'ocr_model'))
+      .orderBy(desc(auditLog.createdAt))
+      .limit(10);
+    return {
+      examVersion: exam?.version ?? null,
+      champion: champ ? { engine: champ.engine, evaluationId: champ.eval?.id ?? null } : null,
+      trialMinLines: ctx.config.OCR_TRIAL_MIN_LINES,
+      models: rows,
+      events,
+    };
   };
 
   app.get('/api/dev/ocr/models', guard, async () => modelView());
@@ -233,18 +253,54 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
       const failed = m.gates.filter((g) => !g.pass).map((g) => `${g.label}: ${g.detail}`);
       throw badRequest(`Not promoted. ${failed.length ? failed.join(' · ') : 'Score it on the current exam first.'}`);
     }
+    const [current] = await ctx.db.select({ id: ocrModels.id }).from(ocrModels).where(eq(ocrModels.status, 'active')).limit(1);
     await ctx.db.transaction(async (tx) => {
-      await tx.update(ocrModels).set({ status: 'retired' }).where(eq(ocrModels.status, 'active'));
-      await tx.update(ocrModels).set({ status: 'active', activatedAt: new Date(), activatedBy: currentUser(req).id }).where(eq(ocrModels.id, m.id));
+      await tx.update(ocrModels).set({ status: 'retired', retiredAt: new Date(), retiredReason: `replaced by ${m.id}` }).where(eq(ocrModels.status, 'active'));
+      await tx
+        .update(ocrModels)
+        .set({ status: 'active', activatedAt: new Date(), activatedBy: currentUser(req).id, previousEngine: current ? `model:${current.id}` : 'tesseract', watch: null, retiredAt: null, retiredReason: null })
+        .where(eq(ocrModels.id, m.id));
+      await tx.insert(auditLog).values({ userId: currentUser(req).id, action: 'ocr.promote', entity: 'ocr_model', entityId: m.id, metadata: { previous: current ? current.id : 'tesseract' } });
     });
     req.log.info({ model: m.id }, 'OCR model promoted');
     return { ok: true };
   });
 
-  /** Stop using the active model: live scans go back to Tesseract within 30 seconds. */
+  /** Stop using the active model: live scans go back to the previous engine (a model, or Tesseract) within 30 seconds. */
   app.post('/api/dev/ocr/models/rollback', guard, async (req) => {
-    const r = await ctx.db.update(ocrModels).set({ status: 'retired' }).where(eq(ocrModels.status, 'active')).returning({ id: ocrModels.id });
-    req.log.info({ model: r[0]?.id }, 'OCR model rolled back to Tesseract');
-    return { ok: true, retired: r[0]?.id ?? null };
+    const [m] = await ctx.db.select().from(ocrModels).where(eq(ocrModels.status, 'active')).limit(1);
+    if (!m) return { ok: true, restored: 'tesseract' };
+    const prev = m.previousEngine?.startsWith('model:') ? m.previousEngine.slice('model:'.length) : null;
+    await ctx.db.transaction(async (tx) => {
+      await tx.update(ocrModels).set({ status: 'retired', retiredAt: new Date(), retiredReason: 'rolled back by hand' }).where(eq(ocrModels.id, m.id));
+      if (prev) await tx.update(ocrModels).set({ status: 'active', activatedAt: new Date(), retiredReason: null }).where(eq(ocrModels.id, prev));
+      await tx.insert(auditLog).values({ userId: currentUser(req).id, action: 'ocr.rollback', entity: 'ocr_model', entityId: m.id, metadata: { restored: prev ?? 'tesseract' } });
+    });
+    req.log.info({ model: m.id, restored: prev ?? 'tesseract' }, 'OCR model rolled back');
+    return { ok: true, retired: m.id, restored: prev ?? 'tesseract' };
+  });
+
+  /** Start a live trial: the model reads every new scan alongside the live engine, recorded only. */
+  app.post<{ Params: { id: string } }>('/api/dev/ocr/models/:id/trial', guard, async (req) => {
+    const [m] = await ctx.db.select().from(ocrModels).where(eq(ocrModels.id, req.params.id));
+    if (!m) throw notFound();
+    if (m.status === 'active') throw badRequest('This model is already reading live scans.');
+    await ctx.db.transaction(async (tx) => {
+      await tx.update(ocrModels).set({ status: 'candidate' }).where(eq(ocrModels.status, 'shadow'));
+      await tx.update(ocrModels).set({ status: 'shadow', trialStartedAt: new Date(), trial: null }).where(eq(ocrModels.id, m.id));
+      await tx.insert(auditLog).values({ userId: currentUser(req).id, action: 'ocr.trial_start', entity: 'ocr_model', entityId: m.id });
+    });
+    return { ok: true };
+  });
+
+  app.post<{ Params: { id: string } }>('/api/dev/ocr/models/:id/trial/stop', guard, async (req) => {
+    await ctx.db.update(ocrModels).set({ status: 'candidate' }).where(and(eq(ocrModels.id, req.params.id), eq(ocrModels.status, 'shadow')));
+    return { ok: true };
+  });
+
+  /** Recompute trial and watch statistics now (normally every 15 minutes). */
+  app.post('/api/dev/ocr/models/watch', guard, async () => {
+    await ctx.queues.maintenance.add('ocr-watch', {}, { removeOnComplete: 20, removeOnFail: 20 });
+    return { ok: true };
   });
 }

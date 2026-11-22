@@ -29,6 +29,13 @@
       "when": 1795355523093,
       "tag": "0003_ocr_models",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1795359577403,
+      "tag": "0004_ocr_trial_watch",
+      "breakpoints": true
     }
   ]
 }

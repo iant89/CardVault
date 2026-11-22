@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { gates, type EvalLike, type SliceLike } from './ocr-gates.js';
+import { gates, trialGate, type EvalLike, type SliceLike } from './ocr-gates.js';
 
 const s = (slice: string, accuracy: number, n = 100, confidentAccuracy: number | null = null, confident = 0): SliceLike => ({ slice, n, accuracy, confidentAccuracy, confident });
 const ev = (slices: SliceLike[], o: Partial<EvalLike> = {}): EvalLike => ({ id: 'x', engine: 'e', examVersion: 3, status: 'done', summary: { msPerLine: 20 }, slices, ...o });
@@ -50,5 +50,23 @@ describe('promotion gates', () => {
     expect(pass(gates(c, null))).toBe(false);
     expect(pass(gates(c, { ...champion, examVersion: 2 }))).toBe(false);
     expect(pass(gates({ ...c, status: 'running' }, champion))).toBe(false);
+  });
+});
+
+describe('live trial gate', () => {
+  const t = (lines: number, live: number, shadow: number, wins: number, losses: number) => ({ lines, liveAccuracy: live, shadowAccuracy: shadow, wins, losses });
+  it('needs enough confirmed lines', () => {
+    expect(trialGate(null, 40)!.pass).toBe(false);
+    expect(trialGate(t(10, 0.5, 0.9, 4, 0), 40)!.pass).toBe(false);
+  });
+  it('passes when at least as good and not losing more than winning', () => {
+    expect(trialGate(t(50, 0.7, 0.9, 12, 2), 40)!.pass).toBe(true);
+  });
+  it('fails when worse live, or losing more lines than it wins', () => {
+    expect(trialGate(t(50, 0.9, 0.85, 3, 5), 40)!.pass).toBe(false);
+    expect(trialGate(t(50, 0.8, 0.8, 2, 3), 40)!.pass).toBe(false);
+  });
+  it('can be turned off', () => {
+    expect(trialGate(null, 0)).toBeNull();
   });
 });
