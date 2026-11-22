@@ -92,6 +92,10 @@ nginx listens on all interfaces and is configured with the PC's hostname and pri
 
 Step 2 is needed once because, during the upgrade, the previous console regenerates nginx before replacing itself. A `cardvault-lan.service` unit refreshes those names and the firewall rules at boot (when LAN access was accepted during install). Use menu option 16 to change this later, option 17 for network diagnostics (listening port, services, firewall rules), and option 18 to enable/disable HTTPS. Both `ufw` and `firewalld` are supported.
 
+With HTTPS enabled, Caddy serves `https://<hostname>` on port 443 only. Port 80 is left to nginx: most distributions' nginx already listens there with its stock default site. CardVault adds a port-80 site for your HTTPS hostname that serves the phone certificate at `http://<hostname>/cardvault-ca.crt` and redirects everything else to `https://`.
+
+**Caddy shows `failed` in the service status?** Earlier versions also put a Caddy site on port 80, which clashed with nginx (`bind: address already in use`). Upgrade with option 14. The upgrade rewrites the Caddyfile and nginx site and restarts Caddy. Option 18 → 1 does the same. If it still fails, `sudo journalctl -u caddy -n 30` shows why.
+
 Defaults can be overridden with `CARDVAULT_REPO`, `CARDVAULT_BRANCH`, `CARDVAULT_DIR`, `CARDVAULT_PORT` and `CARDVAULT_USER`. The installer pins the overall progress bar to the bottom row of the terminal, with steps and tasks scrolling above it, and shows a per-task bar for long commands. Full command output is written to `/tmp/cardvault-setup.log`, and `CARDVAULT_VERBOSE=1` streams it live instead. Backups written by the menu land in `/opt/cardvault/backups`.
 
 ---
