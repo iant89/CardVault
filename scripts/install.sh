@@ -46,11 +46,13 @@ draw_status() {
   if [[ -n ${CURRENT_TASK:-} ]]; then text="${CURRENT_STEP} › ${CURRENT_TASK}"; fi
   max=$(( TERM_COLS - 46 )); (( max < 8 )) && max=8
   text=${text:0:$max}
-  printf '\033[s\033[%d;1H\033[2K' "$STATUS_ROW" >"$TTY_DEV"
+  # ESC 7 / ESC 8 (DECSC/DECRC) save and restore the cursor on every terminal;
+  # the CSI s / CSI u pair is ignored by many, leaving output on the status row.
+  printf '\0337\033[%d;1H\033[2K' "$STATUS_ROW" >"$TTY_DEV"
   printf ' %s[%d/%d]%s ' "$CYAN" "$STEP_NO" "$STEP_TOTAL" "$RESET" >"$TTY_DEV"
   { progress_bar "$pct" 20; } >"$TTY_DEV"
   printf ' %s%3d%%%s  %s%s%s' "$YELLOW" "$pct" "$RESET" "$BOLD" "$text" "$RESET" >"$TTY_DEV"
-  printf '\033[u' >"$TTY_DEV"
+  printf '\0338' >"$TTY_DEV"
 }
 
 init_console() {
@@ -142,36 +144,67 @@ step() {
 task() {
   CURRENT_TASK="$*"
   draw_status
-  printf '    %s↳%s %s\n' "$DIM" "$RESET" "$*"
+  printf '    %s↳%s %s\n' "$DIM" "$RESET" "$(fit_text "$*" $(( $(term_cols) - 7 )))"
+}
+
+# Width of the terminal, for fitting single-line output.
+term_cols() {
+  local c=${TERM_COLS:-0}
+  (( c > 0 )) || c=$(tput cols 2>/dev/null || echo 80)
+  [[ $c =~ ^[0-9]+$ ]] && (( c >= 20 )) || c=80
+  printf '%s' "$c"
+}
+
+# Shorten text to at most $2 characters, ending in "…" when cut.
+fit_text() {
+  local text=$1 max=$2
+  (( max < 1 )) && { printf ''; return; }
+  if (( ${#text} > max )); then printf '%s…' "${text:0:$(( max - 1 ))}"; else printf '%s' "$text"; fi
 }
 
 # Runs a task with an animated progress bar. Set EXPECTED_SECONDS before calling
 # to make the bar fill at a realistic pace; it holds at 95% if a task runs long.
+# Interactive terminals get ONE line per task: "→ label [bar] pct time" updated in
+# place, then replaced by "✔ label (Ns)" or "✖ label failed". The line is sized to
+# the terminal so it can never wrap (a wrapped line can't be fully erased).
 run() {
   local label=$1 expected=${EXPECTED_SECONDS:-30} start=$SECONDS pid rc=0
   shift
+  (( expected > 0 )) || expected=30
   CURRENT_TASK="$label"
   draw_status
-  printf '  %s→%s %s\n' "$DIM" "$RESET" "$label"
   if [[ ${CARDVAULT_VERBOSE:-0} == 1 ]]; then
+    printf '  %s→%s %s\n' "$DIM" "$RESET" "$label"
     set +e
     "$@" 2>&1 | tee -a "$RUN_LOG"
     rc=${PIPESTATUS[0]}
     set -e
-  else
+  elif [[ -t 1 ]]; then
+    local cols bar_w label_w shown elapsed pct
+    cols=$(term_cols)
+    # "  → " + label + " " + "[" bar "]" + " 100%  00:00" (+1 spare column)
+    bar_w=$(( cols - 4 - 1 - 2 - 12 - 1 - 24 ))
+    (( bar_w > 28 )) && bar_w=28
+    (( bar_w < 8 )) && bar_w=0
+    label_w=$(( cols - 4 - 12 - 1 - ( bar_w > 0 ? bar_w + 3 : 0 ) ))
+    shown=$(fit_text "$label" "$label_w")
     "$@" >>"$RUN_LOG" 2>&1 &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
-      local elapsed=$(( SECONDS - start ))
-      local pct=$(( elapsed * 100 / expected ))
+      elapsed=$(( SECONDS - start ))
+      pct=$(( elapsed * 100 / expected ))
       (( pct > 95 )) && pct=95
-      printf '\r  '
-      progress_bar "$pct"
+      printf '\r\033[2K  %s→%s %s ' "$DIM" "$RESET" "$shown"
+      (( bar_w > 0 )) && progress_bar "$pct" "$bar_w"
       printf ' %3d%%  %02d:%02d' "$pct" "$(( elapsed / 60 ))" "$(( elapsed % 60 ))"
       sleep 0.2
     done
     if wait "$pid"; then rc=0; else rc=$?; fi
     printf '\r\033[2K'
+  else
+    # not a terminal (piped / logged): plain lines, no animation
+    printf '  → %s\n' "$label"
+    "$@" >>"$RUN_LOG" 2>&1 || rc=$?
   fi
   CURRENT_TASK=''
   draw_status
