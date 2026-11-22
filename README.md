@@ -104,9 +104,8 @@ scripts/         backup.sh, restore.sh
    Auto-capture re-arms when the frame has been empty for 0.7 s, or when a clearly different card has been steady for about 1 s (a quick swap). A hand passing over the card doesn't re-trigger it.
 
    **Alignment check:** each capture is also cropped with an 8% margin, and the card's real edges are found again inside that crop. If a corner is off by more than 2% of the card width, the capture is misaligned. That typically happens when the shutter is pressed while the card is still moving, or before the outline has locked on. Then:
-   - The scanner straightens the card using the refined edges and asks **"Does this look correct?"**, showing the original in a corner.
-   - **No** reverts to the original and asks **Continue with original** or **Retake photo**.
-   - A misaligned capture that can't be fixed goes straight to that question.
+   - The scanner straightens the card using the refined edges and shows the **corrected** and **original** crops side by side, with one choice: **Keep corrected**, **Keep original** or **Retake**.
+   - If the card's edges can't be found to correct it, only the original is shown, with **Keep original** or **Retake**.
 
    Well-aligned captures (about 1% deviation in testing) skip the check, and auto-capture pauses while a question is open. The decision and measured deviation are stored with the scan (`quality.adjusted`, `quality.alignment`).
 

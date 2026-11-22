@@ -58,12 +58,9 @@ const OUT_W = 750;
 const ALIGN_PAD = 0.08;
 
 interface AlignReview {
-  /** confirm: showing the adjusted crop; fallback: showing the original, asking continue/retake */
-  stage: 'confirm' | 'fallback';
   original: { blob: Blob; url: string };
+  /** the straightened crop; null when the card's edges couldn't be found to correct it */
   adjusted: { blob: Blob; url: string } | null;
-  /** user rejected the adjustment (vs. it could not be adjusted at all) */
-  reverted?: boolean;
   quality: Record<string, unknown>;
   target: { scanId: string; name: string } | null;
 }
@@ -353,7 +350,6 @@ export default function ScanPage() {
         if (b) adjusted = { blob: b, url: URL.createObjectURL(b) };
       }
       setReview({
-        stage: adjusted ? 'confirm' : 'fallback',
         original: { blob: originalBlob, url: URL.createObjectURL(originalBlob) },
         adjusted,
         quality,
@@ -377,11 +373,6 @@ export default function ScanPage() {
     if (!rv?.adjusted) return;
     closeReview();
     await commitCapture(rv.adjusted.blob, { ...rv.quality, adjusted: true }, rv.target);
-  };
-  const rejectAdjusted = () => {
-    // revert to the original photo, then ask whether to keep it or retake
-    const rv = reviewRef.current;
-    if (rv) setReview({ ...rv, stage: 'fallback', reverted: true });
   };
   const useOriginal = async () => {
     const rv = reviewRef.current;
@@ -657,7 +648,7 @@ export default function ScanPage() {
             )}
 
             {review && (
-              <AlignmentReview review={review} onAccept={() => void acceptAdjusted()} onReject={rejectAdjusted} onUseOriginal={() => void useOriginal()} onRetake={retakeCapture} />
+              <AlignmentReview review={review} onKeepCorrected={() => void acceptAdjusted()} onKeepOriginal={() => void useOriginal()} onRetake={retakeCapture} />
             )}
             {review ? null : captured ? (
               <SingleResult
@@ -825,62 +816,54 @@ function SingleResult({
   );
 }
 
-/** Shown when a capture looked misaligned: confirm the automatic fix, or keep the original / retake. */
+/**
+ * Shown when a capture looked misaligned: the corrected and original crops
+ * side by side, with one choice — keep corrected, keep original or retake.
+ */
 function AlignmentReview({
   review,
-  onAccept,
-  onReject,
-  onUseOriginal,
+  onKeepCorrected,
+  onKeepOriginal,
   onRetake,
 }: {
   review: AlignReview;
-  onAccept: () => void;
-  onReject: () => void;
-  onUseOriginal: () => void;
+  onKeepCorrected: () => void;
+  onKeepOriginal: () => void;
   onRetake: () => void;
 }) {
-  const confirming = review.stage === 'confirm' && review.adjusted;
+  const corrected = review.adjusted;
   return (
     <div className="single-result align-review" role="dialog" aria-label="Check card alignment">
-      <img src={confirming ? review.adjusted!.url : review.original.url} alt={confirming ? 'Adjusted card' : 'Original capture'} />
-      {confirming && (
-        <figure className="align-inset">
+      <div className={`align-pair ${corrected ? '' : 'single'}`}>
+        {corrected && (
+          <figure className="align-option recommended">
+            <img src={corrected.url} alt="Corrected card" />
+            <figcaption>Corrected</figcaption>
+          </figure>
+        )}
+        <figure className="align-option">
           <img src={review.original.url} alt="Original capture" />
           <figcaption>Original</figcaption>
         </figure>
-      )}
+      </div>
       <div className="single-card panel">
-        {confirming ? (
-          <>
-            <strong>The card looked misaligned, so we straightened it.</strong>
-            <div className="faint" style={{ fontSize: 13 }}>
-              Does this look correct — the whole card, square, with no table showing?
-            </div>
-            <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
-              <button className="btn sm" onClick={onReject}>
-                No
-              </button>
-              <button className="btn sm primary" onClick={onAccept} autoFocus>
-                Looks correct
-              </button>
-            </div>
-          </>
-        ) : (
-          <>
-            <strong>{review.reverted ? 'Reverted to the original photo.' : 'This card looks misaligned and couldn’t be straightened automatically.'}</strong>
-            <div className="faint" style={{ fontSize: 13 }}>
-              Continue with this photo, or retake it?
-            </div>
-            <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
-              <button className="btn sm" onClick={onUseOriginal}>
-                Continue with {review.reverted ? 'original' : 'this photo'}
-              </button>
-              <button className="btn sm primary" onClick={onRetake} autoFocus>
-                Retake photo
-              </button>
-            </div>
-          </>
-        )}
+        <strong>{corrected ? 'This card looked misaligned, so we corrected it.' : 'This card looks misaligned and couldn’t be corrected automatically.'}</strong>
+        <div className="faint" style={{ fontSize: 13 }}>
+          {corrected ? 'Compare the two and choose which photo to keep — or retake it.' : 'Keep this photo, or retake it?'}
+        </div>
+        <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
+          <button className="btn sm ghost" onClick={onRetake}>
+            Retake
+          </button>
+          <button className={`btn sm ${corrected ? '' : 'primary'}`} onClick={onKeepOriginal} autoFocus={!corrected}>
+            Keep original
+          </button>
+          {corrected && (
+            <button className="btn sm primary" onClick={onKeepCorrected} autoFocus>
+              Keep corrected
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
