@@ -91,19 +91,32 @@ class Line:
 
 
 def load_export(dataset_dir: str, storage: str) -> tuple[list[Line], dict]:
-    info = json.load(open(os.path.join(dataset_dir, "info.json")))
+    # exports always carry non-ASCII (· in counts, accented names): read as UTF-8
+    # whatever the machine's locale says
+    with open(os.path.join(dataset_dir, "info.json"), encoding="utf-8") as f:
+        info = json.load(f)
     lines: list[Line] = []
     missing = 0
-    with open(os.path.join(dataset_dir, "train.jsonl")) as f:
+    bad = 0
+    with open(os.path.join(dataset_dir, "train.jsonl"), encoding="utf-8") as f:
         for raw in f:
             if not raw.strip():
                 continue
-            r = json.loads(raw)
-            p = os.path.join(storage, r["crop"])
+            try:
+                r = json.loads(raw)
+                crop, text, field = r["crop"], r["text"], r["field"]
+            except (ValueError, TypeError, KeyError):
+                bad += 1  # a truncated row from an interrupted write: skip, don't die
+                continue
+            if not text:
+                continue
+            p = os.path.join(storage, crop)
             if not os.path.exists(p):
                 missing += 1
                 continue
-            lines.append(Line(None, p, r["text"], r["field"], float(r.get("weight", 1)), r["group"], r["source"]))
+            lines.append(Line(None, p, text, field, float(r.get("weight") or 1), r.get("group") or "", r.get("source") or ""))
+    if bad:
+        print(f"  {bad} rows in train.jsonl are malformed (skipped)")
     if missing:
         print(f"  {missing} crops listed in the export are missing on disk (skipped)")
     return lines, info
@@ -144,7 +157,8 @@ class Synthetic:
 
     def render(self) -> Line:
         r = self.rng
-        field = "number" if r.random() < 0.4 else "name"
+        # no usable names (number-only dataset, empty name lists): always draw a number
+        field = "number" if r.random() < 0.4 or not self.names else "name"
         text = self.number_text() if field == "number" else r.choice(self.names)
         font_path = r.choice(self.fonts)
         size = r.randint(22, 40)

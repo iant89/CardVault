@@ -37,6 +37,9 @@ const schema = z.object({
   HARVESTER_OUT_DIR: z.string().optional(),
   /** Override the TCGdex API address (testing against tools/tcgdex-harvester/test/mock-tcgdex.mjs). */
   HARVESTER_API: z.string().url().optional(),
+  /** OCR trainer (OCR Lab → Models → Train): Python with torch, or its folder. Found automatically when unset. */
+  OCR_TRAIN_PYTHON: z.string().optional(),
+  OCR_TRAIN_DIR: z.string().optional(),
   /** OCR model live trial: confirmed lines needed before a model may be promoted (0 = no trial required). */
   OCR_TRIAL_MIN_LINES: z.coerce.number().int().min(0).default(40),
   /** OCR live watch: confirmed lines / scans needed on each side before judging an active model. */

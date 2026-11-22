@@ -56,6 +56,22 @@ def evaluate(model, loader, charset):
     return {f: {"n": s[0], "accuracy": round(s[1] / s[0], 4) if s[0] else None, "cer": round(s[2] / s[0], 4) if s[0] else None} for f, s in stats.items()}
 
 
+def usable_datasets(root: str) -> list[str]:
+    """Finished exports under <storage>/ocr/datasets, oldest first.
+
+    Only directories holding both files count: stray files (Thumbs.db, notes,
+    …) and interrupted exports must never break 'latest'.
+    """
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for name in os.listdir(root):
+        d = os.path.join(root, name)
+        if os.path.isdir(d) and os.path.isfile(os.path.join(d, "train.jsonl")) and os.path.isfile(os.path.join(d, "info.json")):
+            out.append(name)
+    return sorted(out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--storage", required=True, help="CardVault storage folder (STORAGE_DIR)")
@@ -69,15 +85,32 @@ def main():
     ap.add_argument("--max-minutes", type=float, default=0, help="stop after this long (0 = no limit)")
     args = ap.parse_args()
 
+    # counts keys and card names carry non-ASCII (·, é, ♂ …): never let a
+    # non-UTF-8 locale crash the run while printing what was loaded
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
 
     root = os.path.join(args.storage, "ocr", "datasets")
-    ds_id = args.dataset if args.dataset != "latest" else (sorted(os.listdir(root))[-1] if os.path.isdir(root) and os.listdir(root) else None)
+    usable = usable_datasets(root)
+    requested = args.dataset.strip()
+    if requested != "latest":
+        ds_id = requested
+        d = os.path.join(root, ds_id)
+        want = [f for f in ("train.jsonl", "info.json") if not os.path.isfile(os.path.join(d, f))]
+        if want:
+            hint = f"dataset {ds_id} is incomplete (missing {', '.join(want)})" if os.path.isdir(d) else f"no dataset {ds_id} in {root}"
+            listing = ", ".join(usable[-5:]) if usable else "none"
+            sys.exit(f"{hint}. Usable datasets: {listing}")
+    else:
+        ds_id = usable[-1] if usable else None
     if not ds_id:
-        sys.exit(f"No dataset in {root}. Export one from CardVault: Developer → OCR Lab → Export training data.")
+        sys.exit(f"No usable dataset in {root}. Export one from CardVault: Developer → OCR Lab → Export training data.")
     lines, info = load_export(os.path.join(root, ds_id), args.storage)
     print(f"dataset {ds_id}: {len(lines)} lines {info.get('counts')}")
     if not lines:
@@ -95,7 +128,8 @@ def main():
         for f in os.listdir(cache):
             if f.startswith("card-names-") and f.endswith(".json"):
                 try:
-                    names.update(json.load(open(os.path.join(cache, f))))
+                    with open(os.path.join(cache, f), encoding="utf-8") as fh:
+                        names.update(json.load(fh))
                 except (OSError, ValueError):
                     pass
     charset = "".join(sorted(set(BASE_CHARSET) | {c for n in names for c in n} | {c for ln in lines for c in ln.text}))

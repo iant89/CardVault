@@ -1,5 +1,6 @@
 import { createReadStream } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
+import path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { and, auditLog, desc, eq, ocrEvaluations, ocrExams, ocrModels, ocrSamples, sql } from '@cardvault/database';
@@ -14,6 +15,54 @@ const EXAM_CAP = { real: 1500, harvest: 500 };
 const TRUSTED = sql`('review', 'corroborated', 'harvest')`;
 const IMPORT_KEY = 'ocr:import-harvest';
 const DATASET_KEY = 'ocr:dataset';
+const TRAIN_KEY = 'ocr:train';
+const TRAIN_CANCEL_KEY = 'ocr:train:cancel';
+
+/** Training run in progress, mirroring apps/worker/src/processors/ocr-train.ts. */
+interface TrainStatus {
+  status: 'queued' | 'starting' | 'running' | 'done' | 'failed' | 'cancelled';
+  requested?: string;
+  dataset?: string;
+  lines?: number;
+  epochs?: number;
+  epoch?: number;
+  loss?: number;
+  devName?: number | null;
+  devNumber?: number | null;
+  minutes?: number;
+  synthetic?: number;
+  modelId?: string;
+  python?: string;
+  error?: string;
+  log: string[];
+  startedAt?: string;
+  finishedAt?: string;
+  updatedAt: string;
+}
+
+const readTraining = async (ctx: AppContext): Promise<TrainStatus | null> => {
+  const raw = await ctx.redis.get(TRAIN_KEY);
+  return raw ? (JSON.parse(raw) as TrainStatus) : null;
+};
+
+/**
+ * Finished exports under <storage>/ocr/datasets: the same rule as the trainer's
+ * 'latest' — a dataset counts only with both train.jsonl and info.json.
+ */
+const listDatasets = async (ctx: AppContext) => {
+  const root = path.join(ctx.storageDir, 'ocr', 'datasets');
+  const out: { id: string; rows: number; counts: Record<string, number>; createdAt: string | null }[] = [];
+  for (const name of (await readdir(root, { withFileTypes: true }).catch(() => [])).sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!name.isDirectory()) continue;
+    try {
+      const info = JSON.parse(await readFile(path.join(root, name.name, 'info.json'), 'utf8')) as { rows?: number; counts?: Record<string, number>; createdAt?: string };
+      out.push({ id: name.name, rows: info.rows ?? 0, counts: info.counts ?? {}, createdAt: info.createdAt ?? null });
+    } catch {
+      /* interrupted export or stray folder: not usable */
+    }
+  }
+  return out;
+};
 
 /**
  * OCR Lab (admins): the data collected from scans, the frozen exam, and
@@ -67,6 +116,8 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
       newSinceExam,
       import: imp ? JSON.parse(imp) : null,
       dataset: dataset ? JSON.parse(dataset) : null,
+      datasets: await listDatasets(ctx),
+      training: await readTraining(ctx),
       evaluations,
     };
   });
@@ -161,6 +212,44 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
 
   app.post('/api/dev/ocr/export', guard, async () => {
     await ctx.queues.maintenance.add('ocr-export-dataset', {}, { removeOnComplete: 20, removeOnFail: 20 });
+    return { ok: true };
+  });
+
+  // ---------------------------------------------------------------- training
+
+  /**
+   * Start training a line reader on an exported dataset (tools/ocr-trainer).
+   * The worker runs the trainer and streams its progress into OCR Lab; the
+   * finished model is registered for scoring automatically.
+   */
+  app.post('/api/dev/ocr/train', guard, async (req) => {
+    const b = z
+      .object({
+        dataset: z.string().regex(/^(latest|[A-Za-z0-9][A-Za-z0-9._-]*)$/).default('latest'),
+        epochs: z.coerce.number().int().min(1).max(500).default(30),
+        synthetic: z.coerce.number().int().min(0).max(200_000).default(20_000),
+        maxMinutes: z.coerce.number().min(0).max(10_080).default(0),
+      })
+      .parse(req.body ?? {});
+    const current = await readTraining(ctx);
+    if (current && ['queued', 'starting', 'running'].includes(current.status)) throw badRequest('Training is already in progress.');
+    const datasets = await listDatasets(ctx);
+    if (b.dataset === 'latest') {
+      if (!datasets.length) throw badRequest('No exported datasets yet. Press Export training data first.');
+    } else if (!datasets.some((d) => d.id === b.dataset)) {
+      throw badRequest(`No usable dataset ${b.dataset}. Export training data first.`);
+    }
+    const status: TrainStatus = { status: 'queued', requested: b.dataset, epochs: b.epochs, synthetic: b.synthetic, log: [], updatedAt: new Date().toISOString() };
+    await ctx.redis.set(TRAIN_KEY, JSON.stringify(status), 'EX', 7 * 24 * 3600);
+    await ctx.redis.del(TRAIN_CANCEL_KEY);
+    await ctx.queues.maintenance.add('ocr-train-model', b, { removeOnComplete: 20, removeOnFail: 20 });
+    req.log.info({ dataset: b.dataset, epochs: b.epochs }, 'OCR training queued');
+    return { ok: true };
+  });
+
+  /** Ask the running trainer to stop (it exits at the next step). */
+  app.post('/api/dev/ocr/train/cancel', guard, async () => {
+    await ctx.redis.set(TRAIN_CANCEL_KEY, '1', 'EX', 300);
     return { ok: true };
   });
 
