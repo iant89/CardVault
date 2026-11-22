@@ -212,11 +212,10 @@ export function warpCard(src: ImageData, corners: [Pt, Pt, Pt, Pt], outW = 750):
       const sx = (H[0]! * x + H[1]! * y + H[2]!) / z;
       const sy = (H[3]! * x + H[4]! * y + H[5]!) / z;
       const o = (y * outW + x) * 4;
-      if (sx < 0 || sy < 0 || sx >= sw - 1 || sy >= sh - 1) {
-        d[o + 3] = 255;
-        continue;
-      }
-      const x0 = sx | 0, y0 = sy | 0, fx = sx - x0, fy = sy - y0;
+      // outside the frame: repeat the nearest edge pixel (black would create a
+      // false "card edge" for the alignment check on padded crops)
+      const cx = Math.min(Math.max(sx, 0), sw - 1.001), cy = Math.min(Math.max(sy, 0), sh - 1.001);
+      const x0 = cx | 0, y0 = cy | 0, fx = cx - x0, fy = cy - y0;
       const i00 = (y0 * sw + x0) * 4, i10 = i00 + 4, i01 = i00 + sw * 4, i11 = i01 + 4;
       for (let c = 0; c < 3; c++) {
         d[o + c] = (s[i00 + c]! * (1 - fx) + s[i10 + c]! * fx) * (1 - fy) + (s[i01 + c]! * (1 - fx) + s[i11 + c]! * fx) * fy;
@@ -278,4 +277,44 @@ export function signatureDiff(a: Float32Array, b: Float32Array): number {
   let d = 0;
   for (let i = 0; i < 64; i++) d += Math.abs(a[i]! - b[i]!);
   return d / 64;
+}
+
+export type Quad = [Pt, Pt, Pt, Pt];
+
+export const rectQuad = (r: Rect): Quad => [
+  { x: r.x, y: r.y },
+  { x: r.x + r.w, y: r.y },
+  { x: r.x + r.w, y: r.y + r.h },
+  { x: r.x, y: r.y + r.h },
+];
+
+/** Grow a quad about its centre so each side gains `pad` × its length. */
+export function expandQuad(q: Quad, pad: number): Quad {
+  const cx = (q[0].x + q[1].x + q[2].x + q[3].x) / 4;
+  const cy = (q[0].y + q[1].y + q[2].y + q[3].y) / 4;
+  const k = 1 + 2 * pad;
+  return q.map((p) => ({ x: cx + (p.x - cx) * k, y: cy + (p.y - cy) * k })) as Quad;
+}
+
+/** A capture is treated as misaligned when a corner is off by more than this fraction of the card width. */
+export const MISALIGNED = 0.02;
+
+export interface Refinement {
+  /** the card's real corners in the padded crop's coordinates */
+  corners: Quad;
+  /** largest corner offset from where the crop assumed the card was, as a fraction of card width */
+  deviation: number;
+}
+
+/**
+ * Alignment check on a padded crop (card plus a margin). `expected` is where
+ * the original crop assumed the card was. Returns the card's actual corners
+ * and how far off the assumption was, or null if no card edge is found.
+ */
+export function refineCrop(gray: Float32Array, w: number, h: number, expected: Rect): Refinement | null {
+  const d = detectCard(gray, w, h, expected);
+  if (!d) return null;
+  const exp = rectQuad(expected);
+  const deviation = Math.max(...d.corners.map((p, i) => Math.hypot(p.x - exp[i]!.x, p.y - exp[i]!.y))) / expected.w;
+  return { corners: d.corners, deviation };
 }

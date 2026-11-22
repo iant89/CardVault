@@ -1,6 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOfflineQueue } from './offlineQueue';
-import { assessQuality, autoLevels, CARD_RATIO, detectCard, regionSignature, signatureDiff, toGray, warpCard, type Detection, type Quality, type Rect } from './vision';
+import {
+  assessQuality,
+  autoLevels,
+  CARD_RATIO,
+  detectCard,
+  expandQuad,
+  MISALIGNED,
+  rectQuad,
+  refineCrop,
+  regionSignature,
+  signatureDiff,
+  toGray,
+  warpCard,
+  type Detection,
+  type Quad,
+  type Quality,
+  type Rect,
+} from './vision';
 import { useLive } from '../../stores/live';
 import { StatusBadge, useConfirm } from '../../components/ui';
 import { toast } from '../../stores/toasts';
@@ -34,6 +51,22 @@ const SAME_CARD_DIFF = 12;
 const NEW_CARD_FRAMES = 8;
 
 type Phase = 'idle' | 'captured' | 'ready';
+
+/** Output width of a captured card image (height follows the 63:88 ratio). */
+const OUT_W = 750;
+/** Margin added around the crop so the alignment check can see the card's real edges. */
+const ALIGN_PAD = 0.08;
+
+interface AlignReview {
+  /** confirm: showing the adjusted crop; fallback: showing the original, asking continue/retake */
+  stage: 'confirm' | 'fallback';
+  original: { blob: Blob; url: string };
+  adjusted: { blob: Blob; url: string } | null;
+  /** user rejected the adjustment (vs. it could not be adjusted at all) */
+  reverted?: boolean;
+  quality: Record<string, unknown>;
+  target: { scanId: string; name: string } | null;
+}
 
 const pref = (k: string, d: string) => {
   try {
@@ -112,6 +145,13 @@ export default function ScanPage() {
     setRetakeState(v);
   };
   const [confirm, confirmDialog] = useConfirm();
+  /** alignment review after a misaligned capture */
+  const [review, setReviewState] = useState<AlignReview | null>(null);
+  const reviewRef = useRef<AlignReview | null>(null);
+  const setReview = (v: AlignReview | null) => {
+    reviewRef.current = v;
+    setReviewState(v);
+  };
 
   const { items, add, discard, retry, online, uploadedIds, uploaded } = useOfflineQueue();
   const jobs = useLive((s) => s.jobs);
@@ -212,57 +252,19 @@ export default function ScanPage() {
   }, []);
 
   // ---- capture
-  const capture = useCallback(
-    async (source: 'auto' | 'manual') => {
-      const v = videoRef.current;
-      const guide = guideInVideo();
-      if (!v || !guide) return;
-      detRef.current.armed = false; // wait for the card to be removed before the next auto shot
-      detRef.current.emptySince = null;
-      detRef.current.newCard = 0;
-      lastSigRef.current = lastFrameSig.current;
-      const c = document.createElement('canvas');
-      c.width = v.videoWidth;
-      c.height = v.videoHeight;
-      const ctx = c.getContext('2d', { willReadFrequently: true })!;
-      ctx.drawImage(v, 0, 0);
-      const k = v.videoWidth / ANALYSIS_W;
-      const det = detRef.current.det;
-      const q = qualityRef.current;
-      let out: ImageData;
-      if (det) {
-        // crop + perspective + rotation correction from detected corners
-        out = warpCard(ctx.getImageData(0, 0, c.width, c.height), det.corners.map((p) => ({ x: p.x * k, y: p.y * k })) as Detection['corners']);
-      } else {
-        // fallback: crop the guide rectangle
-        const t = document.createElement('canvas');
-        t.width = 750;
-        t.height = Math.round(750 / CARD_RATIO);
-        t.getContext('2d')!.drawImage(c, Math.max(0, guide.x), Math.max(0, guide.y), guide.w, guide.h, 0, 0, t.width, t.height);
-        out = t.getContext('2d')!.getImageData(0, 0, t.width, t.height);
-      }
-      autoLevels(out);
-      const oc = document.createElement('canvas');
-      oc.width = out.width;
-      oc.height = out.height;
-      oc.getContext('2d')!.putImageData(out, 0, 0);
-      const blob = await new Promise<Blob | null>((r) => oc.toBlob(r, 'image/jpeg', 0.92));
-      if (!blob) return;
+  const toBlob = (img: ImageData) => {
+    const oc = document.createElement('canvas');
+    oc.width = img.width;
+    oc.height = img.height;
+    oc.getContext('2d')!.putImageData(img, 0, 0);
+    return new Promise<Blob | null>((res) => oc.toBlob(res, 'image/jpeg', 0.92));
+  };
 
-      setFlash((f) => f + 1);
-      if (sound) beep();
-      navigator.vibrate?.(30);
-      const target = retakeRef.current;
+  /** Queue a final image and continue the single/batch flow. */
+  const commitCapture = useCallback(
+    async (blob: Blob, quality: Record<string, unknown>, target: { scanId: string; name: string } | null) => {
       toast(target ? `Captured — replacing the photo of ${target.name}` : 'Captured', 'success');
-      setRetake(null);
-
-      const localId = await add(blob, {
-        gameHint: game || undefined,
-        replaceScanId: target?.scanId,
-        label: target?.name,
-        quality: { source, detected: !!det, detectionConfidence: det?.confidence ?? null, ...(q ? { sharpness: Math.round(q.sharpness), brightness: Math.round(q.brightness), glare: q.glare } : {}) },
-      });
-
+      const localId = await add(blob, { gameHint: game || undefined, replaceScanId: target?.scanId, label: target?.name, quality });
       if (batch) {
         // "✓ Captured" → 2 s later "Ready for the next card…"
         clearTimeout(phaseTimer.current);
@@ -275,8 +277,128 @@ export default function ScanPage() {
         setCaptured({ localId, url: URL.createObjectURL(blob) });
       }
     },
-    [add, game, guideInVideo, batch, sound],
+    [add, game, batch],
   );
+
+  const capture = useCallback(
+    async (source: 'auto' | 'manual') => {
+      const v = videoRef.current;
+      const guide = guideInVideo();
+      if (!v || !guide || reviewRef.current) return;
+      detRef.current.armed = false; // wait for the card to be removed before the next auto shot
+      detRef.current.emptySince = null;
+      detRef.current.newCard = 0;
+      lastSigRef.current = lastFrameSig.current;
+      const c = document.createElement('canvas');
+      c.width = v.videoWidth;
+      c.height = v.videoHeight;
+      const ctx = c.getContext('2d', { willReadFrequently: true })!;
+      ctx.drawImage(v, 0, 0);
+      const frame = ctx.getImageData(0, 0, c.width, c.height);
+      const k = v.videoWidth / ANALYSIS_W;
+      const det = detRef.current.det;
+      const q = qualityRef.current;
+
+      // 1. the crop as captured: detected outline, or the on-screen guide
+      const quad: Quad = det ? (det.corners.map((p) => ({ x: p.x * k, y: p.y * k })) as Quad) : rectQuad(guide);
+      const original = warpCard(frame, quad, OUT_W);
+
+      // 2. alignment check: re-find the card's real edges inside a padded crop
+      const padW = Math.round(OUT_W * (1 + 2 * ALIGN_PAD));
+      const padded = warpCard(frame, expandQuad(quad, ALIGN_PAD), padW);
+      const a = document.createElement('canvas');
+      const aw = ANALYSIS_W, ah = Math.round((padded.height * aw) / padded.width), sc = aw / padded.width;
+      a.width = aw;
+      a.height = ah;
+      const pc = document.createElement('canvas');
+      pc.width = padded.width;
+      pc.height = padded.height;
+      pc.getContext('2d')!.putImageData(padded, 0, 0);
+      const actx = a.getContext('2d', { willReadFrequently: true })!;
+      actx.drawImage(pc, 0, 0, aw, ah);
+      const { g } = toGray(actx.getImageData(0, 0, aw, ah));
+      // where the original crop assumed the card was: centred in the padded crop
+      const outH = OUT_W / CARD_RATIO;
+      const expected = { x: ((padded.width - OUT_W) / 2) * sc, y: ((padded.height - outH) / 2) * sc, w: OUT_W * sc, h: outH * sc };
+      const refined = refineCrop(g, aw, ah, expected);
+      const misaligned = refined ? refined.deviation > MISALIGNED : !det; // no outline and no edges found → can't vouch for the crop
+
+      setFlash((f) => f + 1);
+      if (sound) beep();
+      navigator.vibrate?.(30);
+      const target = retakeRef.current;
+      setRetake(null);
+      const quality = {
+        source,
+        detected: !!det,
+        detectionConfidence: det?.confidence ?? null,
+        alignment: refined ? Math.round(refined.deviation * 1000) / 1000 : null,
+        ...(q ? { sharpness: Math.round(q.sharpness), brightness: Math.round(q.brightness), glare: q.glare } : {}),
+      };
+
+      autoLevels(original);
+      const originalBlob = await toBlob(original);
+      if (!originalBlob) return;
+      if (!misaligned) {
+        await commitCapture(originalBlob, quality, target);
+        return;
+      }
+
+      // 3. misaligned: try to fix it and ask
+      let adjusted: { blob: Blob; url: string } | null = null;
+      if (refined && refined.deviation > MISALIGNED) {
+        const fixed = warpCard(padded, refined.corners.map((p) => ({ x: p.x / sc, y: p.y / sc })) as Quad, OUT_W);
+        autoLevels(fixed);
+        const b = await toBlob(fixed);
+        if (b) adjusted = { blob: b, url: URL.createObjectURL(b) };
+      }
+      setReview({
+        stage: adjusted ? 'confirm' : 'fallback',
+        original: { blob: originalBlob, url: URL.createObjectURL(originalBlob) },
+        adjusted,
+        quality,
+        target,
+      });
+    },
+    [add, game, guideInVideo, batch, sound, commitCapture],
+  );
+
+  // ---- alignment review decisions
+  const closeReview = () => {
+    const rv = reviewRef.current;
+    if (rv) {
+      URL.revokeObjectURL(rv.original.url);
+      if (rv.adjusted) URL.revokeObjectURL(rv.adjusted.url);
+    }
+    setReview(null);
+  };
+  const acceptAdjusted = async () => {
+    const rv = reviewRef.current;
+    if (!rv?.adjusted) return;
+    closeReview();
+    await commitCapture(rv.adjusted.blob, { ...rv.quality, adjusted: true }, rv.target);
+  };
+  const rejectAdjusted = () => {
+    // revert to the original photo, then ask whether to keep it or retake
+    const rv = reviewRef.current;
+    if (rv) setReview({ ...rv, stage: 'fallback', reverted: true });
+  };
+  const useOriginal = async () => {
+    const rv = reviewRef.current;
+    if (!rv) return;
+    closeReview();
+    await commitCapture(rv.original.blob, { ...rv.quality, adjusted: false }, rv.target);
+  };
+  const retakeCapture = () => {
+    const rv = reviewRef.current;
+    closeReview();
+    if (rv?.target) setRetake(rv.target); // a sidebar retake stays a retake
+    // the same card is expected back in frame: arm for it immediately
+    lastSigRef.current = null;
+    Object.assign(detRef.current, { armed: true, stable: 0, newCard: 0, emptySince: null });
+    setPhase('idle');
+    toast('Retake — adjust the card and hold it steady', 'info');
+  };
 
   // ---- retake & delete from the scans sidebar
   const startRetake = async (scan: ScanListItem) => {
@@ -402,7 +524,7 @@ export default function ScanPage() {
       setQuality(q);
       setFound(!!det);
       drawOverlay(det, s);
-      if (auto && st.armed && det && q.ok && st.stable >= STABLE_FRAMES) void capture('auto');
+      if (auto && st.armed && det && q.ok && st.stable >= STABLE_FRAMES && !reviewRef.current) void capture('auto');
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
@@ -534,7 +656,10 @@ export default function ScanPage() {
               </div>
             )}
 
-            {captured ? (
+            {review && (
+              <AlignmentReview review={review} onAccept={() => void acceptAdjusted()} onReject={rejectAdjusted} onUseOriginal={() => void useOriginal()} onRetake={retakeCapture} />
+            )}
+            {review ? null : captured ? (
               <SingleResult
                 captured={captured}
                 pending={items.find((i) => i.id === captured.localId)}
@@ -695,6 +820,67 @@ function SingleResult({
             ◉ Scan another card
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/** Shown when a capture looked misaligned: confirm the automatic fix, or keep the original / retake. */
+function AlignmentReview({
+  review,
+  onAccept,
+  onReject,
+  onUseOriginal,
+  onRetake,
+}: {
+  review: AlignReview;
+  onAccept: () => void;
+  onReject: () => void;
+  onUseOriginal: () => void;
+  onRetake: () => void;
+}) {
+  const confirming = review.stage === 'confirm' && review.adjusted;
+  return (
+    <div className="single-result align-review" role="dialog" aria-label="Check card alignment">
+      <img src={confirming ? review.adjusted!.url : review.original.url} alt={confirming ? 'Adjusted card' : 'Original capture'} />
+      {confirming && (
+        <figure className="align-inset">
+          <img src={review.original.url} alt="Original capture" />
+          <figcaption>Original</figcaption>
+        </figure>
+      )}
+      <div className="single-card panel">
+        {confirming ? (
+          <>
+            <strong>The card looked misaligned, so we straightened it.</strong>
+            <div className="faint" style={{ fontSize: 13 }}>
+              Does this look correct — the whole card, square, with no table showing?
+            </div>
+            <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
+              <button className="btn sm" onClick={onReject}>
+                No
+              </button>
+              <button className="btn sm primary" onClick={onAccept} autoFocus>
+                Looks correct
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <strong>{review.reverted ? 'Reverted to the original photo.' : 'This card looks misaligned and couldn’t be straightened automatically.'}</strong>
+            <div className="faint" style={{ fontSize: 13 }}>
+              Continue with this photo, or retake it?
+            </div>
+            <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
+              <button className="btn sm" onClick={onUseOriginal}>
+                Continue with {review.reverted ? 'original' : 'this photo'}
+              </button>
+              <button className="btn sm primary" onClick={onRetake} autoFocus>
+                Retake photo
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

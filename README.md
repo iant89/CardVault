@@ -103,6 +103,13 @@ scripts/         backup.sh, restore.sh
 
    Auto-capture re-arms when the frame has been empty for 0.7 s, or when a clearly different card has been steady for about 1 s (a quick swap). A hand passing over the card doesn't re-trigger it.
 
+   **Alignment check:** each capture is also cropped with an 8% margin, and the card's real edges are found again inside that crop. If a corner is off by more than 2% of the card width, the capture is misaligned. That typically happens when the shutter is pressed while the card is still moving, or before the outline has locked on. Then:
+   - The scanner straightens the card using the refined edges and asks **"Does this look correct?"**, showing the original in a corner.
+   - **No** reverts to the original and asks **Continue with original** or **Retake photo**.
+   - A misaligned capture that can't be fixed goes straight to that question.
+
+   Well-aligned captures (about 1% deviation in testing) skip the check, and auto-capture pauses while a question is open. The decision and measured deviation are stored with the scan (`quality.adjusted`, `quality.alignment`).
+
    A collapsible sidebar lists recent scans, newest first, with running session totals. Hovering (or tapping on a phone) shows each scan's live state and parsed details, with an **Edit** button. Each entry also has:
    - **Retake** (camera icon): after confirmation, the next capture replaces that scan's photo. The old photo is kept until the new one uploads. An unidentified scan keeps its place in the queue and is identified from the new photo. An identified scan loses that identification and the collection copy it created, and is queued again.
    - **Delete** (trash icon): after confirmation, removes the scan, its photos, its pending jobs and the collection copy it created.
