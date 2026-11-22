@@ -7,43 +7,18 @@ import type { AppContext } from '../context.js';
 
 const month = () => new Date().toISOString().slice(0, 7);
 
-export interface DuplicateInfo {
-  scanId: string;
-  cardId: string | null;
-  cardName: string | null;
-  createdAt: string;
-  distance: number;
-}
-
-/** Find a visually near-identical earlier scan by this user (256-bit dHash Hamming ≤ 16). */
-export async function findDuplicateScan(ctx: AppContext, userId: string, dhash: string, sha: string): Promise<DuplicateInfo | null> {
-  const rows = await ctx.db.execute(sql`
-    SELECT s.id, s.card_id, c.name, s.created_at,
-      bit_count(('x' || s.image_hash)::bit(256) # ('x' || ${dhash})::bit(256))::int AS dist
-    FROM scans s LEFT JOIN cards c ON c.id = s.card_id
-    WHERE s.user_id = ${userId} AND length(s.image_hash) = 64 AND s.status <> 'REJECTED'
-      AND (s.content_hash = ${sha} OR bit_count(('x' || s.image_hash)::bit(256) # ('x' || ${dhash})::bit(256)) <= 16)
-    ORDER BY dist, s.created_at DESC LIMIT 1`);
-  const r = rows[0];
-  return r
-    ? { scanId: String(r.id), cardId: (r.card_id as string) ?? null, cardName: (r.name as string) ?? null, createdAt: new Date(r.created_at as string).toISOString(), distance: Number(r.dist) }
-    : null;
-}
-
 export interface CreateScanInput {
   buffer: Buffer;
   clientScanId?: string;
   gameHint?: string;
   clientOcr?: string;
   capturedAt?: Date;
-  allowDuplicate?: boolean;
   clientQuality?: Record<string, unknown>;
 }
 
 export type CreateScanResult =
   | { kind: 'created'; scanId: string; jobId: string }
-  | { kind: 'existing'; scanId: string; jobId: string | null }
-  | { kind: 'duplicate'; duplicate: DuplicateInfo };
+  | { kind: 'existing'; scanId: string; jobId: string | null };
 
 export async function createScan(ctx: AppContext, user: SessionUser, input: CreateScanInput): Promise<CreateScanResult> {
   // Idempotency for offline-queue re-uploads
@@ -59,11 +34,10 @@ export async function createScan(ctx: AppContext, user: SessionUser, input: Crea
     }
   }
 
+  // A card you already own is simply another copy: no blocking duplicate check.
+  // (Offline re-uploads are de-duplicated above by clientScanId; accidental
+  // double captures can be undone from the scanner.)
   const img = await normalizeUpload(input.buffer);
-  if (!input.allowDuplicate) {
-    const dup = await findDuplicateScan(ctx, user.id, img.dhash, img.sha256);
-    if (dup) return { kind: 'duplicate', duplicate: dup };
-  }
 
   const id = randomUUID();
   const rel = `scans/${user.id}/${month()}/${id}.jpg`;

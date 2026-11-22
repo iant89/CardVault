@@ -57,6 +57,18 @@ export function Toasts() {
         >
           <span>{t.kind === 'success' ? '✓' : t.kind === 'warn' ? '!' : t.kind === 'error' ? '✕' : 'ℹ'}</span>
           <span className="grow">{t.text}</span>
+          {t.action && (
+            <button
+              className="btn sm"
+              onClick={(e) => {
+                e.stopPropagation();
+                t.action!.run();
+                dismiss(t.id);
+              }}
+            >
+              {t.action.label}
+            </button>
+          )}
         </div>
       ))}
     </div>

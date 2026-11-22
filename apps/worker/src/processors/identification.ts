@@ -12,10 +12,23 @@ import { run } from './common.js';
 
 const VARIANT_PREFERENCE: VariantType[] = ['NORMAL', 'NON_FOIL', 'UNLIMITED', 'HOLO'];
 
-async function chooseVariant(ctx: WorkerContext, cardId: string, hints: VariantType[]): Promise<string> {
+/**
+ * Variant for a newly scanned copy, in priority order:
+ *  1. a variant printed on the card (e.g. "1st Edition", serial numbers)
+ *  2. the variant of the copies this user already owns, so a repeat scan
+ *     joins the same pricing line as their existing copies
+ *  3. the card's default (Normal / Non-foil / Unlimited / Holo)
+ */
+async function chooseVariant(ctx: WorkerContext, cardId: string, hints: VariantType[], userId: string): Promise<string> {
   const rows = await ctx.db.select().from(cardVariants).where(eq(cardVariants.cardId, cardId));
+  const owned = await ctx.db.execute(sql`
+    SELECT variant_id FROM collection_items
+    WHERE user_id = ${userId} AND card_id = ${cardId} AND variant_id IS NOT NULL
+    GROUP BY variant_id ORDER BY sum(quantity) DESC, max(updated_at) DESC LIMIT 1`);
+  const ownedVariant = owned[0] ? rows.find((r) => r.id === String(owned[0]!.variant_id)) : undefined;
   const pick =
     rows.find((r) => hints.includes(r.type as VariantType)) ??
+    ownedVariant ??
     VARIANT_PREFERENCE.map((p) => rows.find((r) => r.type === p)).find(Boolean) ??
     rows[0];
   if (pick) return pick.id;
@@ -92,7 +105,7 @@ export async function processIdentification(ctx: WorkerContext, job: Job<Identif
 
     if (best && decision === 'AUTO_ACCEPT') {
       tracker.cardId = best.cardId;
-      const variantId = await chooseVariant(ctx, best.cardId, sig.variantHints);
+      const variantId = await chooseVariant(ctx, best.cardId, sig.variantHints, userId);
       const owned = await ctx.db.execute(sql`SELECT COALESCE(sum(quantity),0)::int AS n FROM collection_items WHERE user_id = ${userId} AND card_id = ${best.cardId} AND variant_id = ${variantId}`);
       const [item] = await ctx.db
         .insert(collectionItems)

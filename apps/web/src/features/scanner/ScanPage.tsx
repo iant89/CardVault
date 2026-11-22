@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router';
 import { useOfflineQueue } from './offlineQueue';
 import { assessQuality, autoLevels, CARD_RATIO, detectCard, regionSignature, signatureDiff, toGray, warpCard, type Detection, type Quality, type Rect } from './vision';
 import { useLive } from '../../stores/live';
@@ -9,7 +8,7 @@ import { api, ApiError } from '../../services/api';
 import { useAsync } from '../../hooks/useAsync';
 import { ScanSidebar } from './ScanSidebar';
 import { canEdit, useScanEdit } from './useScanEdit';
-import { beep, IDENTIFIED, NEEDS_REVIEW, STATUS_LABEL, type ScanListItem } from './scanTypes';
+import { beep, IDENTIFIED, NEEDS_REVIEW, STATUS_LABEL, type ScanDetail, type ScanListItem } from './scanTypes';
 
 const GAMES = [
   { slug: '', label: 'Auto-detect' },
@@ -114,7 +113,7 @@ export default function ScanPage() {
   };
   const [confirm, confirmDialog] = useConfirm();
 
-  const { items, add, resolveDuplicate, discard, retry, online, uploadedIds, uploaded } = useOfflineQueue();
+  const { items, add, discard, retry, online, uploadedIds, uploaded } = useOfflineQueue();
   const jobs = useLive((s) => s.jobs);
   const scans = useAsync(() => api.get<{ scans: ScanListItem[] }>('/api/scans?limit=50'), []);
   const { edit, dialog } = useScanEdit();
@@ -542,11 +541,6 @@ export default function ScanPage() {
                 scan={scanList.find((s) => s.id === uploadedIds[captured.localId])}
                 onAnother={scanAnother}
                 onEdit={(s) => void edit(s)}
-                onDuplicate={async (action) => {
-                  const next = await resolveDuplicate(captured.localId, action);
-                  if (next) setCaptured({ ...captured, localId: next });
-                  else scanAnother();
-                }}
               />
             ) : (
               <div className="vp-bottom">
@@ -632,7 +626,6 @@ export default function ScanPage() {
             });
           }}
           onEdit={(s) => void edit(s)}
-          onDuplicate={(id, action) => void resolveDuplicate(id, action)}
           onRetry={(id) => void retry(id)}
           onDiscard={(id) => void discard(id)}
           onRetake={(sc) => void startRetake(sc)}
@@ -653,69 +646,54 @@ function SingleResult({
   scan,
   onAnother,
   onEdit,
-  onDuplicate,
 }: {
   captured: { url: string };
-  pending?: { status: string; error?: string; duplicate?: { cardId: string | null; cardName: string | null } };
+  pending?: { status: string; error?: string };
   scan?: ScanListItem;
   onAnother: () => void;
   onEdit: (s: ScanListItem) => void;
-  onDuplicate: (action: 'add' | 'cancel') => void;
 }) {
-  const dup = pending?.status === 'duplicate';
-  const title = dup
-    ? 'You already scanned this card.'
-    : pending?.status === 'failed'
+  // once identified, show how many copies the owner now has (they share pricing)
+  const identified = !!scan && IDENTIFIED.includes(scan.status);
+  const owned = useAsync(
+    () => (identified ? api.get<ScanDetail>(`/api/scans/${scan!.id}`).then((d) => d.owned) : Promise.resolve(null)),
+    [scan?.id, identified],
+  ).data;
+  const title =
+    pending?.status === 'failed'
       ? 'Upload rejected'
       : scan
         ? (scan.cardName ?? (NEEDS_REVIEW.includes(scan.status) ? 'Needs a quick review' : 'Identifying…'))
         : 'Uploading…';
+  const copies = owned?.copies ?? 0;
   return (
     <div className="single-result">
       <img src={captured.url} alt="Captured card" />
       <div className="single-card panel">
         <div className="row between" style={{ gap: 8 }}>
           <strong className="truncate">{title}</strong>
-          {scan && !dup && <StatusBadge status={scan.status} />}
+          {scan && <StatusBadge status={scan.status} />}
         </div>
         <div className="faint" style={{ fontSize: 13 }}>
-          {dup
-            ? (pending?.duplicate?.cardName ?? 'An earlier scan looks the same.')
-            : pending?.status === 'failed'
-              ? pending.error
-              : scan
-                ? IDENTIFIED.includes(scan.status)
-                  ? `${STATUS_LABEL[scan.status]}${scan.confidence != null ? ` · ${(scan.confidence * 100).toFixed(0)}% match` : ''}`
-                  : STATUS_LABEL[scan.status]
-                : 'Saved on this device — it uploads automatically.'}
+          {pending?.status === 'failed'
+            ? pending.error
+            : scan
+              ? identified
+                ? `${STATUS_LABEL[scan.status]}${scan.confidence != null ? ` · ${(scan.confidence * 100).toFixed(0)}% match` : ''}${
+                    copies > 1 ? ` · you now have ${copies} copies (shared pricing)` : ''
+                  }`
+                : STATUS_LABEL[scan.status]
+              : 'Saved on this device — it uploads automatically.'}
         </div>
         <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
-          {dup ? (
-            <>
-              <button className="btn sm primary" onClick={() => onDuplicate('add')}>
-                Add another copy
-              </button>
-              {pending?.duplicate?.cardId && (
-                <Link className="btn sm" to={`/collection?card=${pending.duplicate.cardId}`}>
-                  View existing
-                </Link>
-              )}
-              <button className="btn sm ghost" onClick={() => onDuplicate('cancel')}>
-                Cancel
-              </button>
-            </>
-          ) : (
-            <>
-              {scan && canEdit(scan.status, scan.collectionItemId) && (
-                <button className="btn sm" onClick={() => onEdit(scan)}>
-                  Edit
-                </button>
-              )}
-              <button className="btn sm primary" onClick={onAnother}>
-                ◉ Scan another card
-              </button>
-            </>
+          {scan && canEdit(scan.status, scan.collectionItemId) && (
+            <button className="btn sm" onClick={() => onEdit(scan)}>
+              Edit
+            </button>
           )}
+          <button className="btn sm primary" onClick={onAnother}>
+            ◉ Scan another card
+          </button>
         </div>
       </div>
     </div>

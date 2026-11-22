@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { CardVaultEvent } from '@cardvault/shared';
 import { api } from '../services/api';
 import type { JobDTO } from '../types';
-import { toast } from './toasts';
+import { actionToast, toast } from './toasts';
 
 /**
  * Live job monitor fed by Server-Sent Events. Events patch jobs in place for
@@ -54,7 +54,22 @@ export const useLive = create<LiveState>((set, get) => ({
       }));
       if (e.type === 'IDENTIFICATION_COMPLETE') {
         const owned = Number((e.data as { alreadyOwned?: number } | undefined)?.alreadyOwned ?? 0);
-        toast(`Identified ${e.message ?? ''}${owned ? ` — you already own ${owned}` : ''}`, 'success');
+        const name = (e.message ?? '').replace(/\s*\(.*\)$/, '');
+        if (owned > 0 && e.scanId) {
+          // a repeat scan is simply another copy; offer Undo in case it was an accidental double capture
+          const scanId = e.scanId;
+          actionToast(`Added another ${name} — you now have ${owned + 1} copies`, 'success', {
+            label: 'Undo',
+            run: () =>
+              void api
+                .del(`/api/scans/${scanId}`)
+                .then(() => {
+                  toast(`Removed the extra copy of ${name}`, 'info');
+                  void get().refresh();
+                })
+                .catch(() => toast('Could not undo — delete it from the scans list', 'error')),
+          });
+        } else toast(`Identified ${e.message ?? ''}`, 'success');
       }
       if (e.type === 'MANUAL_REVIEW_REQUIRED') toast(`Needs review: ${e.message ?? 'card'}`, 'warn', '/review');
       if (e.type === 'JOB_FAILED' && e.state === 'FAILED') toast(`Job failed: ${e.message ?? ''}`, 'error', '/queue');

@@ -19,7 +19,6 @@ interface Props {
   onDelete: (scan: ScanListItem) => void;
   /** scan currently being retaken (camera armed for it) */
   retakingId: string | null;
-  onDuplicate: (id: string, action: 'add' | 'cancel') => void;
   onRetry: (id: string) => void;
   onDiscard: (id: string) => void;
 }
@@ -31,17 +30,16 @@ const narrow = () => window.matchMedia('(max-width: 1000px)').matches;
 const TIP_W = 300;
 
 /** Collapsible list of recent scans (newest first) with live status tooltips. */
-export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle, onEdit, onRetake, onDelete, retakingId, onDuplicate, onRetry, onDiscard }: Props) {
+export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle, onEdit, onRetake, onDelete, retakingId, onRetry, onDiscard }: Props) {
   const [open, setOpen] = useState<{ id: string; top: number; left: number; inline: boolean } | null>(null);
   const [details, setDetails] = useState<Record<string, ScanDetail>>({});
   const hideTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   // session running totals (local captures not yet uploaded count as processing)
   const session = scans.filter((s) => new Date(s.createdAt).getTime() >= sessionStart);
-  const waiting = pending.filter((p) => p.status !== 'duplicate' && p.status !== 'failed').length;
-  const undecided = pending.filter((p) => p.status === 'duplicate').length;
+  const waiting = pending.filter((p) => p.status !== 'failed').length;
   const totals = {
-    scanned: session.length + waiting + undecided,
+    scanned: session.length + waiting,
     identified: session.filter((s) => IDENTIFIED.includes(s.status)).length,
     review: session.filter((s) => NEEDS_REVIEW.includes(s.status)).length,
     processing: session.filter((s) => IN_PROGRESS.includes(s.status)).length + waiting,
@@ -90,8 +88,7 @@ export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle,
     );
   }
 
-  const dupes = pending.filter((p) => p.status === 'duplicate');
-  const queued = pending.filter((p) => p.status !== 'duplicate');
+  const queued = pending;
   const tipScan = open ? scans.find((s) => s.id === open.id) : undefined;
 
   const tip = (s: ScanListItem, inline: boolean) => (
@@ -144,33 +141,6 @@ export function ScanSidebar({ scans, pending, sessionStart, collapsed, onToggle,
       </div>
 
       <div className="scan-list">
-        {dupes.map((d) => (
-          <div key={d.id} className="scan-dupe">
-            <div className="row" style={{ alignItems: 'flex-start', gap: 10 }}>
-              <img src={d.url} alt="" />
-              <div className="grow" style={{ minWidth: 0 }}>
-                <strong style={{ fontSize: 13 }}>You already scanned this card.</strong>
-                <div className="faint truncate" style={{ fontSize: 12 }}>
-                  {d.duplicate?.cardName ?? 'Earlier scan'}
-                </div>
-                <div className="row wrap" style={{ gap: 4, marginTop: 6 }}>
-                  <button className="btn sm primary" onClick={() => onDuplicate(d.id, 'add')}>
-                    Add copy
-                  </button>
-                  {d.duplicate?.cardId && (
-                    <Link className="btn sm" to={`/collection?card=${d.duplicate.cardId}`}>
-                      View
-                    </Link>
-                  )}
-                  <button className="btn sm ghost" onClick={() => onDuplicate(d.id, 'cancel')}>
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        ))}
-
         {queued.map((p) => (
           <div key={p.id} className="scan-item" title={p.error}>
             <div className="thumb">
@@ -313,6 +283,15 @@ function ScanTip({ scan, detail, onEdit }: { scan: ScanListItem; detail?: ScanDe
           )}
           <dt>Market</dt>
           <dd>{card.price?.market != null ? money(card.price.market) : status === 'RESEARCHING' ? 'researching…' : '—'}</dd>
+          {detail.owned && detail.owned.copies > 0 && (
+            <>
+              <dt>You own</dt>
+              <dd>
+                {detail.owned.copies} {detail.owned.copies === 1 ? 'copy' : 'copies'}
+                {detail.owned.copies > 1 && <span className="faint"> · shared pricing</span>}
+              </dd>
+            </>
+          )}
         </dl>
       ) : (
         <div style={{ fontSize: 13 }}>

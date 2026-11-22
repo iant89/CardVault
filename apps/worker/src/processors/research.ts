@@ -26,6 +26,28 @@ export async function processResearch(ctx: WorkerContext, job: Job<ResearchJobDa
     await tracker.start('Starting research', job.attemptsMade + 1);
     let card = await loadNormalized(ctx, d.cardId);
     if (!card) throw new Error('Card not found');
+
+    // Another copy of a card we already know: prices, sales and history live on
+    // the catalog card, so the new copy shares them. Skip re-researching while
+    // that data is fresh. ("Research now" and scheduled refreshes carry no
+    // scanId and always run.)
+    if (d.scanId) {
+      const fresh = await ctx.db.execute(sql`
+        SELECT 1 FROM cards c
+        WHERE c.id = ${d.cardId}
+          AND c.last_researched_at > now() - make_interval(hours => ${ctx.config.RESEARCH_REFRESH_HOURS})
+          AND EXISTS (SELECT 1 FROM price_snapshots ps WHERE ps.card_id = c.id)`);
+      if (fresh.length) {
+        await ctx.db.execute(sql`UPDATE scans SET status = 'COMPLETED', updated_at = now() WHERE id = ${d.scanId} AND status = 'RESEARCHING'`);
+        const [snap] = await ctx.db.execute(
+          sql`SELECT market_price FROM price_snapshots WHERE card_id = ${d.cardId} AND variant_id IS NULL ORDER BY created_at DESC LIMIT 1`,
+        );
+        const market = snap?.market_price == null ? null : Number(snap.market_price);
+        await ctx.events.publish({ type: 'PRICE_UPDATED', userId: d.userId ?? null, cardId: d.cardId, data: { marketPrice: market, shared: true } });
+        await tracker.finish('COMPLETED', `Shares pricing with your other copies${market != null ? ` · $${market.toFixed(2)}` : ''}`, 'CARD_RESEARCH_COMPLETE');
+        return { shared: true, market };
+      }
+    }
     await tracker.update('RESEARCHING', `Researching ${card.name}`, 15, 'RESEARCH_STARTED');
 
     let attempted = 0;

@@ -108,7 +108,13 @@ scripts/         backup.sh, restore.sh
    - **Delete** (trash icon): after confirmation, removes the scan, its photos, its pending jobs and the collection copy it created.
 
    Each scan has an image version number. An identification run still working on a replaced or deleted photo discards its result. Uploads retry with backoff, and the server ignores repeats of the same `clientScanId`, so scanning keeps working through server outages.
-2. **On upload** the API decodes the image to validate it (it doesn't trust the MIME type), re-encodes it (stripping EXIF), makes a thumbnail, and computes a 256-bit perceptual hash. If you already scanned a near-identical image, it answers *"You already scanned this card"* with **Add another copy / View existing / Cancel**.
+2. **On upload** the API decodes the image to validate it (it doesn't trust the MIME type), re-encodes it (stripping EXIF), makes a thumbnail, and computes a 256-bit perceptual hash (used for visual matching).
+
+   **Scanning a card you already own adds another copy automatically.** Prices, sold/listed observations, history and trends belong to the catalog card and its variant, so every copy shares them:
+   - The new copy takes the variant of your existing copies (unless the card itself prints a different one, such as "1st Edition"), so it joins the same pricing line.
+   - If the card was researched within `RESEARCH_REFRESH_HOURS`, no new research runs. The copy is "Done" immediately with the shared price.
+   - The toast says "Added another Pikachu — you now have 3 copies" with **Undo**, in case it was an accidental double capture.
+   - Condition, grading, purchase price and notes stay per copy.
 3. **The worker** combines several signals rather than relying on OCR alone:
    - Tesseract OCR on the whole card plus the title and footer bands. The English model ships with the worker, so no CDN is needed.
    - Game guess from keywords, name candidates, and collector numbers matched with each game's patterns.
@@ -119,7 +125,7 @@ scripts/         backup.sh, restore.sh
 
    | Confidence | Result |
    |---|---|
-   | ≥ 95% | Auto-accepted and added to the collection; research starts |
+   | ≥ 95% | Auto-accepted and added to the collection; research starts (skipped while the card's shared prices are fresh) |
    | 80–94% | Verification queue with one-click "Confirm" |
    | < 80% | Manual processing |
 

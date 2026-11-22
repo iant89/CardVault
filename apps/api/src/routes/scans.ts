@@ -15,10 +15,6 @@ const fields = z.object({
   gameHint: z.enum(GAME_SLUGS).optional(),
   clientOcr: z.string().max(4000).optional(),
   capturedAt: z.coerce.date().optional(),
-  allowDuplicate: z
-    .string()
-    .optional()
-    .transform((v) => v === 'true'),
   quality: z.string().max(2000).optional(),
 });
 
@@ -51,13 +47,8 @@ export async function scanRoutes(app: FastifyInstance, ctx: AppContext) {
         gameHint: f.gameHint,
         clientOcr: f.clientOcr,
         capturedAt: f.capturedAt,
-        allowDuplicate: f.allowDuplicate,
         clientQuality: quality,
       });
-      if (result.kind === 'duplicate') {
-        reply.code(409);
-        return { error: 'DUPLICATE_SCAN', message: 'You already scanned this card.', duplicate: result.duplicate };
-      }
       reply.code(result.kind === 'created' ? 201 : 200);
       return { scanId: result.scanId, jobId: result.jobId, existing: result.kind === 'existing' };
     } catch (e) {
@@ -101,6 +92,15 @@ export async function scanRoutes(app: FastifyInstance, ctx: AppContext) {
       FROM identifications i LEFT JOIN cards c ON c.id = i.card_id LEFT JOIN sets s ON s.id = c.set_id
       WHERE i.scan_id = ${scan.id} ORDER BY i.created_at DESC, i.rank`);
     const jobs = await ctx.db.select().from(researchJobs).where(eq(researchJobs.scanId, scan.id)).orderBy(desc(researchJobs.createdAt));
+    // how many copies of this card the scan's owner has (all copies share the card's pricing)
+    const owned = scan.cardId
+      ? (
+          await ctx.db.execute(sql`
+            SELECT COALESCE(sum(quantity), 0)::int AS copies,
+              COALESCE(sum(quantity) FILTER (WHERE variant_id IS NOT DISTINCT FROM ${scan.variantId}), 0)::int AS "sameVariant"
+            FROM collection_items WHERE user_id = ${scan.userId} AND card_id = ${scan.cardId}`)
+        )[0]
+      : null;
     return {
       scan: {
         ...scan,
@@ -110,6 +110,7 @@ export async function scanRoutes(app: FastifyInstance, ctx: AppContext) {
       card: scan.cardId ? await getCard(ctx, scan.cardId) : null,
       identifications: idents,
       jobs,
+      owned: owned ? { copies: Number(owned.copies), sameVariant: Number(owned.sameVariant) } : null,
     };
   });
 
