@@ -161,6 +161,12 @@ export const tcgdexProvider: CardProvider = {
     }
   },
 
+  /** All Pokémon card names (one request for the whole card list). */
+  async listCardNames(_game, ctx) {
+    const briefs = await ctx.http.getJson<{ name?: string }[]>(`${BASE}/cards`, { timeoutMs: 60_000, maxBytes: 40 * 1024 * 1024 });
+    return [...new Set(briefs.map((b) => b.name).filter((n): n is string => !!n))];
+  },
+
   /** TCGplayer market prices mirrored by TCGdex (a second Pokémon price source besides pokemontcg.io). */
   async getPrices(card, ctx) {
     const id = card.externalIds.tcgdex;

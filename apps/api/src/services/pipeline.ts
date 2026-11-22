@@ -5,6 +5,9 @@ import { normalizeUpload, makeThumbnail, writeFileSafe, resolveStoragePath } fro
 import type { SessionUser } from '@cardvault/shared';
 import type { AppContext } from '../context.js';
 
+/** Longest edge kept for scan photos: a 1500px-wide capture is ~2100px tall; small print needs it. */
+const SCAN_MAX_EDGE = 2200;
+
 const month = () => new Date().toISOString().slice(0, 7);
 
 export interface CreateScanInput {
@@ -37,7 +40,7 @@ export async function createScan(ctx: AppContext, user: SessionUser, input: Crea
   // A card you already own is simply another copy: no blocking duplicate check.
   // (Offline re-uploads are de-duplicated above by clientScanId; accidental
   // double captures can be undone from the scanner.)
-  const img = await normalizeUpload(input.buffer);
+  const img = await normalizeUpload(input.buffer, SCAN_MAX_EDGE);
 
   const id = randomUUID();
   const rel = `scans/${user.id}/${month()}/${id}.jpg`;
@@ -187,7 +190,7 @@ export type RetakeResult = { scanId: string; jobId: string; requeued: 'kept' | '
 export async function retakeScan(ctx: AppContext, scanId: string, buffer: Buffer, clientQuality?: Record<string, unknown>): Promise<RetakeResult> {
   const [scan] = await ctx.db.select().from(scans).where(eq(scans.id, scanId));
   if (!scan) throw new Error('scan not found');
-  const img = await normalizeUpload(buffer);
+  const img = await normalizeUpload(buffer, SCAN_MAX_EDGE);
   const version = scan.imageVersion + 1;
   const rel = `scans/${scan.userId}/${month()}/${scan.id}-v${version}.jpg`;
   const thumbRel = `thumbnails/scans/${scan.userId}/${month()}/${scan.id}-v${version}.webp`;

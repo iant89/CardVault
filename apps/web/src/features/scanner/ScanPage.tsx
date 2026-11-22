@@ -50,6 +50,8 @@ type Phase = 'idle' | 'captured' | 'ready';
 
 /** Output width of a captured card image (height follows the 63:88 ratio). */
 const OUT_W = 750;
+/** Captures keep up to this width when the camera sees the card larger (sharper text for OCR). */
+const MAX_OUT_W = 1500;
 
 interface AlignReview {
   original: { blob: Blob; url: string };
@@ -147,6 +149,7 @@ export default function ScanPage() {
   const [camState, setCamState] = useState<'starting' | 'on' | 'paused' | 'denied' | 'unavailable'>('starting');
   const [camError, setCamError] = useState('');
   const [quality, setQuality] = useState<Quality | null>(null);
+  const lowResWarned = useRef(false);
   const [found, setFound] = useState(false);
   const [flash, setFlash] = useState(0);
   const [phase, setPhaseState] = useState<Phase>('idle');
@@ -228,6 +231,13 @@ export default function ScanPage() {
       Object.assign(detRef.current, { det: null, last: null, stable: 0, armed: !reopenDisarmed.current, emptySince: null, newCard: 0 });
       reopenDisarmed.current = false;
       setCamState('on');
+      // the guide covers a fixed share of the frame, so the camera's resolution
+      // sets how many pixels the card's small print gets
+      const got = track?.getSettings?.().height ?? videoRef.current?.videoHeight ?? 0;
+      if (got && got < 900 && !lowResWarned.current) {
+        lowResWarned.current = true;
+        toast(`Camera is running at ${got}p: small print like collector numbers may not be readable. Choose 1080p or 4K in the camera settings if your camera supports it.`, 'info');
+      }
       setDevices((await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput'));
     } catch (e) {
       if (gen !== camGen.current) return;
@@ -318,7 +328,7 @@ export default function ScanPage() {
       // the crop along the live outline (or guide), re-checked against the card's
       // real edges; anything not verified goes to the keep/retake review
       const live = det ? (det.corners.map((p) => ({ x: p.x * k, y: p.y * k })) as Quad) : null;
-      const plan = planCapture(frame, live, guide, OUT_W, ANALYSIS_W);
+      const plan = planCapture(frame, live, guide, OUT_W, ANALYSIS_W, MAX_OUT_W);
       const original = plan.original;
 
       setFlash((f) => f + 1);

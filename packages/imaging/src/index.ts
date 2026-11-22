@@ -158,6 +158,36 @@ export async function prepareForOcr(input: Buffer, region?: { top: number; heigh
   return img.grayscale().resize({ width: 1400, withoutEnlargement: false }).normalize().sharpen().png().toBuffer();
 }
 
+/**
+ * One small region (a title line or a collector number) made ready for OCR:
+ * cropped, scaled so the text is ~`targetHeight` px tall overall, contrast
+ * stretched. Measured on rendered cards: plain grayscale with no added margin
+ * reads best; a white margin (a hard frame around the grey card stock) and
+ * adaptive thresholding (breaks up small digits) both made numbers unreadable.
+ */
+export async function prepareOcrRegion(
+  input: Buffer,
+  region: { left: number; top: number; width: number; height: number },
+  targetHeight = 110,
+): Promise<Buffer> {
+  const m = await sharp(input).metadata();
+  const W = m.width ?? 0, H = m.height ?? 0;
+  const left = Math.min(W - 1, Math.round(W * region.left));
+  const top = Math.min(H - 1, Math.round(H * region.top));
+  return sharp(input)
+    .extract({
+      left,
+      top,
+      width: Math.max(1, Math.min(W - left, Math.round(W * region.width))),
+      height: Math.max(1, Math.min(H - top, Math.round(H * region.height))),
+    })
+    .grayscale()
+    .resize({ height: targetHeight, kernel: 'lanczos3' })
+    .normalize()
+    .png()
+    .toBuffer();
+}
+
 export async function writeFileSafe(root: string, relative: string, data: Buffer): Promise<string> {
   const abs = path.resolve(root, relative);
   if (!abs.startsWith(path.resolve(root) + path.sep)) throw new Error('Path escapes storage root');

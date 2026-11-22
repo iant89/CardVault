@@ -102,3 +102,15 @@ describe('planCapture', () => {
     expect(p.adjusted).toBeNull();
   });
 });
+
+describe('capture size', () => {
+  it('keeps the camera detail up to the maximum width', () => {
+    const { img, truth, guide } = scene(0);
+    // card is ~300px wide in this frame: never stored smaller than the minimum
+    expect(planCapture(img, truth, guide, 750, 360, 1500).original.width).toBe(750);
+    // a card seen larger keeps its size, capped at the maximum
+    const big: Quad = truth.map((p) => ({ x: p.x * 4, y: p.y * 4 })) as Quad;
+    const frame4 = new ImageData(W * 4, H * 4);
+    expect(planCapture(frame4, big, { ...guide, x: guide.x * 4, y: guide.y * 4, w: guide.w * 4, h: guide.h * 4 }, 750, 360, 1500).original.width).toBe(1203);
+  });
+});

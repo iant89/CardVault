@@ -39,3 +39,32 @@ describe('trimDebris', () => {
     expect(trimDebris('x Charizard VMAX 330 .')).toBe('Charizard VMAX');
   });
 });
+
+describe('collector numbers from targeted readings', () => {
+  it('drops symbols glued to the number and ranks the agreed reading first', () => {
+    const s = extractSignals({ top: 'Fletchling', full: 'Fletchling 60 x\nweakness resistance retreat', bottom: 'E086/193\nGE086193 SRA\n3 006/193\nEN 086/193 S' }, 'pokemon');
+    expect(s.numbers[0]).toMatchObject({ norm: '86', total: '193' });
+  });
+  it('reads a slash misread as 1', () => {
+    const s = extractSignals({ top: 'Fletchling', full: '', bottom: 'E0861193 CS' }, 'pokemon');
+    expect(s.numbers[0]).toMatchObject({ norm: '86', total: '193' });
+  });
+  it('keeps prefixed numbers with prefixed totals', () => {
+    const s = extractSignals({ top: 'Pikachu', full: '', bottom: 'TG05/TG30' }, 'pokemon');
+    expect(s.numbers[0]).toMatchObject({ norm: 'TG05', total: 'TG30' });
+  });
+});
+
+describe('trimDebris on real misreads', () => {
+  it.each([
+    ['oasic Porygon', 'Porygon'],
+    ['sraocz Arboliva', 'Arboliva'],
+    ['Machoke w90', 'Machoke'],
+    ['Lusamine Supporter TRAINER', 'Lusamine'],
+    ['Supporter TRAINER', ''],
+    ['Porygon2 80', 'Porygon2'],
+  ])('%s → %s', async (inp, out) => {
+    const { trimDebris } = await import('./extract.js');
+    expect(trimDebris(inp)).toBe(out);
+  });
+});
