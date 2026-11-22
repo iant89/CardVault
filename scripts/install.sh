@@ -957,7 +957,7 @@ fresh_install() {
 
   step "Downloading CardVault source"
   task "Cloning ${REPO} (${TRACK_BRANCH})"
-  if have git && EXPECTED_SECONDS=90 run "Clone repository" git clone --depth 1 --branch "$TRACK_BRANCH" "$REPO" "$INSTALL_DIR.tmp"; then
+  if have git && EXPECTED_SECONDS=90 run "Clone repository" git clone --branch "$TRACK_BRANCH" "$REPO" "$INSTALL_DIR.tmp"; then
     if [[ $SCRIPT_DIR == "$INSTALL_DIR" ]]; then
       # Never delete the directory the running script lives in.
       (cd "$INSTALL_DIR.tmp" && tar -cf - .) | as_root tar -xf - -C "$INSTALL_DIR"
@@ -1081,11 +1081,26 @@ check_for_updates() {
     warn "Could not reach origin; update check skipped."
     return
   fi
+  # Installs cloned with --depth 1 don't know their own history, which makes
+  # every commit ever merged look "new". Fetch the full history once.
+  if [[ $(cd "$INSTALL_DIR" && git rev-parse --is-shallow-repository 2>/dev/null) == true ]]; then
+    (cd "$INSTALL_DIR" && git fetch --quiet --unshallow origin 2>/dev/null) || true
+  fi
   count=$(cd "$INSTALL_DIR" && git rev-list --count "HEAD..origin/${branch}" 2>/dev/null || echo 0)
   if [[ $count == 0 ]]; then ok "Already up to date."; return; fi
 
-  warn "${count} new commit(s) available:"
-  (cd "$INSTALL_DIR" && git --no-pager log --oneline "HEAD..origin/${branch}" | head -12) || true
+  local changes width shown
+  changes=$(cd "$INSTALL_DIR" && git rev-list --no-merges --count "HEAD..origin/${branch}" 2>/dev/null || echo "$count")
+  (( changes > 0 )) || changes=$count
+  warn "${changes} new change(s) available:"
+  width=$(( ${TERM_COLS:-0} > 0 ? TERM_COLS : $(tput cols 2>/dev/null || echo 100) ))
+  (( width > 20 )) || width=80
+  shown=0
+  while IFS= read -r log; do
+    printf '    %s\n' "${log:0:$(( width - 6 ))}"
+    shown=$(( shown + 1 ))
+  done < <(cd "$INSTALL_DIR" && git --no-pager log --no-merges --format='%h %s' "HEAD..origin/${branch}" 2>/dev/null | head -12)
+  (( changes > shown )) && info "…and $(( changes - shown )) more"
 
   if ask "Upgrade to the latest version now?" n; then
     do_upgrade "$branch"
@@ -1097,18 +1112,31 @@ check_for_updates() {
 do_upgrade() {
   local branch=$1
   section "Upgrading CardVault"
-  if [[ -n $(cd "$INSTALL_DIR" && git status --porcelain 2>/dev/null) ]]; then
-    warn "Local source files have been modified."
+  # Only edits to tracked files count; runtime files (pids, logs) are not source changes.
+  if [[ -n $(cd "$INSTALL_DIR" && git status --porcelain --untracked-files=no 2>/dev/null) ]]; then
+    warn "Local source files have been modified:"
+    (cd "$INSTALL_DIR" && git status --short --untracked-files=no | head -8 | sed 's/^/    /') || true
     ask "Discard local source changes and upgrade?" n || { warn "Upgrade cancelled."; return; }
     (cd "$INSTALL_DIR" && git reset --hard "origin/${branch}")
   fi
   run "Fetch and apply updates" bash -c "cd '$INSTALL_DIR' && git pull --ff-only origin '$branch'"
-  run "Update dependencies" bash -c "cd '$INSTALL_DIR' && pnpm install --frozen-lockfile"
-  run "Rebuild application" bash -c "cd '$INSTALL_DIR' && pnpm build"
-  run "Apply migrations" bash -c "cd '$INSTALL_DIR' && pnpm db:migrate && pnpm db:seed"
+  EXPECTED_SECONDS=60 run "Update dependencies" bash -c "cd '$INSTALL_DIR' && pnpm install --frozen-lockfile"
+  EXPECTED_SECONDS=150 run "Rebuild application" bash -c "cd '$INSTALL_DIR' && pnpm build"
+  EXPECTED_SECONDS=20 run "Apply migrations" bash -c "cd '$INSTALL_DIR' && pnpm db:migrate && pnpm db:seed"
   write_config "$INSTALL_DIR" "$branch" "$INSTALL_USER" "$WEB_PORT" "${LAN_ACCESS:-yes}" "${HTTPS_ENABLED:-no}" "${HTTPS_HOST:-}"
-  install_nginx
-  if [[ -f $INSTALL_DIR/scripts/install.sh ]]; then install_manager "$INSTALL_DIR/scripts/install.sh"; fi
+  if [[ -f $INSTALL_DIR/scripts/install.sh ]]; then
+    install_manager "$INSTALL_DIR/scripts/install.sh"
+    # This function belongs to the console that *started* the upgrade. Let the
+    # freshly pulled script regenerate nginx etc., so fixes to its templates
+    # take effect now rather than on the next upgrade.
+    ensure_sudo # refresh cached credentials in the foreground; the child must never prompt
+    if ! EXPECTED_SECONDS=15 run "Refresh nginx and network settings" bash "$INSTALL_DIR/scripts/install.sh" --refresh-lan; then
+      warn "Falling back to the current console's nginx settings."
+      install_nginx
+    fi
+  else
+    install_nginx
+  fi
   restart_services
   sleep 2
   ok "Upgrade complete."

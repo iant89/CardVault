@@ -29,6 +29,14 @@ Only the web port is published. PostgreSQL, Redis and the worker stay on the int
 
 **"Cross-origin request rejected" on the sign-in screen?** The API only accepts sign-ins and changes from pages served by CardVault itself. It compares the page's address (`Origin`) with the address the browser used (`Host`), port included. The bundled nginx forwards the full host, so any address you use works: IP, hostname, `:8080`. If you put another proxy in front that rewrites the `Host` header, list the address(es) you use in `WEB_ORIGIN` (comma-separated) and restart. The error message names the address it saw.
 
+**"SSL received a record that exceeded the maximum permissible length" (Firefox) / "ERR_SSL_PROTOCOL_ERROR" (Chrome)?** The browser is using **https://** on CardVault's plain-HTTP port (8080, or whatever port you chose). Use `http://<address>:8080`. HTTPS, when enabled, lives at `https://<your HTTPS hostname>` with no port.
+
+If the browser keeps switching to https by itself, one of two things is happening:
+- **Firefox HTTPS-Only Mode** is on. Add an exception for the address.
+- **The browser remembered "HTTPS only" for the hostname.** Versions before this fix sent an HSTS header over HTTPS. To clear it:
+  - Firefox: History → right-click the site → *Forget About This Site*
+  - Chrome/Edge: open `chrome://net-internals/#hsts` and delete the domain
+
 ### HTTPS (needed for phone cameras)
 
 Browsers allow camera access only on **HTTPS or `localhost`**. Over plain `http://cardvault.local`, phones fall back to **"Upload photo instead"**, which opens the native camera and still works. For the live scanner with auto-capture:
