@@ -29,7 +29,14 @@ async function request<T>(method: string, url: string, body?: unknown, opts: { r
     headers['content-type'] = 'application/json';
     payload = JSON.stringify(body);
   }
-  const res = await fetch(url, { method, headers, body: payload, credentials: 'same-origin' });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 60_000);
+  let res: Response;
+  try {
+    res = await fetch(url, { method, headers, body: payload, credentials: 'same-origin', signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
   const text = await res.text();
   let data: Record<string, unknown> = {};
   try {

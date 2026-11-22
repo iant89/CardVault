@@ -43,6 +43,39 @@ Set `SEED_DEMO=true` to load 8 sample cards (Pikachu, Charizard, Black Lotus, Bl
 
 ---
 
+## Native install (without Docker)
+
+`scripts/install.sh` sets up CardVault directly on a Linux host (Debian/Ubuntu, Fedora/RHEL or Arch). It installs Node.js 22, pnpm, PostgreSQL, Redis and nginx, clones the repository to `/opt/cardvault`, creates the database and admin account, writes systemd units, and serves the UI on port 8080.
+
+```bash
+git clone https://github.com/iant89/CardVault.git
+cd CardVault
+bash scripts/install.sh
+```
+
+The script asks for the admin password, whether to start services on boot, whether to allow LAN devices, and whether to set up HTTPS with a local CA (needed for the live phone camera). It detects an existing installation on later runs, offers an upgrade when the tracked branch has new commits, and otherwise opens a menu for:
+
+- service status / start / stop / restart / live logs
+- export, import or clear the database
+- export or import stored card images
+- change a user password, create a user, edit `.env`
+- view the PC's hostname and LAN IPs, refresh them, and enable/disable LAN firewall rules at boot
+- enable/disable HTTPS with Caddy, publish the root CA at `http://<hostname>/cardvault-ca.crt` over LAN HTTP, and print the phone install instructions
+
+Reopen the console at any time with:
+
+```bash
+sudo cardvault-setup
+```
+
+If CardVault is already installed, the script goes straight to the menu. If it isn't, it simply asks whether you want to install it. Use menu option 14 to check for upgrades.
+
+nginx listens on all interfaces and is configured with the PC's hostname and private LAN IP addresses, so other devices can open `http://<hostname>:8080` or `http://<lan-ip>:8080`. A `cardvault-lan.service` unit refreshes those names and the firewall rules at boot (when LAN access was accepted during install). Use menu option 16 to change this later, option 17 for network diagnostics (listening port, services, firewall rules), and option 18 to enable/disable HTTPS. Both `ufw` and `firewalld` are supported.
+
+Defaults can be overridden with `CARDVAULT_REPO`, `CARDVAULT_BRANCH`, `CARDVAULT_DIR`, `CARDVAULT_PORT` and `CARDVAULT_USER`. The installer pins the overall progress bar to the bottom row of the terminal, with steps and tasks scrolling above it, and shows a per-task bar for long commands. Full command output is written to `/tmp/cardvault-setup.log`, and `CARDVAULT_VERBOSE=1` streams it live instead. Backups written by the menu land in `/opt/cardvault/backups`.
+
+---
+
 ## Development
 
 Requirements: Node 22+, pnpm 10, PostgreSQL 16, Redis 7.
