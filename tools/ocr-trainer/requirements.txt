@@ -1,0 +1,7 @@
+# CPU is enough. For a smaller CPU-only install of torch:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.2
+numpy>=1.26
+pillow>=10.0
+onnx>=1.15
+onnxruntime>=1.17

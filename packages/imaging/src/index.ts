@@ -193,6 +193,25 @@ export async function prepareLine(crop: Buffer, targetHeight = 110): Promise<Buf
   return sharp(crop).grayscale().resize({ height: targetHeight, kernel: 'lanczos3' }).normalize().png().toBuffer();
 }
 
+/** Input height of the trained line reader (tools/ocr-trainer uses the same). */
+export const LINE_HEIGHT = 32;
+export const LINE_MAX_WIDTH = 512;
+
+/**
+ * A text line as the trained reader's input: grayscale, LINE_HEIGHT px tall,
+ * width scaled to keep the aspect ratio (8..LINE_MAX_WIDTH), values in
+ * [-1, 1], row-major. Must match tools/ocr-trainer/ocrtrainer/data.py.
+ */
+export async function lineTensor(crop: Buffer): Promise<{ data: Float32Array; width: number; height: number }> {
+  const m = await sharp(crop).metadata();
+  const h = LINE_HEIGHT;
+  const width = Math.max(8, Math.min(LINE_MAX_WIDTH, Math.round(((m.width ?? 1) * h) / Math.max(1, m.height ?? 1))));
+  const raw = await sharp(crop).removeAlpha().grayscale().resize(width, h, { fit: 'fill', kernel: 'linear' }).raw().toBuffer();
+  const data = new Float32Array(width * h);
+  for (let i = 0; i < data.length; i++) data[i] = raw[i]! / 127.5 - 1;
+  return { data, width, height: h };
+}
+
 /** One region of a card made ready for OCR (crop + prepareLine). */
 export async function prepareOcrRegion(input: Buffer, region: CardRegion, targetHeight = 110): Promise<Buffer> {
   return prepareLine(await cropRegion(input, region), targetHeight);

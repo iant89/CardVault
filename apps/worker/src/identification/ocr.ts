@@ -70,6 +70,14 @@ export interface OcrLine {
   text: string;
   readings: string[];
   confidence: number;
+  /** the engine that produced this reading */
+  engine: string;
+}
+
+/** Reads one line: a trained model, or Tesseract (see engines.ts). */
+export interface LineReader {
+  id: string;
+  read(crop: Buffer, field: LineField, opts: { numberChars?: string }): Promise<LineReading>;
 }
 
 /** Identifies what read a line: stored with every sample and every score. */
@@ -128,7 +136,7 @@ export async function readLine(crop: Buffer, field: LineField, opts: { numberCha
  * enlarged and read on their own. Without a known layout every game's title
  * spot is tried and the footer is read in two magnified halves.
  */
-export async function ocrCard(image: Buffer, log: Logger, langPath?: string, gameHint?: string): Promise<OcrResult> {
+export async function ocrCard(image: Buffer, log: Logger, langPath?: string, gameHint?: string, reader?: LineReader): Promise<OcrResult> {
   const w = await getWorker(log, langPath);
   const [fullImg, topImg] = await Promise.all([prepareForOcr(image), prepareForOcr(image, { top: 0, height: 0.18 })]);
   const a = await read(w, fullImg, PSM.auto);
@@ -147,15 +155,15 @@ export async function ocrCard(image: Buffer, log: Logger, langPath?: string, gam
   if (layout) {
     for (const [i, r] of layout.name.entries()) {
       const crop = await cropRegion(image, r);
-      const t = await readLine(crop, 'name', { log, langPath });
+      const t = reader ? await reader.read(crop, 'name', {}) : await readLine(crop, 'name', { log, langPath });
       if (t.text) names.push(t.text);
-      lines.push({ field: 'name', region: i, crop, ...t });
+      lines.push({ field: 'name', region: i, crop, engine: reader?.id ?? ENGINE_ID, ...t });
     }
     for (const [i, r] of layout.number.entries()) {
       const crop = await cropRegion(image, r);
-      const t = await readLine(crop, 'number', { numberChars: layout.numberChars, log, langPath });
+      const t = reader ? await reader.read(crop, 'number', { numberChars: layout.numberChars }) : await readLine(crop, 'number', { numberChars: layout.numberChars, log, langPath });
       numbers.push(...t.readings);
-      lines.push({ field: 'number', region: i, crop, ...t });
+      lines.push({ field: 'number', region: i, crop, engine: reader?.id ?? ENGINE_ID, ...t });
     }
   } else {
     // the game couldn't be told: try every game's title spot (no samples kept)

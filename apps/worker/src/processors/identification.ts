@@ -9,6 +9,7 @@ import { ocrCard, type OcrResult } from '../identification/ocr.js';
 import { extractSignals } from '../identification/extract.js';
 import { nameIndex } from '../identification/dictionary.js';
 import { labelScanSamples, saveScanSamples } from '../identification/samples.js';
+import { liveEngine } from '../identification/engines.js';
 import { localCandidates, remoteCandidates, scoreCandidates } from '../identification/identify.js';
 import { run } from './common.js';
 
@@ -61,7 +62,8 @@ export async function processIdentification(ctx: WorkerContext, job: Job<Identif
     let ocr: OcrResult = { full: '', top: '', bottom: '', confidence: 0 };
     if (ctx.config.OCR_ENABLED) {
       try {
-        ocr = await ocrCard(image, ctx.log, ctx.config.OCR_LANG_PATH, job.data.gameHint ?? scan.gameHint ?? undefined);
+        const reader = await liveEngine(ctx);
+        ocr = await ocrCard(image, ctx.log, ctx.config.OCR_LANG_PATH, job.data.gameHint ?? scan.gameHint ?? undefined, reader ?? undefined);
       } catch (e) {
         ctx.log.warn({ err: (e as Error).message }, 'OCR failed; continuing with other signals');
       }

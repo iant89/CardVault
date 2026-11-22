@@ -40,7 +40,7 @@ export async function saveScanSamples(ctx: WorkerContext, scan: { id: string; im
       field: l.field,
       region: l.region,
       cropPath,
-      engine: ENGINE_ID,
+      engine: l.engine ?? ENGINE_ID,
       predicted: l.text,
       predictedConfidence: l.confidence,
       meta: { readings: l.readings, source: 'scan', capture: scan.quality ?? {} },

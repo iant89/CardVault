@@ -46,8 +46,33 @@ interface Overview {
   exam: { id: string; version: number; size: number; counts: Record<string, number>; note: string | null; createdAt: string } | null;
   newSinceExam: number;
   import: { status: string; done?: number; total?: number; added?: number; skipped?: number; error?: string; alreadyImported?: number } | null;
+  dataset: { id: string; createdAt: string; rows: number; counts: Record<string, number>; dir: string; storage: string } | null;
   evaluations: Evaluation[];
 }
+interface Gate {
+  id: string;
+  label: string;
+  pass: boolean;
+  detail: string;
+}
+interface Model {
+  id: string;
+  status: 'candidate' | 'active' | 'retired';
+  createdAt: string;
+  activatedAt: string | null;
+  dataset: { id: string; rows: number } | null;
+  training: { epochs: number; minutes: number; parameters: number; synthetic: number } | null;
+  dev: Record<string, { n: number; accuracy: number | null }> | null;
+  evaluation: { id: string; examVersion: number; summary: Summary } | null;
+  gates: Gate[];
+  canPromote: boolean;
+}
+interface Models {
+  examVersion: number | null;
+  champion: { engine: string; evaluationId: string | null } | null;
+  models: Model[];
+}
+
 interface Sample {
   id: string;
   field: string;
@@ -82,13 +107,17 @@ const crop = (id: string) => `/api/dev/ocr/samples/${id}/crop`;
 
 export default function OcrLabPage() {
   const ov = useAsync(() => api.get<Overview>('/api/dev/ocr'), []);
+  const models = useAsync(() => api.get<Models>('/api/dev/ocr/models'), []);
   const [detail, setDetail] = useState<Evaluation | null>(null);
   const [filter, setFilter] = useState<{ source?: string; field?: string; regression?: string }>({});
   const samples = useAsync(() => api.get<{ samples: Sample[] }>(`/api/dev/ocr/samples?${new URLSearchParams(filter as Record<string, string>)}`), [JSON.stringify(filter)]);
   const busy = !!ov.data && (ov.data.evaluations.some((e) => e.status === 'queued' || e.status === 'running') || ov.data.import?.status === 'running' || ov.data.import?.status === 'queued');
 
   useEffect(() => {
-    const t = setInterval(() => ov.reload(), busy ? 2500 : 15000);
+    const t = setInterval(() => {
+      ov.reload();
+      models.reload();
+    }, busy ? 2500 : 15000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [busy]);
@@ -98,6 +127,7 @@ export default function OcrLabPage() {
       await fn();
       toast(ok, 'success');
       ov.reload();
+      models.reload();
     } catch (e) {
       toast(e instanceof ApiError ? e.message : 'Failed', 'error');
     }
@@ -248,6 +278,8 @@ export default function OcrLabPage() {
         )}
       </div>
 
+      <ModelsPanel d={d} m={models.data} busy={busy} act={act} onDetails={(id) => void open(id)} />
+
       <div className="panel">
         <div className="panel-head">
           <h3>Collected lines</h3>
@@ -327,6 +359,110 @@ export default function OcrLabPage() {
           </div>
         )}
       </Dialog>
+    </div>
+  );
+}
+
+function ModelsPanel({ d, m, busy, act, onDetails }: { d: Overview; m: Models | null; busy: boolean; act: (fn: () => Promise<unknown>, ok: string) => Promise<void>; onDetails: (id: string) => void }) {
+  const active = m?.models.find((x) => x.status === 'active');
+  const storage = d.dataset?.storage ?? '<STORAGE_DIR>';
+  const cmd = `python tools/ocr-trainer/train.py --storage ${storage}`;
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h3>Models</h3>
+        <div className="row" style={{ gap: 8 }}>
+          <span className="faint" style={{ fontSize: 13 }}>
+            Reading scans now: <strong style={{ color: 'var(--text)' }}>{active ? active.id : 'Tesseract'}</strong>
+            {active && ' (Tesseract for lines it isn’t sure of)'}
+          </span>
+          {active && (
+            <button className="btn sm danger" onClick={() => void act(() => api.post('/api/dev/ocr/models/rollback', {}), 'Rolled back to Tesseract')}>
+              Roll back to Tesseract
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="ocr-train">
+        <div>
+          <strong>1. Export training data</strong>
+          <p className="faint">Training-side lines only, never the exam and never self-confirmed labels.</p>
+          {d.dataset ? (
+            <p className="faint" style={{ fontSize: 12 }}>
+              Last: <code>{d.dataset.id}</code> · {d.dataset.rows.toLocaleString()} lines · {Object.entries(d.dataset.counts).map(([k, v]) => `${k} ${v}`).join(', ')}
+            </p>
+          ) : null}
+          <button className="btn sm" disabled={busy} onClick={() => void act(() => api.post('/api/dev/ocr/export', {}), 'Export started')}>
+            Export training data
+          </button>
+        </div>
+        <div>
+          <strong>2. Train on the server</strong>
+          <p className="faint">CPU is enough. Needs Python with the packages in tools/ocr-trainer/requirements.txt.</p>
+          <div className="ocr-cmd">
+            <code>{cmd}</code>
+            <button className="btn sm ghost" onClick={() => void navigator.clipboard?.writeText(cmd).then(() => toast('Copied', 'success'))}>Copy</button>
+          </div>
+        </div>
+        <div>
+          <strong>3. Score, then promote</strong>
+          <p className="faint">A model can only start reading scans when every gate below passes on the same exam version as the current engine.</p>
+          <button className="btn sm ghost" onClick={() => void act(() => api.post('/api/dev/ocr/models/rescan', {}), 'Looking for new models')}>
+            Look for new models
+          </button>
+        </div>
+      </div>
+
+      {m?.models.length ? (
+        <div className="stack" style={{ marginTop: 14 }}>
+          {m.models.map((x) => {
+            const s = x.evaluation?.summary;
+            return (
+              <div key={x.id} className={`ocr-model ${x.status}`}>
+                <div className="row between wrap">
+                  <div>
+                    <strong><code>{x.id}</code></strong> <span className={`ocr-status ${x.status}`}>{x.status}</span>
+                    <div className="faint" style={{ fontSize: 12 }}>
+                      {new Date(x.createdAt).toLocaleString()}
+                      {x.dataset && ` · trained on ${x.dataset.rows?.toLocaleString()} lines (${x.dataset.id})`}
+                      {x.training && ` · ${x.training.epochs} epochs, ${x.training.minutes} min, ${(x.training.parameters / 1e6).toFixed(1)}M params`}
+                      {x.dev && ` · held-out check: names ${pct(x.dev.name?.accuracy)}, numbers ${pct(x.dev.number?.accuracy)}`}
+                    </div>
+                  </div>
+                  <div className="row" style={{ gap: 6 }}>
+                    <button className="btn sm" disabled={busy || m.examVersion == null} onClick={() => void act(() => api.post(`/api/dev/ocr/models/${x.id}/evaluate`, {}), 'Scoring started')}>
+                      {x.evaluation ? 'Score again' : `Score on exam v${m.examVersion ?? '?'}`}
+                    </button>
+                    {x.status !== 'active' && (
+                      <button className="btn sm primary" disabled={!x.canPromote} title={x.canPromote ? 'Use this model for live scans' : 'Every gate must pass'} onClick={() => void act(() => api.post(`/api/dev/ocr/models/${x.id}/promote`, {}), 'Promoted: live scans use this model within 30 seconds')}>
+                        Promote
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {s && (
+                  <div className="row wrap" style={{ gap: 18, marginTop: 8, fontSize: 13 }}>
+                    <span>Exam v{x.evaluation!.examVersion}: names <strong>{pct(s.name?.accuracy)}</strong>, numbers <strong>{pct(s.number?.accuracy)}</strong>, {s.msPerLine} ms/line</span>
+                    <button className="btn sm ghost" onClick={() => onDetails(x.evaluation!.id)}>Details</button>
+                  </div>
+                )}
+                {x.gates.length > 0 && (
+                  <ul className="ocr-gates">
+                    {x.gates.map((g) => (
+                      <li key={g.id} className={g.pass ? 'ok' : 'no'}>
+                        <span>{g.pass ? '✓' : '✗'}</span> {g.label} <em className="faint">{g.detail}</em>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="faint" style={{ margin: '14px 0 0' }}>No models yet. Export training data, train on the server, then press Look for new models.</p>
+      )}
     </div>
   );
 }

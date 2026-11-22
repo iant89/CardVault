@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { eq, sql, researchJobs } from '@cardvault/database';
 import type { WorkerContext } from '../context.js';
 import { snapshotCollectionValues } from '../pricing/compute.js';
-import { evaluate, importHarvest, labelReviewed } from './ocr-lab.js';
+import { evaluate, exportDataset, importHarvest, labelReviewed, scanModels } from './ocr-lab.js';
 import { pruneSamples } from '../identification/samples.js';
 
 /**
@@ -76,6 +76,10 @@ export async function processMaintenance(ctx: WorkerContext, job: Job) {
       return labelReviewed(ctx, job.data as { scanId: string; cardId: string });
     case 'ocr-evaluate':
       return evaluate(ctx, job.data as { evaluationId: string });
+    case 'ocr-export-dataset':
+      return exportDataset(ctx);
+    case 'ocr-scan-models':
+      return scanModels(ctx);
     case 'ocr-import-harvest':
       return importHarvest(ctx, job.data as { limit?: number });
     case 'prune':
@@ -95,4 +99,6 @@ export async function scheduleMaintenance(ctx: WorkerContext) {
   await m.upsertJobScheduler('refresh-research', { every: 60 * 60_000 }, { name: 'refresh-research' });
   await m.upsertJobScheduler('value-snapshots', { every: 60 * 60_000 }, { name: 'value-snapshots' });
   await m.upsertJobScheduler('prune', { pattern: '17 3 * * *' }, { name: 'prune' });
+  // pick up models the trainer wrote since the last start
+  await m.add('ocr-scan-models', {}, { removeOnComplete: 10, removeOnFail: 10 });
 }

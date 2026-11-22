@@ -501,3 +501,19 @@ export const ocrEvaluations = pgTable(
   },
   (t) => [index('ocr_evaluations_created_idx').on(t.createdAt)],
 );
+
+/**
+ * Trained line-reader models (tools/ocr-trainer output under storage/ocr/models).
+ * status: candidate (registered, may be scored) → active (reads live scans; at
+ * most one) → retired. Promotion to active is gated on exam results.
+ */
+export const ocrModels = pgTable('ocr_models', {
+  id: text('id').primaryKey(),
+  dir: text('dir').notNull(),
+  status: text('status').notNull().default('candidate'),
+  card: jsonb('card').$type<Record<string, unknown>>().notNull().default({}),
+  createdAt: created(),
+  activatedAt: ts('activated_at'),
+  activatedBy: uuid('activated_by').references(() => users.id, { onDelete: 'set null' }),
+  note: text('note'),
+});

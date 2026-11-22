@@ -2,16 +2,18 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { desc, eq, ocrEvaluations, ocrExams, ocrSamples, sql } from '@cardvault/database';
+import { and, desc, eq, ocrEvaluations, ocrExams, ocrModels, ocrSamples, sql } from '@cardvault/database';
 import { resolveStoragePath } from '@cardvault/imaging';
 import type { AppContext } from '../context.js';
 import { requireAdmin, user as currentUser } from '../auth/plugin.js';
 import { badRequest, notFound } from '../errors.js';
+import { gates, type EvalLike } from '../services/ocr-gates.js';
 
 /** Most groups (a scan's lines, or a harvested card's) an exam takes from each kind of source. */
 const EXAM_CAP = { real: 1500, harvest: 500 };
 const TRUSTED = sql`('review', 'corroborated', 'harvest')`;
 const IMPORT_KEY = 'ocr:import-harvest';
+const DATASET_KEY = 'ocr:dataset';
 
 /**
  * OCR Lab (admins): the data collected from scans, the frozen exam, and
@@ -57,12 +59,14 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
       .orderBy(desc(ocrEvaluations.createdAt))
       .limit(20);
     const imp = await ctx.redis.get(IMPORT_KEY);
+    const dataset = await ctx.redis.get(DATASET_KEY);
     return {
       counts,
       totals,
       exam: exam ? { id: exam.id, version: exam.version, size: exam.sampleIds.length, counts: exam.counts, note: exam.note, createdAt: exam.createdAt } : null,
       newSinceExam,
       import: imp ? JSON.parse(imp) : null,
+      dataset: dataset ? JSON.parse(dataset) : null,
       evaluations,
     };
   });
@@ -93,18 +97,18 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     return { exam: { id: exam!.id, version: exam!.version, size: exam!.sampleIds.length, counts } };
   });
 
-  app.post('/api/dev/ocr/evaluations', guard, async (req) => {
+  /** Queue scoring of an engine ('tesseract' or 'model:<id>') on the latest exam. */
+  const startEvaluation = async (engine: string, userId: string) => {
     const [exam] = await ctx.db.select({ id: ocrExams.id, version: ocrExams.version }).from(ocrExams).orderBy(desc(ocrExams.version)).limit(1);
     if (!exam) throw badRequest('Freeze an exam first.');
     const running = await ctx.db.execute(sql`SELECT 1 FROM ocr_evaluations WHERE status IN ('queued', 'running') LIMIT 1`);
     if (running.length) throw badRequest('An evaluation is already running.');
-    const [ev] = await ctx.db
-      .insert(ocrEvaluations)
-      .values({ examId: exam.id, examVersion: exam.version, engine: 'current', requestedBy: currentUser(req).id })
-      .returning({ id: ocrEvaluations.id });
+    const [ev] = await ctx.db.insert(ocrEvaluations).values({ examId: exam.id, examVersion: exam.version, engine, requestedBy: userId }).returning({ id: ocrEvaluations.id });
     await ctx.queues.maintenance.add('ocr-evaluate', { evaluationId: ev!.id }, { removeOnComplete: 50, removeOnFail: 50 });
     return { id: ev!.id };
-  });
+  };
+
+  app.post('/api/dev/ocr/evaluations', guard, async (req) => startEvaluation('tesseract', currentUser(req).id));
 
   app.get<{ Params: { id: string } }>('/api/dev/ocr/evaluations/:id', guard, async (req) => {
     const id = z.string().uuid().parse(req.params.id);
@@ -151,5 +155,96 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     reply.header('cache-control', 'private, max-age=86400');
     reply.header('x-content-type-options', 'nosniff');
     return reply.send(createReadStream(abs));
+  });
+
+  // ---------------------------------------------------------------- training data & models
+
+  app.post('/api/dev/ocr/export', guard, async () => {
+    await ctx.queues.maintenance.add('ocr-export-dataset', {}, { removeOnComplete: 20, removeOnFail: 20 });
+    return { ok: true };
+  });
+
+  app.post('/api/dev/ocr/models/rescan', guard, async () => {
+    await ctx.queues.maintenance.add('ocr-scan-models', {}, { removeOnComplete: 20, removeOnFail: 20 });
+    return { ok: true };
+  });
+
+  /** Latest finished evaluation of an engine on an exam version. */
+  const latestEval = async (engine: string, examVersion: number) => {
+    const [e] = await ctx.db
+      .select()
+      .from(ocrEvaluations)
+      .where(and(eq(ocrEvaluations.engine, engine), eq(ocrEvaluations.examVersion, examVersion), eq(ocrEvaluations.status, 'done')))
+      .orderBy(desc(ocrEvaluations.completedAt))
+      .limit(1);
+    return (e as unknown as EvalLike) ?? null;
+  };
+
+  /** The engine reading live scans now, and its score on the given exam version. */
+  const champion = async (examVersion: number) => {
+    const [active] = await ctx.db.select({ id: ocrModels.id }).from(ocrModels).where(eq(ocrModels.status, 'active')).limit(1);
+    if (active) return { engine: `model:${active.id}`, eval: await latestEval(`model:${active.id}`, examVersion) };
+    const tess = await ctx.db.execute(sql`
+      SELECT engine FROM ocr_evaluations WHERE engine LIKE 'tesseract%' AND exam_version = ${examVersion} AND status = 'done'
+      ORDER BY completed_at DESC LIMIT 1`);
+    const engine = tess[0] ? String(tess[0].engine) : 'tesseract';
+    return { engine, eval: await latestEval(engine, examVersion) };
+  };
+
+  const modelView = async () => {
+    const [exam] = await ctx.db.select({ version: ocrExams.version }).from(ocrExams).orderBy(desc(ocrExams.version)).limit(1);
+    const models = await ctx.db.select().from(ocrModels).orderBy(desc(ocrModels.createdAt));
+    const champ = exam ? await champion(exam.version) : null;
+    const rows = [];
+    for (const m of models) {
+      const ev = exam ? await latestEval(`model:${m.id}`, exam.version) : null;
+      const g = ev && m.status !== 'active' ? gates(ev, champ?.eval ?? null) : [];
+      const card = m.card as Record<string, unknown>;
+      rows.push({
+        id: m.id,
+        status: m.status,
+        createdAt: m.createdAt,
+        activatedAt: m.activatedAt,
+        dataset: card.dataset ?? null,
+        training: card.training ?? null,
+        dev: card.dev ?? null,
+        evaluation: ev ? { id: ev.id, examVersion: ev.examVersion, summary: ev.summary } : null,
+        gates: g,
+        canPromote: m.status !== 'active' && g.length > 0 && g.every((x) => x.pass),
+      });
+    }
+    return { examVersion: exam?.version ?? null, champion: champ ? { engine: champ.engine, evaluationId: champ.eval?.id ?? null } : null, models: rows };
+  };
+
+  app.get('/api/dev/ocr/models', guard, async () => modelView());
+
+  app.post<{ Params: { id: string } }>('/api/dev/ocr/models/:id/evaluate', guard, async (req) => {
+    const [m] = await ctx.db.select({ id: ocrModels.id }).from(ocrModels).where(eq(ocrModels.id, req.params.id));
+    if (!m) throw notFound();
+    return startEvaluation(`model:${m.id}`, currentUser(req).id);
+  });
+
+  /** Make a model read live scans. Refused unless every gate passes on the current exam. */
+  app.post<{ Params: { id: string } }>('/api/dev/ocr/models/:id/promote', guard, async (req) => {
+    const view = await modelView();
+    const m = view.models.find((x) => x.id === req.params.id);
+    if (!m) throw notFound();
+    if (!m.canPromote) {
+      const failed = m.gates.filter((g) => !g.pass).map((g) => `${g.label}: ${g.detail}`);
+      throw badRequest(`Not promoted. ${failed.length ? failed.join(' · ') : 'Score it on the current exam first.'}`);
+    }
+    await ctx.db.transaction(async (tx) => {
+      await tx.update(ocrModels).set({ status: 'retired' }).where(eq(ocrModels.status, 'active'));
+      await tx.update(ocrModels).set({ status: 'active', activatedAt: new Date(), activatedBy: currentUser(req).id }).where(eq(ocrModels.id, m.id));
+    });
+    req.log.info({ model: m.id }, 'OCR model promoted');
+    return { ok: true };
+  });
+
+  /** Stop using the active model: live scans go back to Tesseract within 30 seconds. */
+  app.post('/api/dev/ocr/models/rollback', guard, async (req) => {
+    const r = await ctx.db.update(ocrModels).set({ status: 'retired' }).where(eq(ocrModels.status, 'active')).returning({ id: ocrModels.id });
+    req.log.info({ model: r[0]?.id }, 'OCR model rolled back to Tesseract');
+    return { ok: true, retired: r[0]?.id ?? null };
   });
 }
