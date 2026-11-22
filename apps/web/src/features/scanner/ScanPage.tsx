@@ -2,9 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOfflineQueue } from './offlineQueue';
 import {
   assessQuality,
-  autoLevels,
   CARD_RATIO,
+  correctPhoto,
   detectCard,
+  finishCard,
   planCapture,
   regionSignature,
   signatureDiff,
@@ -52,6 +53,10 @@ type Phase = 'idle' | 'captured' | 'ready';
 const OUT_W = 750;
 /** Captures keep up to this width when the camera sees the card larger (sharper text for OCR). */
 const MAX_OUT_W = 1500;
+/** Ceiling for the CSS fallback zoom (cameras without a zoom control). */
+const CSS_ZOOM_MAX = 4;
+/** Double-tap toggles between this and 1×. */
+const DOUBLE_TAP_ZOOM = 2;
 
 interface AlignReview {
   original: { blob: Blob; url: string };
@@ -88,6 +93,23 @@ function Meter({ label, value, good, text }: { label: string; value: number; goo
   );
 }
 
+/**
+ * Ease a detection toward the previous one so the live outline (and the crop
+ * taken from it) stops jittering between frames. A card that jumps — swapped,
+ * handed over — snaps to the new position instead of smearing across.
+ */
+function smoothDetection(prev: Detection | null, next: Detection | null, guideW: number): Detection | null {
+  if (!next) return null;
+  if (!prev) return next;
+  const moved = next.corners.reduce((a, p, i) => a + Math.hypot(p.x - prev.corners[i]!.x, p.y - prev.corners[i]!.y), 0) / 4;
+  if (moved > guideW * 0.15) return next;
+  const k = 0.45;
+  return {
+    corners: next.corners.map((p, i) => ({ x: prev.corners[i]!.x + (p.x - prev.corners[i]!.x) * k, y: prev.corners[i]!.y + (p.y - prev.corners[i]!.y) * k })) as Detection['corners'],
+    confidence: next.confidence,
+  };
+}
+
 /** iOS often hands us HEIC; convert to a modest JPEG the API can always decode. */
 async function preparePhoto(f: File): Promise<Blob> {
   if (f.type === 'image/jpeg' || f.size > 60_000_000) return f;
@@ -119,8 +141,9 @@ export default function ScanPage() {
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const analysisRef = useRef<HTMLCanvasElement | null>(null);
-  const detRef = useRef<{ det: Detection | null; stable: number; armed: boolean; last: Detection | null; emptySince: number | null; newCard: number }>({
+  const detRef = useRef<{ det: Detection | null; smooth: Detection | null; stable: number; armed: boolean; last: Detection | null; emptySince: number | null; newCard: number }>({
     det: null,
+    smooth: null,
     stable: 0,
     armed: true,
     last: null,
@@ -151,6 +174,21 @@ export default function ScanPage() {
   const [quality, setQuality] = useState<Quality | null>(null);
   const lowResWarned = useRef(false);
   const [found, setFound] = useState(false);
+  /** detection confidence 0..1 (drives the "Card" meter) */
+  const [conf, setConf] = useState(0);
+  // ---- zoom: camera zoom when the device offers it, CSS zoom otherwise
+  const [zoom, setZoom] = useState(() => Math.max(1, parseFloat(pref('zoom', '1')) || 1));
+  /** camera zoom ceiling (1 = the camera has no zoom control) */
+  const [zoomMax, setZoomMax] = useState(1);
+  const zoomRef = useRef(zoom);
+  const cameraZoomRef = useRef(false);
+  const zoomTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  /** the camera supports manual focus (tap-to-focus) */
+  const focusManualRef = useRef(false);
+  /** tap-to-focus ring, in viewport pixels */
+  const [focusPt, setFocusPt] = useState<{ x: number; y: number } | null>(null);
+  const focusTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(zoomTimer.current), []);
   const [flash, setFlash] = useState(0);
   const [phase, setPhaseState] = useState<Phase>('idle');
   const [torch, setTorch] = useState<boolean | null>(null);
@@ -221,14 +259,27 @@ export default function ScanPage() {
       }
       streamRef.current = stream;
       const track = stream.getVideoTracks()[0];
-      const caps = (track?.getCapabilities?.() ?? {}) as MediaTrackCapabilities & { torch?: boolean; focusMode?: string[] };
+      const caps = (track?.getCapabilities?.() ?? {}) as MediaTrackCapabilities & { torch?: boolean; focusMode?: string[]; zoom?: { min: number; max: number; step: number } };
       if (caps.focusMode?.includes('continuous')) await track!.applyConstraints({ advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet] }).catch(() => undefined);
+      focusManualRef.current = !!caps.focusMode?.includes('manual');
       setTorch(caps.torch ? false : null);
+      // camera zoom: apply the saved level so zooming in keeps more pixels on the card
+      if (caps.zoom && caps.zoom.max > 1) {
+        cameraZoomRef.current = true;
+        setZoomMax(caps.zoom.max);
+        const z = Math.max(1, Math.min(caps.zoom.max, zoomRef.current));
+        zoomRef.current = z;
+        setZoom(z);
+        await track!.applyConstraints({ advanced: [{ zoom: z } as MediaTrackConstraintSet] }).catch(() => undefined);
+      } else {
+        cameraZoomRef.current = false;
+        setZoomMax(1);
+      }
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play().catch(() => undefined);
       }
-      Object.assign(detRef.current, { det: null, last: null, stable: 0, armed: !reopenDisarmed.current, emptySince: null, newCard: 0 });
+      Object.assign(detRef.current, { det: null, smooth: null, last: null, stable: 0, armed: !reopenDisarmed.current, emptySince: null, newCard: 0 });
       reopenDisarmed.current = false;
       setCamState('on');
       // the guide covers a fixed share of the frame, so the camera's resolution
@@ -263,6 +314,9 @@ export default function ScanPage() {
   };
 
   // ---- geometry: guide rectangle in video pixel space
+  // The guide is fixed on screen. Camera zoom narrows the stream itself, so
+  // the guide maps as at 1×; CSS zoom shows the frame's centre enlarged, so
+  // the guide covers a correspondingly smaller patch of the frame.
   const guideInVideo = useCallback((): Rect | null => {
     const v = videoRef.current,
       vp = vpRef.current;
@@ -270,12 +324,118 @@ export default function ScanPage() {
     const W = vp.clientWidth,
       H = vp.clientHeight;
     const scale = Math.max(W / v.videoWidth, H / v.videoHeight);
-    const offX = (W - v.videoWidth * scale) / 2,
-      offY = (H - v.videoHeight * scale) / 2;
-    const gh = H * 0.78,
+    const z = cameraZoomRef.current ? 1 : zoomRef.current;
+    const gh = (H * 0.78) / z,
       gw = gh * CARD_RATIO;
-    return { x: ((W - gw) / 2 - offX) / scale, y: ((H - gh) / 2 - offY) / scale, w: gw / scale, h: gh / scale };
+    return { x: v.videoWidth / 2 - gw / (2 * scale), y: v.videoHeight / 2 - gh / (2 * scale), w: gw / scale, h: gh / scale };
   }, []);
+
+  // ---- zoom controls
+  const changeZoom = useCallback(
+    (z: number) => {
+      const max = cameraZoomRef.current ? zoomMax : CSS_ZOOM_MAX;
+      const clamped = Math.max(1, Math.min(max, z));
+      zoomRef.current = clamped;
+      setZoom(clamped);
+      savePref('zoom', String(clamped));
+      if (cameraZoomRef.current) {
+        clearTimeout(zoomTimer.current);
+        zoomTimer.current = setTimeout(() => {
+          const track = streamRef.current?.getVideoTracks()[0];
+          void track?.applyConstraints({ advanced: [{ zoom: zoomRef.current } as MediaTrackConstraintSet] }).catch(() => undefined);
+        }, 120);
+      }
+    },
+    [zoomMax],
+  );
+
+  // ---- gestures on the preview: pinch / wheel zoom, tap-to-focus, double-tap zoom
+  const pointersRef = useRef(new Map<number, { x: number; y: number; x0: number; y0: number; t: number }>());
+  const pinchRef = useRef<{ dist: number; zoom: number } | null>(null);
+  const lastTapRef = useRef(0);
+  const tapTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(tapTimer.current), []);
+
+  /** Focus the camera where the user tapped (viewport px → video-frame fraction). */
+  const tapFocus = (px: number, py: number) => {
+    const v = videoRef.current,
+      vp = vpRef.current;
+    if (!v || !vp || !focusManualRef.current) return;
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (!track) return;
+    const W = vp.clientWidth,
+      H = vp.clientHeight;
+    const scale = Math.max(W / v.videoWidth, H / v.videoHeight);
+    const dw = v.videoWidth * scale,
+      dh = v.videoHeight * scale;
+    const vx = Math.max(0, Math.min(1, (px - (W - dw) / 2) / dw));
+    const vy = Math.max(0, Math.min(1, (py - (H - dh) / 2) / dh));
+    void track
+      .applyConstraints({ advanced: [{ focusMode: 'manual', pointsOfInterest: [{ x: vx, y: vy }] } as MediaTrackConstraintSet] })
+      .catch(() => undefined);
+    setFocusPt({ x: px, y: py });
+    clearTimeout(focusTimer.current);
+    focusTimer.current = setTimeout(() => setFocusPt(null), 900);
+  };
+
+  const onPointerDown = (e: React.PointerEvent<HTMLVideoElement>) => {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, t: performance.now() });
+    if (pointersRef.current.size === 2) {
+      // pinch: remember the starting spread and zoom
+      const [a, b] = [...pointersRef.current.values()];
+      pinchRef.current = { dist: Math.hypot(a!.x - b!.x, a!.y - b!.y), zoom: zoomRef.current };
+      clearTimeout(tapTimer.current);
+    }
+  };
+  const onPointerMove = (e: React.PointerEvent<HTMLVideoElement>) => {
+    const p = pointersRef.current.get(e.pointerId);
+    if (!p) return;
+    p.x = e.clientX;
+    p.y = e.clientY;
+    if (pointersRef.current.size === 2 && pinchRef.current && pinchRef.current.dist > 0) {
+      const [a, b] = [...pointersRef.current.values()];
+      changeZoom((pinchRef.current.zoom * Math.hypot(a!.x - b!.x, a!.y - b!.y)) / pinchRef.current.dist);
+    }
+  };
+  const onPointerUp = (e: React.PointerEvent<HTMLVideoElement>) => {
+    const p = pointersRef.current.get(e.pointerId);
+    pointersRef.current.delete(e.pointerId);
+    if (pointersRef.current.size === 0) pinchRef.current = null;
+    if (!p || pointersRef.current.size > 0) return;
+    // a single quick tap: focus — unless it is the second half of a double-tap (zoom toggle)
+    if (performance.now() - p.t > 300 || Math.hypot(e.clientX - p.x0, e.clientY - p.y0) > 12) return;
+    const now = performance.now();
+    if (now - lastTapRef.current < 300) {
+      lastTapRef.current = 0;
+      clearTimeout(tapTimer.current);
+      changeZoom(zoomRef.current > 1.05 ? 1 : DOUBLE_TAP_ZOOM);
+      return;
+    }
+    lastTapRef.current = now;
+    const rect = vpRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const px = e.clientX - rect.left,
+      py = e.clientY - rect.top;
+    tapTimer.current = setTimeout(() => tapFocus(px, py), 280);
+  };
+  const onPointerCancel = (e: React.PointerEvent<HTMLVideoElement>) => {
+    pointersRef.current.delete(e.pointerId);
+    if (pointersRef.current.size === 0) pinchRef.current = null;
+  };
+
+  // wheel zoom over the preview (native listener so the page doesn't scroll)
+  useEffect(() => {
+    const vp = vpRef.current;
+    if (!vp) return;
+    const onWheel = (e: WheelEvent) => {
+      if (camState !== 'on') return;
+      e.preventDefault();
+      changeZoom(zoomRef.current * Math.exp(-e.deltaY * 0.0012));
+    };
+    vp.addEventListener('wheel', onWheel, { passive: false });
+    return () => vp.removeEventListener('wheel', onWheel);
+  }, [camState, changeZoom]);
 
   // ---- capture
   const toBlob = (img: ImageData) => {
@@ -344,7 +504,7 @@ export default function ScanPage() {
         ...(q ? { sharpness: Math.round(q.sharpness), brightness: Math.round(q.brightness), glare: q.glare } : {}),
       };
 
-      autoLevels(original);
+      finishCard(original);
       const originalBlob = await toBlob(original);
       if (!originalBlob) return;
       if (!plan.needsReview) {
@@ -355,7 +515,7 @@ export default function ScanPage() {
       // not verified: offer the corrected crop (if the card was found) and ask
       let adjusted: { blob: Blob; url: string } | null = null;
       if (plan.adjusted) {
-        autoLevels(plan.adjusted);
+        finishCard(plan.adjusted);
         const b = await toBlob(plan.adjusted);
         if (b) adjusted = { blob: b, url: URL.createObjectURL(b) };
       }
@@ -496,8 +656,12 @@ export default function ScanPage() {
       const { g, max } = toGray(ctx.getImageData(0, 0, a.width, a.height));
       const guide = { x: guideV.x * s, y: guideV.y * s, w: guideV.w * s, h: guideV.h * s };
       const q = assessQuality(g, max, a.width, guide);
-      const det = detectCard(g, a.width, a.height, guide);
       const st = detRef.current;
+      // ease the outline toward each new measurement so it stops jittering;
+      // a card that jumps (swap, hand-off) snaps instead of smearing
+      const raw = detectCard(g, a.width, a.height, guide);
+      const det = smoothDetection(st.smooth, raw, guide.w);
+      st.smooth = det;
       const sig = det ? regionSignature(g, a.width, guide) : null;
       lastFrameSig.current = sig;
       if (det && st.last) {
@@ -524,6 +688,7 @@ export default function ScanPage() {
       qualityRef.current = q;
       setQuality(q);
       setFound(!!det);
+      setConf(det?.confidence ?? 0);
       drawOverlay(det, s);
       if (auto && st.armed && det && q.ok && st.stable >= STABLE_FRAMES && !reviewRef.current) void capture('auto');
     };
@@ -574,12 +739,47 @@ export default function ScanPage() {
                   ? 'HOLD STILL…'
                   : 'READY';
 
+  /** Run the camera's corrector over an uploaded photo; null when no card is found. */
+  const correctUpload = async (blob: Blob): Promise<Blob | null> => {
+    try {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      const max = 1600;
+      const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+      const w = Math.max(1, Math.round(img.naturalWidth * scale));
+      const h = Math.max(1, Math.round(img.naturalHeight * scale));
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext('2d', { willReadFrequently: true })!;
+      ctx.drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      const frame = ctx.getImageData(0, 0, w, h);
+      // a centred card-ratio guide filling most of the smaller dimension
+      const gh = Math.min(h * 0.85, (w * 0.85) / CARD_RATIO);
+      const guide = { x: (w - gh * CARD_RATIO) / 2, y: (h - gh) / 2, w: gh * CARD_RATIO, h: gh };
+      const corrected = correctPhoto(frame, guide, OUT_W, ANALYSIS_W, MAX_OUT_W);
+      if (!corrected) return null;
+      const oc = document.createElement('canvas');
+      oc.width = corrected.width;
+      oc.height = corrected.height;
+      oc.getContext('2d')!.putImageData(corrected, 0, 0);
+      return await new Promise<Blob | null>((r) => oc.toBlob(r, 'image/jpeg', 0.92));
+    } catch {
+      return null;
+    }
+  };
+
   const onFile = async (f: File) => {
     // a sidebar retake also applies to an uploaded photo
     const target = retakeRef.current;
     try {
       toast('Preparing photo…', 'info');
-      const blob = await preparePhoto(f);
+      const prepared = await preparePhoto(f);
+      // straighten the card if it can be found in the photo, else keep it as-is
+      const blob = (await correctUpload(prepared)) ?? prepared;
       const localId = await add(blob, { gameHint: game || undefined, quality: { source: 'file' }, replaceScanId: target?.scanId, label: target?.name });
       if (!localId) {
         toast('Not signed in — sign in again and retry.', 'error');
@@ -624,8 +824,19 @@ export default function ScanPage() {
       <div className={`scanner ${sideCollapsed ? 'collapsed' : ''}`}>
         <div className="stack" style={{ minWidth: 0 }}>
           <div className="viewport" ref={vpRef}>
-            <video ref={videoRef} playsInline muted autoPlay style={{ visibility: captured ? 'hidden' : 'visible' }} />
-            <canvas ref={overlayRef} className="overlay-canvas" style={{ visibility: captured ? 'hidden' : 'visible' }} />
+            <video
+              ref={videoRef}
+              playsInline
+              muted
+              autoPlay
+              style={{ visibility: captured ? 'hidden' : 'visible', transform: zoomMax > 1 ? undefined : `scale(${zoom})` }}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerCancel={onPointerCancel}
+            />
+            <canvas ref={overlayRef} className="overlay-canvas" style={{ visibility: captured ? 'hidden' : 'visible', transform: zoomMax > 1 ? undefined : `scale(${zoom})` }} />
+            {focusPt && !captured && <div className="focus-ring" style={{ left: focusPt.x, top: focusPt.y }} />}
             {!captured && (
               <div className={`guide ${found || phase === 'captured' ? 'found' : ''} ${phase !== 'idle' ? 'prompt' : ''}`}>
                 {camState === 'on' && <div className="hint">{hint}</div>}
@@ -661,6 +872,29 @@ export default function ScanPage() {
                 Batch
               </button>
             </div>
+
+            {camState === 'on' && !review && !captured && (
+              <div className="vp-zoom" role="group" aria-label="Zoom">
+                <button onClick={() => changeZoom(zoom - 0.25)} aria-label="Zoom out" title="Zoom out">
+                  −
+                </button>
+                <input
+                  type="range"
+                  min={1}
+                  max={zoomMax > 1 ? zoomMax : CSS_ZOOM_MAX}
+                  step={0.05}
+                  value={zoom}
+                  onChange={(e) => changeZoom(parseFloat(e.target.value))}
+                  aria-label="Zoom level"
+                />
+                <button onClick={() => changeZoom(zoom + 0.25)} aria-label="Zoom in" title="Zoom in">
+                  +
+                </button>
+                <button className="zoom-level" onClick={() => changeZoom(1)} title="Reset zoom to 1×" aria-label="Reset zoom">
+                  {zoom.toFixed(zoom % 1 ? 1 : 0)}×
+                </button>
+              </div>
+            )}
 
             {camState !== 'on' && !captured && camState !== 'paused' && (
               <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 24, textAlign: 'center' }}>
@@ -709,7 +943,7 @@ export default function ScanPage() {
                 <Meter label="Focus" value={(quality.sharpness / 200) * 100} good={!quality.blurry} text={quality.blurry ? 'blurry' : 'sharp'} />
                 <Meter label="Lighting" value={(quality.brightness / 255) * 100} good={!quality.tooDark && !quality.tooBright} text={quality.tooDark ? 'dark' : quality.tooBright ? 'bright' : 'good'} />
                 <Meter label="Glare" value={100 - Math.min(100, quality.glare * 1500)} good={!quality.hasGlare} text={quality.hasGlare ? 'glare' : 'none'} />
-                <Meter label="Card" value={found ? 100 : 10} good={found} text={found ? 'found' : 'searching'} />
+                <Meter label="Card" value={found ? Math.round(conf * 100) : 10} good={found && conf >= 0.6} text={found ? `${Math.round(conf * 100)}%` : 'searching'} />
               </div>
             )}
             <div className="stack">

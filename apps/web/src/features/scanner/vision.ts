@@ -172,7 +172,30 @@ function consensusLine(rows: { v: number; us: number[] }[], guideEdge: number): 
   return bestPts.length ? fitLine(bestPts) : null;
 }
 
+/**
+ * Detect the card around the on-screen guide. The card rarely fills the guide
+ * exactly (held a little nearer or farther), so the search is repeated around
+ * guides scaled to 78% and 128% of the given one and the most confident result
+ * wins. The given guide is tried first and accepted at once when it is already
+ * confident, so the common case costs no more than a single search.
+ */
 export function detectCard(gray: Float32Array, w: number, h: number, guide: Rect): Detection | null {
+  let best: Detection | null = null;
+  for (const sc of [1, 0.78, 1.28]) {
+    const d = detectAtScale(gray, w, h, sc === 1 ? guide : scaleRect(guide, sc));
+    if (d && (!best || d.confidence > best.confidence)) best = d;
+    if (best && best.confidence >= 0.6) break;
+  }
+  return best;
+}
+
+/** Scale a rect about its centre (the card stays centred when the guide is resized). */
+function scaleRect(r: Rect, sc: number): Rect {
+  const w = r.w * sc, h = r.h * sc;
+  return { x: r.x + r.w / 2 - w / 2, y: r.y + r.h / 2 - h / 2, w, h };
+}
+
+function detectAtScale(gray: Float32Array, w: number, h: number, guide: Rect): Detection | null {
   const SAMPLES = 28;
   const bandX = guide.w * 0.22, bandY = guide.h * 0.16;
   type Side = 'left' | 'right' | 'top' | 'bottom';
@@ -195,7 +218,13 @@ export function detectCard(gray: Float32Array, w: number, h: number, guide: Rect
       let prev = g(lo - 1), cur = g(lo);
       for (let u = lo; u <= hi; u++) {
         const next = g(u + 1);
-        if (cur >= EDGE_FLOOR && cur >= prev && cur > next) us.push(u);
+        if (cur >= EDGE_FLOOR && cur >= prev && cur > next) {
+          // parabolic interpolation of the peak: the edge sits between pixels,
+          // and the warp is only as accurate as the corners it is given
+          const den = prev - 2 * cur + next;
+          const frac = den < 0 ? Math.max(-1, Math.min(1, (0.5 * (prev - next)) / den)) : 0;
+          us.push(u + frac);
+        }
         prev = cur;
         cur = next;
       }
@@ -295,6 +324,34 @@ export function autoLevels(img: ImageData): ImageData {
   if (hi - lo < 40) return img;
   const k = 255 / (hi - lo);
   for (let i = 0; i < d.length; i += 4) for (let c = 0; c < 3; c++) d[i + c] = Math.max(0, Math.min(255, (d[i + c]! - lo) * k));
+  return img;
+}
+
+/**
+ * Mild unsharp mask (5-tap Laplacian): adds back the high-frequency detail a
+ * bilinear warp and a soft camera take away, so small print like collector
+ * numbers reads better. Kept gentle — a strong sharpen halos the digits.
+ */
+export function sharpen(img: ImageData, amount = 0.3): ImageData {
+  const { width: w, height: h, data: d } = img;
+  const src = new Uint8ClampedArray(d); // neighbours are read while writing
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = (y * w + x) * 4;
+      for (let c = 0; c < 3; c++) {
+        const v = src[i + c]!;
+        const lap = 4 * v - src[i - 4 + c]! - src[i + 4 + c]! - src[i - w * 4 + c]! - src[i + w * 4 + c]!;
+        d[i + c] = v + amount * lap;
+      }
+    }
+  }
+  return img;
+}
+
+/** Final polish for a warped card: exposure normalization, then a mild sharpen. */
+export function finishCard(img: ImageData): ImageData {
+  autoLevels(img);
+  sharpen(img);
   return img;
 }
 
@@ -460,4 +517,17 @@ export function planCapture(frame: ImageData, live: Quad | null, guide: Rect, mi
     }
   }
   return { original, adjusted: found ? warpCard(frame, found.corners, outW) : null, deviation, needsReview: true };
+}
+
+/**
+ * Correct an uploaded photo: find the card around `guide` and return a
+ * straightened, polished crop — or null when no card is found, in which case
+ * the photo is kept as it is. Same corrector as the camera, without the
+ * keep/retake review (there is nothing to retake).
+ */
+export function correctPhoto(frame: ImageData, guide: Rect, minW = 750, analysisW = 360, maxW = 1500): ImageData | null {
+  const plan = planCapture(frame, null, guide, minW, analysisW, maxW);
+  const img = plan.adjusted ?? (plan.needsReview ? null : plan.original);
+  if (img) finishCard(img);
+  return img;
 }
