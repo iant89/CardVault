@@ -53,7 +53,7 @@ Set `SEED_DEMO=true` to load 8 sample cards (Pikachu, Charizard, Black Lotus, Bl
 
 ## Native install (without Docker)
 
-`scripts/install.sh` sets up CardVault directly on a Linux host (Debian/Ubuntu, Fedora/RHEL or Arch). It installs Node.js 22, pnpm, PostgreSQL, Redis and nginx, clones the repository to `/opt/cardvault`, creates the database and admin account, writes systemd units, and serves the UI on port 8080.
+`scripts/install.sh` sets up CardVault directly on a Linux host (Debian/Ubuntu, Fedora/RHEL or Arch). It installs Node.js 22, pnpm, PostgreSQL, Redis, nginx and Python 3, clones the repository to `/opt/cardvault`, creates the database and admin account, builds the OCR trainer's Python environment, writes systemd units, and serves the UI on port 8080.
 
 ```bash
 git clone https://github.com/iant89/CardVault.git
@@ -116,6 +116,8 @@ pnpm dev:api      # :3000  Fastify
 pnpm dev:worker   # BullMQ workers
 pnpm dev:web      # :5173  Vite (proxies /api → :3000)
 pnpm test         # unit tests (pricing stats, confidence, SSRF guard, robots, hashing, OCR signal extraction)
+
+bash scripts/ocr-python.sh   # optional: the Python for Developer → OCR Lab → Train
 ```
 
 After changing `packages/database/src/schema.ts`, run `pnpm db:generate` to write a new migration into `migrations/`.
@@ -282,4 +284,5 @@ Copy `./backups` to another disk or machine as well.
 - **Upside-down captures** aren't auto-rotated by 180°.
 - **eBay sold prices** need Marketplace Insights API access. Without it, eBay adds listed prices only, and sold-style figures come from the TCGplayer, Scryfall and YGOPRODeck aggregates.
 - **Themes** use CSS gradients only and ship no third-party artwork. To use your own images, set `backgroundImage` in `apps/web/src/themes/index.ts` and put the files in `apps/web/public/themes/`.
+- **Custom OCR trainer** (Developer → OCR Lab → Models → Train) needs a Python with PyTorch on the worker's machine. The native installer sets it up in `storage/ocr/venv`, and OCR Lab's **Set up the OCR trainer** does the same later (a few hundred MB, one time). In Docker it lives on the `storage` volume, so it survives `docker compose up --build`; the download needs the worker container to reach PyPI. On an offline server, run `bash scripts/ocr-python.sh` with a local wheel mirror in `OCR_TRAIN_TORCH_INDEX`.
 - Future-features list (trading, want lists, binders, deck builders, alerts): not started.

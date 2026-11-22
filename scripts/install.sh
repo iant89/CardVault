@@ -932,7 +932,7 @@ install_packages() {
       EXPECTED_SECONDS=60 run "Refresh package index" as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
       task "Installing PostgreSQL, Redis, nginx, Node.js prerequisites and build tools"
       EXPECTED_SECONDS=180 run "Install base packages" as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        curl git ca-certificates openssl nano build-essential python3 postgresql postgresql-contrib postgresql-client redis-server nginx
+        curl git ca-certificates openssl nano build-essential python3 python3-venv postgresql postgresql-contrib postgresql-client redis-server nginx
       if [[ $(node_major) -lt 22 ]]; then
         EXPECTED_SECONDS=45 run "Add NodeSource Node.js 22 repository" bash -c 'curl -fsSL https://deb.nodesource.com/setup_22.x | '"$( [[ $EUID -eq 0 ]] || echo sudo )"' bash -'
         EXPECTED_SECONDS=90 run "Install Node.js 22" as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs
@@ -940,6 +940,9 @@ install_packages() {
       ;;
     rhel)
       EXPECTED_SECONDS=180 run "Install base packages" as_root dnf install -y -q curl git ca-certificates openssl nano gcc gcc-c++ make python3 postgresql-server postgresql-contrib redis nginx
+      # Fedora/RHEL split pip/venv out of the python3 package (either name
+      # provides ensurepip; the CPU wheels the trainer needs are manylinux ones)
+      as_root dnf install -y -q python3-pip >/dev/null 2>&1 || as_root dnf install -y -q python3-virtualenv >/dev/null 2>&1 || true
       if [[ $(node_major) -lt 22 ]]; then
         EXPECTED_SECONDS=45 run "Add NodeSource Node.js 22 repository" bash -c 'curl -fsSL https://deb.nodesource.com/setup_22.x | '"$( [[ $EUID -eq 0 ]] || echo sudo )"' bash -'
         EXPECTED_SECONDS=90 run "Install Node.js 22" as_root dnf install -y -q nodejs
@@ -1121,6 +1124,33 @@ configure_redis() {
   systemctl list-unit-files 2>/dev/null | grep -q '^redis.service' && svc=redis
   as_root systemctl enable --now "$svc" >/dev/null 2>&1 || as_root service "$svc" start >/dev/null 2>&1 || true
   ok "Redis ready"
+}
+
+# ---------------------------------------------------------------------------
+# OCR trainer Python (tools/ocr-trainer)
+# ---------------------------------------------------------------------------
+# Training runs in the worker (Developer → OCR Lab → Models → Train), which
+# needs a Python with CPU PyTorch. scripts/ocr-python.sh builds it in
+# <INSTALL_DIR>/storage/ocr/venv; the worker finds that by itself, so nothing
+# has to be added to .env. Without internet access the install continues: the
+# same setup can be pressed again in OCR Lab later.
+ocr_python_setup() {
+  local script="$INSTALL_DIR/scripts/ocr-python.sh" venv="$INSTALL_DIR/storage/ocr/venv" home
+  if [[ ! -f $script ]]; then
+    warn "scripts/ocr-python.sh missing; the OCR trainer cannot be set up."
+    return 0
+  fi
+  home=$(getent passwd "$INSTALL_USER" | cut -d: -f6) || home=$INSTALL_DIR
+  if as_root runuser -u "$INSTALL_USER" -- env OCR_TRAIN_VENV="$venv" HOME="$home" bash "$script" --check >/dev/null 2>&1; then
+    ok "OCR trainer Python already installed"
+    return 0
+  fi
+  info "Installing PyTorch (CPU) for the OCR trainer — a few hundred MB, one time. Skip with Ctrl-C; OCR Lab can do it later."
+  if EXPECTED_SECONDS=600 run "PyTorch and trainer packages" as_root runuser -u "$INSTALL_USER" -- env HOME="$home" OCR_TRAIN_VENV="$venv" bash "$script"; then
+    ok "OCR trainer ready: Developer → OCR Lab → Models → Train"
+  else
+    warn "OCR trainer Python was not installed. Press “Set up the OCR trainer” in OCR Lab, or run scripts/ocr-python.sh by hand."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1606,7 +1636,7 @@ fresh_install() {
 # The installation itself. On the TUI this runs on the progress screen with
 # raw output captured to the run log; ok/warn/… feed the on-screen checklist.
 fresh_install_runs() {
-  STEP_TOTAL=8
+  STEP_TOTAL=9
   step "Preparing system"
   task "Detecting the operating system"
   detect_os
@@ -1717,6 +1747,9 @@ EOF
   task "Installing the boot-time LAN refresh"
   install_lan_unit
 
+  step "Setting up the OCR trainer"
+  ocr_python_setup
+
   step "Starting CardVault"
   if [[ $boot == yes ]]; then task "Enabling services at boot"; enable_boot; fi
   task "Checking the local firewall"
@@ -1738,6 +1771,8 @@ install_summary() {
     info "Phone camera: use HTTPS or 'Upload photo instead' on plain HTTP."
   fi
   service_status
+  info "OCR trainer (Developer → OCR Lab → Models → Train): use “Set up the OCR trainer” there if it was skipped here."
+  pause
 }
 
 # ---------------------------------------------------------------------------
@@ -1793,6 +1828,9 @@ do_upgrade() {
   EXPECTED_SECONDS=60 run "Update dependencies" bash -c "cd '$INSTALL_DIR' && pnpm install --frozen-lockfile"
   EXPECTED_SECONDS=150 run "Rebuild application" bash -c "cd '$INSTALL_DIR' && pnpm build"
   EXPECTED_SECONDS=20 run "Apply migrations" bash -c "cd '$INSTALL_DIR' && pnpm db:migrate && pnpm db:seed"
+  # installs that predate the in-app trainer have no Python for it yet
+  task "Checking the Python the OCR trainer runs on"
+  ocr_python_setup
   write_config "$INSTALL_DIR" "$branch" "$INSTALL_USER" "$WEB_PORT" "${LAN_ACCESS:-yes}" "${HTTPS_ENABLED:-no}" "${HTTPS_HOST:-}"
   if [[ -f $INSTALL_DIR/scripts/install.sh ]]; then
     install_manager "$INSTALL_DIR/scripts/install.sh"

@@ -40,6 +40,10 @@ const schema = z.object({
   /** OCR trainer (OCR Lab → Models → Train): Python with torch, or its folder. Found automatically when unset. */
   OCR_TRAIN_PYTHON: z.string().optional(),
   OCR_TRAIN_DIR: z.string().optional(),
+  /** Virtual environment the trainer's Python lives in (default: <STORAGE_DIR>/ocr/venv). */
+  OCR_TRAIN_VENV: z.string().optional(),
+  /** Index the setup downloads CPU PyTorch from (default: https://download.pytorch.org/whl/cpu). */
+  OCR_TRAIN_TORCH_INDEX: z.string().url().optional(),
   /** OCR model live trial: confirmed lines needed before a model may be promoted (0 = no trial required). */
   OCR_TRIAL_MIN_LINES: z.coerce.number().int().min(0).default(40),
   /** OCR live watch: confirmed lines / scans needed on each side before judging an active model. */

@@ -5,6 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { WorkerContext } from '../context.js';
 
+const LOG_TAIL = 80;
+
 /**
  * Training runs tools/ocr-trainer/train.py as a child process (CPU PyTorch) and
  * reports its progress into redis (`ocr:train`), the same pattern as the
@@ -14,6 +16,8 @@ import type { WorkerContext } from '../context.js';
 
 export const TRAIN_KEY = 'ocr:train';
 export const TRAIN_CANCEL_KEY = 'ocr:train:cancel';
+/** Whether a Python that can train exists here, and the last setup run. */
+export const PYTHON_KEY = 'ocr:python';
 
 export interface TrainStatus {
   status: 'queued' | 'starting' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -85,12 +89,17 @@ export function findTrainerDir(configured?: string): string | null {
 
 /**
  * A Python interpreter that can import torch and pillow: OCR_TRAIN_PYTHON when
- * set, otherwise the README's ~/ocr-venv, then python3/python on PATH.
+ * set, otherwise the venv this project's setup creates (OCR_TRAIN_VENV, then
+ * ~/ocr-venv — scripts/ocr-python.sh installs it there), then a virtualenv
+ * inside the storage folder (what the Docker image uses), then python3/python
+ * on PATH.
  */
-export function findTrainPython(configured?: string): { python: string; error?: string } {
+export function findTrainPython(configured?: string, storageDir?: string, venv?: string): { python: string; error?: string } {
+  const homes = [path.join(homedir(), 'ocr-venv'), '/opt/cardvault/ocr-venv'];
+  const venvDirs = [...new Set([venv, ...homes, storageDir ? path.join(storageDir, 'ocr', 'venv') : undefined].filter((v): v is string => !!v))];
   const candidates = configured
     ? [configured]
-    : [path.join(homedir(), 'ocr-venv', 'bin', 'python'), path.join(homedir(), 'ocr-venv', 'bin', 'python3'), 'python3', 'python'];
+    : [...venvDirs.flatMap((v) => [path.join(v, 'bin', 'python'), path.join(v, 'bin', 'python3')]), 'python3', 'python'];
   for (const c of candidates) {
     const probe = spawnSync(c, ['-c', 'import torch, PIL'], { timeout: 60_000, windowsHide: true, stdio: 'ignore' });
     if (!probe.error && probe.status === 0) return { python: c };
@@ -98,12 +107,139 @@ export function findTrainPython(configured?: string): { python: string; error?: 
   return {
     python: '',
     error: configured
-      ? `${configured} cannot import torch and pillow. Install tools/ocr-trainer/requirements.txt into it.`
-      : 'No Python with torch and pillow found (tried ~/ocr-venv/bin/python, python3, python). Install tools/ocr-trainer/requirements.txt (see its README) or set OCR_TRAIN_PYTHON.',
+      ? `${configured} cannot import torch and pillow. Install tools/ocr-trainer/requirements.txt into it, or clear OCR_TRAIN_PYTHON to let CardVault set it up.`
+      : 'No Python with torch and pillow found (tried the trainer venv, python3, python). Press “Set up the OCR trainer” above, run bash scripts/ocr-python.sh on this server, or set OCR_TRAIN_PYTHON.',
   };
 }
 
-const LOG_TAIL = 80;
+/** The path scripts/ocr-python.sh builds (and the app's setup button reports). */
+export function trainVenvDir(config: { OCR_TRAIN_VENV?: string }, storageDir: string): string {
+  return config.OCR_TRAIN_VENV || path.join(storageDir, 'ocr', 'venv');
+}
+
+/** Path of the setup script, found the same way as the trainer itself. */
+export function findSetupScript(trainerDir: string): string {
+  return path.join(path.dirname(trainerDir), '..', 'scripts', 'ocr-python.sh');
+}
+
+export interface PythonStatus {
+  status: 'unknown' | 'missing' | 'ready' | 'installing' | 'failed';
+  python?: string;
+  error?: string;
+  /** line of setup output being run now (install only) */
+  step?: number;
+  venv?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  updatedAt: string;
+  log: string[];
+}
+
+/** Store the last interpreter check / setup run for OCR Lab. */
+export async function savePythonStatus(ctx: WorkerContext, patch: Partial<PythonStatus>): Promise<PythonStatus> {
+  const raw = await ctx.redis.get(PYTHON_KEY).catch(() => null);
+  const before = raw ? (JSON.parse(raw) as PythonStatus) : ({ status: 'unknown', log: [], updatedAt: '' } as PythonStatus);
+  const status: PythonStatus = { ...before, ...patch, updatedAt: new Date().toISOString() };
+  await ctx.redis.set(PYTHON_KEY, JSON.stringify(status), 'EX', 7 * 24 * 3600).catch(() => undefined);
+  return status;
+}
+
+const SETUP_STEPS: { at: RegExp; step: number }[] = [
+  { at: /^==> creating/, step: 1 },
+  { at: /^==> reusing/, step: 1 },
+  { at: /^==> installing PyTorch/, step: 2 },
+  { at: /^==> the CPU index/, step: 2 },
+  { at: /^==> installing the trainer/, step: 3 },
+];
+
+/** Which phase of the setup a script line belongs to (0 = not a phase line). */
+export function setupStep(line: string): number {
+  return SETUP_STEPS.find((s) => s.at.test(line))?.step ?? 0;
+}
+
+/** pip's progress bars are one long line with carriage returns: keep only the tail. */
+export const shortenLine = (line: string) => {
+  const parts = line.split(/\r+/).map((x) => x.trim()).filter(Boolean);
+  const last = parts.at(-1) ?? line;
+  return last.length > 300 ? `…${last.slice(-300)}` : last;
+};
+
+/**
+ * Run scripts/ocr-python.sh: creates the venv, installs CPU PyTorch and the
+ * trainer's requirements, and reports each phase into OCR Lab. Idempotent — a
+ * healthy environment finishes in a second, so the same job also serves as the
+ * "check" the Train button runs before starting.
+ */
+export async function setupOcrPython(ctx: WorkerContext): Promise<PythonStatus> {
+  const trainerDir = findTrainerDir(ctx.config.OCR_TRAIN_DIR);
+  const venv = trainVenvDir(ctx.config, ctx.storageDir);
+  const configured = ctx.config.OCR_TRAIN_PYTHON;
+  if (!trainerDir) return savePythonStatus(ctx, { status: 'failed', error: 'tools/ocr-trainer/train.py was not found on this server.', finishedAt: new Date().toISOString() });
+
+  // an explicitly configured interpreter is never replaced: only report on it
+  if (configured) {
+    const { python, error } = findTrainPython(configured, ctx.storageDir, venv);
+    return savePythonStatus(ctx, python ? { status: 'ready', python, error: undefined } : { status: 'failed', error });
+  }
+
+  const script = findSetupScript(trainerDir);
+  if (!existsSync(script)) return savePythonStatus(ctx, { status: 'failed', venv, error: `The setup script ${script} was not found on this server.` });
+
+  await savePythonStatus(ctx, { status: 'installing', step: 0, venv, log: [], startedAt: new Date().toISOString(), error: undefined, python: undefined });
+  ctx.log.info({ venv, script }, 'OCR trainer Python setup starting');
+
+  // a minimal environment: setup needs no CardVault secrets. HOME picks up
+  // ~/ocr-venv for people following the README; the venv itself lives under storage.
+  const env: NodeJS.ProcessEnv = {};
+  for (const k of ['PATH', 'HOME', 'LANG', 'TZ', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'PIP_INDEX_URL', 'PIP_EXTRA_INDEX_URL']) if (process.env[k]) env[k] = process.env[k];
+  env.OCR_TRAIN_VENV = venv;
+
+  return new Promise<PythonStatus>((resolve) => {
+    const child = spawn('/bin/bash', [script], { cwd: path.dirname(path.dirname(script)), env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let log: string[] = [];
+    let step = 0;
+    let pending = '';
+    const push = (raw: string) => {
+      const line = shortenLine(raw);
+      if (!line) return;
+      log = [...log, line].slice(-LOG_TAIL);
+      const found = setupStep(line);
+      if (found > step) {
+        step = found;
+        void savePythonStatus(ctx, { status: 'installing', step, log });
+      } else void savePythonStatus(ctx, { log });
+    };
+    const consume = (chunk: Buffer) => {
+      pending += chunk.toString('utf8');
+      const parts = pending.split('\n');
+      pending = parts.pop() ?? '';
+      for (const p of parts) push(p.replace(/\r$/, ''));
+    };
+    child.stdout.on('data', consume);
+    child.stderr.on('data', consume);
+    child.on('error', (e) => {
+      void savePythonStatus(ctx, { status: 'failed', venv, error: `Could not run the setup script: ${e.message}`, finishedAt: new Date().toISOString() }).then(resolve);
+    });
+    child.on('exit', (code) => {
+      if (pending) push(pending);
+      const finishedAt = new Date().toISOString();
+      if (code === 0) {
+        const python = path.join(venv, 'bin', 'python');
+        ctx.log.info({ venv }, 'OCR trainer Python ready');
+        void savePythonStatus(ctx, { status: 'ready', python, step: 3, log, finishedAt }).then(resolve);
+        return;
+      }
+      const tail = log.slice(-12).join('\n');
+      const hint =
+        code === 2
+          ? 'Python 3 is not installed on this server.'
+          : 'The setup could not finish. The log above shows why (no internet access to PyPI, python3-venv missing, disk space…).';
+      ctx.log.warn({ code, venv }, 'OCR trainer Python setup failed');
+      void savePythonStatus(ctx, { status: 'failed', venv, error: `${hint}\n${tail}`, finishedAt, log }).then(resolve);
+    });
+  });
+}
+
 const clamp = (v: unknown, lo: number, hi: number, dflt: number) => {
   const n = Number(v);
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : dflt;
@@ -129,9 +265,15 @@ export async function trainModel(
   if (!trainerDir) {
     return save({ status: 'failed', error: 'tools/ocr-trainer/train.py was not found on this server.', finishedAt: new Date().toISOString() });
   }
-  const { python, error: pyError } = findTrainPython(ctx.config.OCR_TRAIN_PYTHON);
-  if (!python) return save({ status: 'failed', error: pyError, finishedAt: new Date().toISOString() });
+  const { python, error: pyError } = findTrainPython(ctx.config.OCR_TRAIN_PYTHON, ctx.storageDir, ctx.config.OCR_TRAIN_VENV);
+  if (!python) {
+    // OCR Lab asks the admin to press "Set up the OCR trainer" and offers the
+    // manual command; keep the interpreter report in step with what we saw.
+    await savePythonStatus(ctx, { status: 'missing', error: pyError });
+    return save({ status: 'failed', error: pyError, finishedAt: new Date().toISOString() });
+  }
   await save({ python, startedAt: new Date().toISOString() });
+  await savePythonStatus(ctx, { status: 'ready', python, error: undefined });
 
   const args = [
     '-u',

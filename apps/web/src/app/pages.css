@@ -175,3 +175,13 @@
   .login .clock .t { font-size: 76px; }
   .login .center { margin-top: 14vh; }
 }
+
+/* OCR Lab → Models → Train: the Python the trainer runs on */
+.ocr-python { width: 100%; display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: rgba(0,0,0,.18); font-size: 13px; }
+.ocr-python.ready { border-color: rgba(76, 175, 80, .4); }
+.ocr-python.failed, .ocr-python.missing { border-color: rgba(244, 67, 54, .4); }
+.ocr-python code { font-size: 12px; word-break: break-all; }
+.ocr-python-steps { list-style: none; margin: 2px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; }
+.ocr-python-steps li.done { color: var(--good); }
+.ocr-python-steps li.now { color: var(--warn); font-weight: 600; }
+.ocr-python-steps li.next { color: var(--text-2); opacity: .7; }
