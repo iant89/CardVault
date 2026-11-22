@@ -18,6 +18,20 @@ node tools/tcgdex-harvester/src/server.mjs
 3. **Start**. Close the browser if you like: downloads continue in the
    background, and the page picks up the live feed again when reopened.
 
+## From CardVault
+
+Administrators get a **Developer** menu in CardVault's nav bar. *Start &
+open* launches the harvester on the server (if it isn't already running) and
+opens its dashboard in a new tab. The menu shows live progress and can stop
+it. The dashboard is served through CardVault's own address
+(`/api/dev/harvester/app/`), so it works from any device that can open
+CardVault. The harvester itself still listens on `127.0.0.1` only, and every
+request passes CardVault's login, admin check and CSRF check first.
+
+Settings (`.env`): `DEV_TOOLS=false` hides the menu; `HARVESTER_PORT`
+(default 4777); `HARVESTER_OUT_DIR` (default `$STORAGE_DIR/tcgdex-data`).
+Its log is `.harvester/server.log` in that folder.
+
 ## Features
 
 | | |

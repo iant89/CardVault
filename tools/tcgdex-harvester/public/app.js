@@ -20,10 +20,15 @@ const fmtDur = (sec) => {
 const fmtTime = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
 const hue = (s) => [...String(s)].reduce((a, c) => (a * 31 + c.charCodeAt(0)) % 360, 7);
 
+// Opened from CardVault's Developer menu, this page is served through
+// CardVault, which requires its CSRF token on every change.
+const csrf = () => /(?:^|;\s*)cv_csrf=([^;]+)/.exec(document.cookie)?.[1];
+
 async function api(path, body) {
   const res = await fetch(path, {
     method: body === undefined ? 'GET' : 'POST',
-    headers: body === undefined ? {} : { 'content-type': 'application/json' },
+    headers: body === undefined ? {} : { 'content-type': 'application/json', ...(csrf() ? { 'x-csrf-token': decodeURIComponent(csrf()) } : {}) },
+    credentials: 'same-origin',
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
@@ -69,7 +74,7 @@ const state = {
 
 let es;
 function connect() {
-  es = new EventSource('/events');
+  es = new EventSource('events');
   es.addEventListener('hello', (e) => {
     const d = JSON.parse(e.data);
     $('#conn').classList.add('live');
@@ -253,7 +258,7 @@ window.addEventListener('resize', () => state.stats && drawChart(state.stats.cha
 
 function setCardHtml(s) {
   const h = hue(s.id);
-  const logo = s.localLogo ? `<img src="/files/${encodeURI(s.localLogo)}" alt="">` : esc(s.id.slice(0, 5).toUpperCase());
+  const logo = s.localLogo ? `<img src="files/${encodeURI(s.localLogo)}" alt="">` : esc(s.id.slice(0, 5).toUpperCase());
   return `<div class="set${s.selected ? ' selected' : ''}" data-id="${esc(s.id)}" role="checkbox" aria-checked="${!!s.selected}" tabindex="0">
     <span class="check"></span>
     <div class="top">
@@ -310,7 +315,7 @@ function updateSetCards() {
       delete act.dataset.on;
       act.innerHTML = '';
     }
-    if (s.localLogo && !el.querySelector('.logo img')) el.querySelector('.logo').innerHTML = `<img src="/files/${encodeURI(s.localLogo)}" alt="">`;
+    if (s.localLogo && !el.querySelector('.logo img')) el.querySelector('.logo').innerHTML = `<img src="files/${encodeURI(s.localLogo)}" alt="">`;
   }
 }
 
@@ -331,7 +336,7 @@ async function select(ids, selected) {
     if (s) s.selected = selected;
   }
   renderSets();
-  await api('/api/select', { ids, selected }).catch((e) => toast(e.message, 'error'));
+  await api('api/select', { ids, selected }).catch((e) => toast(e.message, 'error'));
 }
 
 $('#sets').addEventListener('click', (e) => {
@@ -340,7 +345,7 @@ $('#sets').addEventListener('click', (e) => {
   const serie = e.target.closest('[data-serie]');
   if (prio && card) {
     e.stopPropagation();
-    api(`/api/sets/${encodeURIComponent(card.dataset.id)}/prioritize`, {}).then((r) => toast(`${r.moved} items moved to the front.`));
+    api(`api/sets/${encodeURIComponent(card.dataset.id)}/prioritize`, {}).then((r) => toast(`${r.moved} items moved to the front.`));
     return;
   }
   if (serie) {
@@ -377,7 +382,7 @@ async function loadQueue() {
   const want = q.pendingVersion ?? q.version;
   try {
     const p = new URLSearchParams({ status: q.status, kind: q.kind, q: q.q, limit: String(q.limit) });
-    const d = await api(`/api/queue?${p}`);
+    const d = await api(`api/queue?${p}`);
     q.version = want;
     renderQueue(d);
   } catch (e) {
@@ -421,7 +426,7 @@ $('#queue').addEventListener('click', async (e) => {
   if (!b) return;
   const row = b.closest('.q-row');
   if (b.dataset.act === 'view') return openLightbox(row.dataset.file, row.dataset.label);
-  const r = await api(`/api/queue/${encodeURIComponent(row.dataset.id)}/${b.dataset.act}`, {}).catch((err) => toast(err.message, 'error'));
+  const r = await api(`api/queue/${encodeURIComponent(row.dataset.id)}/${b.dataset.act}`, {}).catch((err) => toast(err.message, 'error'));
   if (r && !r.ok) toast('That item changed in the meantime.', 'error');
   refreshQueue(true);
 });
@@ -445,7 +450,7 @@ $('#queueMore').onclick = () => {
   state.queue.limit += 200;
   refreshQueue(true);
 };
-$('#retryFailed').onclick = () => api('/api/retry-failed', {}).then((r) => toast(r.retried ? `Retrying ${r.retried} items.` : 'Nothing has failed.'));
+$('#retryFailed').onclick = () => api('api/retry-failed', {}).then((r) => toast(r.retried ? `Retrying ${r.retried} items.` : 'Nothing has failed.'));
 $('#tileFailed').onclick = () => {
   switchTab('queue');
   $$('#qStatus button').forEach((x) => x.classList.toggle('on', x.dataset.v === 'failed'));
@@ -459,7 +464,7 @@ function thumb(i) {
   const el = document.createElement('button');
   el.className = 'card-thumb';
   el.title = i.label;
-  el.innerHTML = `<img loading="lazy" src="/files/${encodeURI(i.file)}" alt=""><span>${esc(i.label.split(' · ')[0])}</span>`;
+  el.innerHTML = `<img loading="lazy" src="files/${encodeURI(i.file)}" alt=""><span>${esc(i.label.split(' · ')[0])}</span>`;
   el.onclick = () => openLightbox(i.file, i.label);
   return el;
 }
@@ -478,7 +483,7 @@ function addImage(i) {
 }
 function openLightbox(file, label) {
   const lb = $('#lightbox');
-  lb.querySelector('img').src = `/files/${encodeURI(file)}`;
+  lb.querySelector('img').src = `files/${encodeURI(file)}`;
   lb.querySelector('p').textContent = `${label ?? ''}\n${file}`;
   lb.hidden = false;
 }
@@ -524,7 +529,7 @@ let settingsTimer;
 function pushSettings(patch) {
   state.settingsDirty = Date.now();
   clearTimeout(settingsTimer);
-  settingsTimer = setTimeout(() => api('/api/settings', patch).catch((e) => toast(e.message, 'error')), 250);
+  settingsTimer = setTimeout(() => api('api/settings', patch).catch((e) => toast(e.message, 'error')), 250);
 }
 $('#rate').addEventListener('input', (e) => {
   $('#rateOut').textContent = e.target.value;
@@ -556,9 +561,9 @@ for (const [id, key] of [['#optQuality', 'quality'], ['#optFormat', 'format']]) 
 
 async function discover() {
   try {
-    const r = await api('/api/discover', {});
+    const r = await api('api/discover', {});
     toast(`Found ${r.catalog.sets.length} sets.`);
-    const sets = await api('/api/sets');
+    const sets = await api('api/sets');
     state.sets = new Map(sets.sets.map((s) => [s.id, s]));
     renderSets();
   } catch (e) {
@@ -569,17 +574,17 @@ $('#btnDiscover').onclick = discover;
 $('#btnDiscover2').onclick = discover;
 $('#btnStart').onclick = async () => {
   if (![...state.sets.values()].some((s) => s.selected) && !state.stats?.counts.pending) return toast('Select at least one set first.', 'error');
-  await api('/api/start', { plan: true });
-  const sets = await api('/api/sets');
+  await api('api/start', { plan: true });
+  const sets = await api('api/sets');
   state.sets = new Map(sets.sets.map((s) => [s.id, s]));
   renderSets();
 };
-$('#btnPause').onclick = () => api('/api/pause', {});
-$('#btnResume').onclick = () => api('/api/resume', {});
+$('#btnPause').onclick = () => api('api/pause', {});
+$('#btnResume').onclick = () => api('api/resume', {});
 $('#btnClear').onclick = async () => {
   if (!confirm('Drop everything that has not been downloaded yet? Files already saved stay.')) return;
-  await api('/api/clear', {});
-  const sets = await api('/api/sets');
+  await api('api/clear', {});
+  const sets = await api('api/sets');
   state.sets = new Map(sets.sets.map((s) => [s.id, s]));
   renderSets();
   refreshQueue(true);
@@ -598,8 +603,8 @@ document.addEventListener('keydown', (e) => {
   if (e.target.closest('input, select, textarea')) return;
   if (e.key === ' ' && !e.target.closest('button, .set')) {
     e.preventDefault();
-    if (state.stats?.status === 'running') api('/api/pause', {});
-    else if (state.stats?.status === 'paused') api('/api/resume', {});
+    if (state.stats?.status === 'running') api('api/pause', {});
+    else if (state.stats?.status === 'paused') api('api/resume', {});
   }
   if (e.key === '/') {
     e.preventDefault();
@@ -613,5 +618,8 @@ document.addEventListener('keydown', (e) => {
 setInterval(() => {
   if (state.tab === 'queue' && state.stats?.status === 'running') refreshQueue();
 }, 3000);
+
+// served through CardVault's Developer menu: offer the way back
+if (location.pathname.startsWith('/api/dev/harvester/')) $('#backLink').hidden = false;
 
 connect();

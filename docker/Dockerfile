@@ -10,6 +10,8 @@ COPY pnpm-lock.yaml pnpm-workspace.yaml package.json tsconfig.base.json ./
 COPY packages ./packages
 COPY apps ./apps
 COPY migrations ./migrations
+# developer tools (Developer menu → TCGdex Harvester); no dependencies to install
+COPY tools ./tools
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 RUN pnpm -r run build
 # Drop dev dependencies for the runtime images. (`pnpm prune` drops workspace

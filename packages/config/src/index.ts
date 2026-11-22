@@ -29,6 +29,14 @@ const schema = z.object({
   WORKER_CONCURRENCY: z.coerce.number().int().default(2),
   OCR_ENABLED: bool.default(true),
   OCR_LANG_PATH: z.string().optional(),
+  /** Developer menu (admins only): tools under tools/ that CardVault can start and open. */
+  DEV_TOOLS: bool.default(true),
+  /** TCGdex Harvester: localhost port, its folder (found automatically), and where it saves downloads. */
+  HARVESTER_PORT: z.coerce.number().int().default(4777),
+  HARVESTER_DIR: z.string().optional(),
+  HARVESTER_OUT_DIR: z.string().optional(),
+  /** Override the TCGdex API address (testing against tools/tcgdex-harvester/test/mock-tcgdex.mjs). */
+  HARVESTER_API: z.string().url().optional(),
 });
 
 export type AppConfig = z.infer<typeof schema>;

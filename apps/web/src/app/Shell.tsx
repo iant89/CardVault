@@ -5,6 +5,7 @@ import { useLive, ACTIVE_STATES } from '../stores/live';
 import { Avatar, Toasts } from '../components/ui';
 import { JobMonitor } from '../features/queue/JobMonitor';
 import { useOfflineQueue } from '../features/scanner/offlineQueue';
+import { DevMenu } from './DevMenu';
 
 const NAV = [
   { to: '/', label: 'Home', ico: '⌂', end: true },
@@ -51,6 +52,7 @@ export function Shell({ children }: { children: ReactNode }) {
           ))}
         </nav>
         <div className="spacer" />
+        {user!.role === 'ADMIN' && <DevMenu />}
         <span className="hide-mobile faint" title={connected ? 'Live updates connected' : 'Reconnecting…'}>
           <span className={`dot ${connected ? 'good' : 'warn pulse'}`} />
         </span>

@@ -5,3 +5,5 @@
 storage
 backups
 *.log
+tools/*/tcgdex-data
+tools/*/demo-data
