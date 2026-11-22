@@ -62,6 +62,35 @@ describe('detectCard', () => {
     expect(maxCornerError(d!.corners, f.truth)).toBeLessThan(3);
   });
 
+  it('ignores background clutter: a remote, another card and bright specks around the card', () => {
+    // mimics a real photo: card on a busy desk
+    const f = frame({ deg: 2, bg: 30, border: 225, body: 240, title: 40 });
+    const ch = 158, cw = ch * CARD_RATIO, cx = f.W / 2, cy = f.H / 2;
+    const set = (x: number, y: number, v: number) => {
+      if (x >= 0 && y >= 0 && x < f.W && y < f.H) f.g[y * f.W + x] = v;
+    };
+    // a long straight bright bar slanting down through the right-hand search band
+    const x0 = cx + cw / 2 + 6, y0 = 0, x1 = f.W, y1 = f.H * 0.7;
+    for (let y = 0; y < f.H; y++)
+      for (let x = Math.floor(cx + cw / 2 + 4); x < f.W; x++) {
+        const t = Math.max(0, Math.min(1, ((x - x0) * (x1 - x0) + (y - y0) * (y1 - y0)) / ((x1 - x0) ** 2 + (y1 - y0) ** 2)));
+        if (Math.hypot(x - (x0 + t * (x1 - x0)), y - (y0 + t * (y1 - y0))) < 5) set(x, y, 235);
+      }
+    // part of another card in the lower-left search band
+    for (let y = Math.floor(f.H * 0.55); y < f.H; y++) for (let x = 0; x < cx - cw / 2 - 5 - (y - f.H * 0.55) * 0.3; x++) set(x, y, 210);
+    // bright specks everywhere outside the card
+    let seed = 11;
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    for (let i = 0; i < 140; i++) {
+      const x = Math.floor(rnd() * f.W), y = Math.floor(rnd() * f.H);
+      if (Math.abs(x - cx) < cw / 2 + 3 && Math.abs(y - cy) < ch / 2 + 3) continue;
+      for (let dy = 0; dy < 3; dy++) for (let dx = 0; dx < 3; dx++) set(x + dx, y + dy, 255);
+    }
+    const d = detectCard(f.g, f.W, f.H, f.guide);
+    expect(d).not.toBeNull();
+    expect(maxCornerError(d!.corners, f.truth)).toBeLessThan(3);
+  });
+
   it('returns nothing on an empty table', () => {
     const f = frame({ deg: 0, bg: 21, border: 21, body: 21, title: 21 });
     expect(detectCard(f.g, f.W, f.H, f.guide)).toBeNull();

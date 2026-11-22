@@ -115,6 +115,63 @@ function fitLine(pts: { u: number; v: number }[]): { a: number; b: number; inlie
  * scan-lines across the expected edge, take the outermost strong gradient
  * and fit a line; the four line intersections are the card corners.
  */
+/** Steepest tilt (slope) accepted for a card side relative to the guide: ~20°. */
+const MAX_TILT = 0.36;
+/**
+ * Largest slope difference allowed between opposite card sides (~14°). A card
+ * lying on a desk seen from an angled camera is a mild trapezoid (≈0.15);
+ * an outline mixing card and background edges is typically far beyond this.
+ */
+const MAX_SKEW = 0.25;
+/** Support (in scan-lines) a candidate line loses per pixel of distance from the guide edge. */
+const GUIDE_PULL = 0.25;
+
+/**
+ * The card's edge is the one straight line running along the whole side;
+ * background edges are scattered or cover only part of it. From per-scan-line
+ * edge candidates, find the line (u = a·v + b) supported by the most scan
+ * lines (RANSAC-style, deterministic), discounted by its distance from the
+ * guide edge, then least-squares refit on its inliers.
+ */
+function consensusLine(rows: { v: number; us: number[] }[], guideEdge: number): { a: number; b: number; inliers: number } | null {
+  const filled = rows.filter((r) => r.us.length);
+  if (filled.length < 6) return null;
+  const TOL = 1.6;
+  const support = (a: number, b: number) => {
+    const pts: { u: number; v: number }[] = [];
+    for (const r of filled) {
+      const want = a * r.v + b;
+      let best = Infinity, bu = 0;
+      for (const u of r.us) {
+        const d = Math.abs(u - want);
+        if (d < best) (best = d), (bu = u);
+      }
+      if (best <= TOL) pts.push({ u: bu, v: r.v });
+    }
+    return pts;
+  };
+  let bestPts: { u: number; v: number }[] = [];
+  let bestScore = -Infinity;
+  let seed = 9301;
+  const rnd = (n: number) => (seed = (seed * 16807) % 2147483647) % n;
+  const half = Math.floor(filled.length / 2);
+  for (let it = 0; it < 240; it++) {
+    // one point from each half of the side keeps the pair well separated
+    const r1 = filled[rnd(half)]!, r2 = filled[half + rnd(filled.length - half)]!;
+    const u1 = r1.us[rnd(r1.us.length)]!, u2 = r2.us[rnd(r2.us.length)]!;
+    if (r2.v === r1.v) continue;
+    const a = (u2 - u1) / (r2.v - r1.v);
+    if (Math.abs(a) > MAX_TILT) continue;
+    const b = u1 - a * r1.v;
+    const pts = support(a, b);
+    const mid = a * ((filled[0]!.v + filled[filled.length - 1]!.v) / 2) + b;
+    // the card sits in the guide: a line far outside it needs clearly more support to win
+    const score = pts.length - GUIDE_PULL * Math.abs(mid - guideEdge);
+    if (score > bestScore) (bestScore = score), (bestPts = pts);
+  }
+  return bestPts.length ? fitLine(bestPts) : null;
+}
+
 export function detectCard(gray: Float32Array, w: number, h: number, guide: Rect): Detection | null {
   const SAMPLES = 28;
   const bandX = guide.w * 0.22, bandY = guide.h * 0.16;
@@ -123,37 +180,34 @@ export function detectCard(gray: Float32Array, w: number, h: number, guide: Rect
 
   for (const side of ['left', 'right', 'top', 'bottom'] as Side[]) {
     const vertical = side === 'left' || side === 'right';
-    const pts: { u: number; v: number }[] = [];
+    const edge = vertical ? (side === 'left' ? guide.x : guide.x + guide.w) : side === 'top' ? guide.y : guide.y + guide.h;
+    const band = vertical ? bandX : bandY;
+    const lim = vertical ? w : h;
+    const lo = Math.max(2, Math.round(edge - band));
+    const hi = Math.min(lim - 3, Math.round(edge + band));
+    // every edge candidate on every scan-line: local gradient maxima above the floor
+    const rows: { v: number; us: number[] }[] = [];
     for (let s = 0; s < SAMPLES; s++) {
       const t = 0.15 + (0.7 * s) / (SAMPLES - 1);
-      const v = Math.round(vertical ? guide.y + guide.h * t : guide.x + guide.w * t);
-      const edge = vertical ? (side === 'left' ? guide.x : guide.x + guide.w) : side === 'top' ? guide.y : guide.y + guide.h;
-      const band = vertical ? bandX : bandY;
-      const lim = vertical ? w : h;
-      // scan from outside → inside
-      const outer = side === 'left' || side === 'top' ? Math.max(2, Math.round(edge - band)) : Math.min(lim - 3, Math.round(edge + band));
-      const inner = side === 'left' || side === 'top' ? Math.min(lim - 3, Math.round(edge + band)) : Math.max(2, Math.round(edge - band));
-      const step = outer < inner ? 1 : -1;
-      const vv = Math.min(Math.max(v, 2), (vertical ? h : w) - 3);
-      let best = 0;
-      const vals: number[] = [];
-      for (let u = outer; u !== inner; u += step) {
-        const gm = vertical ? gradAt(gray, w, u, vv, true) : gradAt(gray, w, vv, u, false);
-        vals.push(gm);
-        if (gm > best) best = gm;
+      const v = Math.min(Math.max(Math.round(vertical ? guide.y + guide.h * t : guide.x + guide.w * t), 2), (vertical ? h : w) - 3);
+      const g = (u: number) => (vertical ? gradAt(gray, w, u, v, true) : gradAt(gray, w, v, u, false));
+      const us: number[] = [];
+      let prev = g(lo - 1), cur = g(lo);
+      for (let u = lo; u <= hi; u++) {
+        const next = g(u + 1);
+        if (cur >= EDGE_FLOOR && cur >= prev && cur > next) us.push(u);
+        prev = cur;
+        cur = next;
       }
-      if (best < 60) continue; // no edge on this scan-line
-      // Outermost edge above a fixed strength floor: a weak card border on a
-      // dark table must win over strong artwork/text edges further inside.
-      // (Random table texture outside the card is rejected by the line fit.)
-      const thr = Math.min(best * 0.55, EDGE_FLOOR);
-      const k = vals.findIndex((x) => x >= thr);
-      if (k >= 0) pts.push({ u: outer + k * step, v: vv });
+      rows.push({ v, us });
     }
-    const line = fitLine(pts);
+    const line = consensusLine(rows, edge);
     if (!line || line.inliers < SAMPLES * 0.45) return null;
     lines[side] = line;
   }
+  // opposite sides of a card seen roughly head-on are close to parallel; a
+  // quad mixing card and background edges usually isn't
+  if (Math.abs(lines.left!.a - lines.right!.a) > MAX_SKEW || Math.abs(lines.top!.a - lines.bottom!.a) > MAX_SKEW) return null;
   const L = lines.left!, R = lines.right!, T = lines.top!, B = lines.bottom!;
   // vertical lines: x = a*y + b ; horizontal lines: y = a*x + b
   const meet = (v: { a: number; b: number }, hz: { a: number; b: number }): Pt => {
