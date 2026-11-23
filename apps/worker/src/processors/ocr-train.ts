@@ -450,6 +450,9 @@ export async function trainModel(
     '--epochs', String(epochs),
     '--synthetic', String(synthetic),
     '--max-minutes', String(maxMinutes),
+    // a time limit set in the lab's form is a deliberate cut-off: keep the best
+    // epoch instead of discarding the run that hit it
+    ...(maxMinutes ? ['--time-limit-danger'] : []),
     '--progress-every', '1',
     '--samples', String(RECENT_SAMPLES),
   ];

@@ -114,6 +114,7 @@ def main():
     ap.add_argument("--max-minutes", type=float, default=0, help="stop after this long (0 = no limit)")
     ap.add_argument("--progress-every", type=int, default=10, help="print a step line every N batches (0 = only epochs)")
     ap.add_argument("--samples", type=int, default=12, help="held-out lines to report each epoch (0 = none)")
+    ap.add_argument("--time-limit-danger", action="store_true", help="with --max-minutes, exit 0 and keep the best model instead of stopping")
     args = ap.parse_args()
 
     # counts keys and card names carry non-ASCII (·, é, ♂ …): never let a
@@ -231,7 +232,11 @@ def main():
             best_epoch = epoch
         if args.max_minutes and mins >= args.max_minutes:
             print("time limit reached")
-            break
+            if args.time_limit_danger:
+                # an explicit choice in the lab's form: keep what has been learned
+                # rather than throwing away a run that hit its wall-clock limit
+                break
+            sys.exit("time limit reached before the last epoch; nothing was written (raise the limit or the epochs)")
     model.load_state_dict(best_state)
     model.eval()
 

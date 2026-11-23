@@ -1033,6 +1033,11 @@ export function TrainingTab({ d, act, busy, trainActive }: { d: Overview; act: (
                   Stop after minutes (0 = no limit)
                   <input className="input" type="number" min={0} max={10080} value={form.maxMinutes} onChange={(e) => setForm({ ...form, maxMinutes: +e.target.value })} />
                 </label>
+                {!!form.maxMinutes && (
+                  <p className="faint" style={{ fontSize: 12, margin: 0 }}>
+                    Hitting the limit keeps the best epoch so far and writes that model — a deliberate cut-off, not a failed run.
+                  </p>
+                )}
                 {!pyReady && (
                   <p className="faint" style={{ fontSize: 12, margin: 0 }}>
                     {pyMissing
