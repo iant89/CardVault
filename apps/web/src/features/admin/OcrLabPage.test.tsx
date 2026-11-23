@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { TrainerPythonPanel } from './OcrLabPage';
+import { TrainerPythonPanel } from './ocr/TrainerPythonPanel';
 
 const steps = ['Virtual environment', 'PyTorch (CPU build)', 'Trainer packages'];
 const base = { steps, venv: '/data/storage/ocr/venv', configured: false, manual: 'bash scripts/ocr-python.sh', setupScript: '/app/scripts/ocr-python.sh', log: [] as string[] };

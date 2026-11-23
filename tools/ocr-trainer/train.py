@@ -41,19 +41,48 @@ def levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 
-def evaluate(model, loader, charset):
+def evaluate(model, loader, charset, samples: int = 0, offset: int = 0, storage: str = ""):
+    """Score the held-out lines.
+
+    Returns the per-field statistics plus the last `samples` lines as they were
+    read: what the model saw, what it said, what the line really holds and how
+    sure it was. OCR Lab lists those while training, so it is visible whether
+    the model is learning (and guessing confidently) or merely guessing.
+    """
     model.eval()
     stats = {"name": [0, 0, 0.0], "number": [0, 0, 0.0]}
+    seen: list[dict] = []
+    paths = getattr(loader.dataset, "paths", None) or []
+    base = 0  # index into `paths` of the first line in the current batch
     with torch.no_grad():
         for img, _w, _t, _l, texts, fields, _wt in loader:
             logp = model(img)
             for k, (field, truth) in enumerate(zip(fields, texts)):
-                pred, _ = greedy_decode(logp[k : k + 1], charset, NUMBER_CHARS if field == "number" else None)[0]
+                pred, conf = greedy_decode(logp[k : k + 1], charset, NUMBER_CHARS if field == "number" else None)[0]
                 s = stats[field]
                 s[0] += 1
                 s[1] += int(pred == truth)
                 s[2] += min(1.0, levenshtein(pred, truth) / max(1, len(truth)))
-    return {f: {"n": s[0], "accuracy": round(s[1] / s[0], 4) if s[0] else None, "cer": round(s[2] / s[0], 4) if s[0] else None} for f, s in stats.items()}
+                if samples:
+                    line = base + k
+                    crop = ""
+                    if line < len(paths) and paths[line]:
+                        crop = os.path.relpath(paths[line], storage) if storage else paths[line]
+                    seen.append(
+                        {
+                            # stable per held-out line, so a later epoch replaces its earlier reading
+                            "id": offset + line,
+                            "field": field,
+                            "truth": truth,
+                            "predicted": pred,
+                            "confidence": round(float(conf), 4),
+                            "correct": pred == truth,
+                            "crop": crop.replace(os.sep, "/"),
+                        }
+                    )
+            base += len(texts)
+    report = {f: {"n": s[0], "accuracy": round(s[1] / s[0], 4) if s[0] else None, "cer": round(s[2] / s[0], 4) if s[0] else None} for f, s in stats.items()}
+    return report, seen[-samples:] if samples else []
 
 
 def usable_datasets(root: str) -> list[str]:
@@ -83,6 +112,9 @@ def main():
     ap.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-minutes", type=float, default=0, help="stop after this long (0 = no limit)")
+    ap.add_argument("--progress-every", type=int, default=10, help="print a step line every N batches (0 = only epochs)")
+    ap.add_argument("--samples", type=int, default=12, help="held-out lines to report each epoch (0 = none)")
+    ap.add_argument("--time-limit-danger", action="store_true", help="with --max-minutes, exit 0 and keep the best model instead of stopping")
     args = ap.parse_args()
 
     # counts keys and card names carry non-ASCII (·, é, ♂ …): never let a
@@ -149,6 +181,9 @@ def main():
     model = CRNN(len(charset) + 1)
     params = sum(p.numel() for p in model.parameters())
     print(f"model: CRNN, {params / 1e6:.2f}M parameters, charset {len(charset)}; train {len(train_ds)} / dev {len(dev_ds)} per epoch")
+    # what the whole run costs, so CardVault can show a percentage and a time until finished
+    steps_per_epoch = max(1, len(train_dl))
+    print(f"plan epochs {args.epochs} steps {steps_per_epoch} × {args.epochs} train {len(train_ds)} dev {len(dev_ds)} batch {args.batch}", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     steps = max(1, len(train_dl) * args.epochs)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.15)
@@ -156,6 +191,7 @@ def main():
 
     started = time.time()
     best, best_state, history = None, None, []
+    best_epoch = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         total, batches = 0.0, 0
@@ -171,16 +207,36 @@ def main():
             sched.step()
             total += float(loss.detach())
             batches += 1
-        m = evaluate(model, dev_dl, charset) if len(dev_ds) else {}
+            if args.progress_every and batches % args.progress_every == 0:
+                print(f"step {batches}/{steps_per_epoch} loss {total / batches:.4f} ({(time.time() - started) / 60:.1f} min)", flush=True)
+        m_dev, seen = evaluate(model, dev_dl, charset, samples=args.samples, storage=args.storage) if len(dev_ds) else ({}, [])
+        m = m_dev
         score = sum((m[f]["accuracy"] or 0) * m[f]["n"] for f in m) / max(1, sum(m[f]["n"] for f in m)) if m else -total
-        history.append({"epoch": epoch, "loss": round(total / max(1, batches), 4), "dev": m})
         mins = (time.time() - started) / 60
-        print(f"epoch {epoch:3d}  loss {total / max(1, batches):.4f}  dev name {m.get('name', {}).get('accuracy')}  number {m.get('number', {}).get('accuracy')}  ({mins:.1f} min)", flush=True)
+        epoch_seconds = mins * 60 / max(1, epoch)
+        history.append({"epoch": epoch, "loss": round(total / max(1, batches), 4), "dev": m, "seconds": round(epoch_seconds, 1)})
+        print(
+            f"epoch {epoch:3d}  loss {total / max(1, batches):.4f}  dev name {m.get('name', {}).get('accuracy')}  number {m.get('number', {}).get('accuracy')}  ({mins:.1f} min)  epoch {epoch_seconds:.1f} s",
+            flush=True,
+        )
+        # the held-out lines as this epoch read them (right/wrong, and how sure)
+        if seen:
+            print(f"samples epoch {epoch} ({sum(1 for x in seen if x['correct'])}/{len(seen)} right)", flush=True)
+            for x in seen:
+                print(
+                    f"sample {x['id']} {x['field']} conf {x['confidence']:.3f} {'ok' if x['correct'] else 'miss'} {x.get('crop') or '-'} {x['truth']} → {x['predicted'] or '(nothing)'}",
+                    flush=True,
+                )
         if best is None or score >= best:
             best, best_state = score, {k: v.clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
         if args.max_minutes and mins >= args.max_minutes:
             print("time limit reached")
-            break
+            if args.time_limit_danger:
+                # an explicit choice in the lab's form: keep what has been learned
+                # rather than throwing away a run that hit its wall-clock limit
+                break
+            sys.exit("time limit reached before the last epoch; nothing was written (raise the limit or the epochs)")
     model.load_state_dict(best_state)
     model.eval()
 
@@ -207,7 +263,7 @@ def main():
     except ImportError:
         print("onnxruntime not installed: skipped the export check")
 
-    final = evaluate(model, dev_dl, charset) if len(dev_ds) else {}
+    final = evaluate(model, dev_dl, charset)[0] if len(dev_ds) else {}
     card = {
         "id": model_id,
         "architecture": "crnn-ctc",
@@ -218,6 +274,7 @@ def main():
         "dataset": {"id": ds_id, "sha256": info.get("sha256"), "rows": info.get("rows"), "counts": info.get("counts")},
         "training": {"epochs": len(history), "batch": args.batch, "lr": args.lr, "synthetic": args.synthetic if synthetic else 0, "parameters": params, "minutes": round((time.time() - started) / 60, 1), "seed": args.seed},
         "dev": final,
+        "bestEpoch": best_epoch,
         "history": history,
     }
     with open(os.path.join(out, "card.json"), "w") as f:

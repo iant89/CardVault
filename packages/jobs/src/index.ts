@@ -72,3 +72,5 @@ export function subscribeEvents(url: string, onEvent: (e: CardVaultEvent) => voi
 }
 
 export const WORKER_HEARTBEAT_KEY = (id: string) => `cardvault:worker:${id}`;
+
+export * from './tasks.js';
