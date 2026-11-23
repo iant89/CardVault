@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectCard, expandQuad, refineCrop, regionSignature, signatureDiff, CARD_RATIO, MISALIGNED, type Pt, type Quad } from './vision';
+import { detectCard, enhanceGray, expandQuad, refineCrop, regionSignature, signatureDiff, CARD_RATIO, autoZoomTarget, MISALIGNED, type Pt, type Quad } from './vision';
 
 /**
  * Synthetic analysis frame: a card rotated by `deg` on a flat table, with a
@@ -110,6 +110,30 @@ describe('detectCard', () => {
     const d = detectCard(f.g, f.W, f.H, f.guide);
     expect(d).not.toBeNull();
     expect(maxCornerError(d!.corners, f.truth)).toBeLessThan(1.5);
+  });
+
+  it('finds a low-contrast card only after the detection-assist enhancement', () => {
+    // haze / dim light: the card is barely brighter than the table, so its
+    // gradients sit below the edge floor and the raw frame yields nothing
+    const f = frame({ deg: 2, bg: 95, border: 104, body: 100, title: 92 });
+    expect(detectCard(f.g, f.W, f.H, f.guide)).toBeNull();
+    const d = detectCard(enhanceGray(f.g, f.W, f.H), f.W, f.H, f.guide);
+    expect(d).not.toBeNull();
+    expect(maxCornerError(d!.corners, f.truth)).toBeLessThan(3);
+  });
+
+  it('leaves a near-uniform frame unchanged (assist can never invent an edge)', () => {
+    const g = new Float32Array(120 * 90).fill(128);
+    const out = enhanceGray(g, 120, 90);
+    expect([...out]).toEqual([...g]);
+  });
+
+  it('computes a zoom target that fills the guide and shrinks an oversized card', () => {
+    const z = autoZoomTarget(0.2, 800, 600);
+    expect(z).toBeCloseTo((0.85 * 0.78 * 600 * CARD_RATIO) / (0.2 * 800), 5);
+    expect(z).toBeGreaterThan(1); // small card → zoom in
+    expect(autoZoomTarget(0.9, 800, 600)).toBeLessThan(1); // oversized → caller clamps to 1× (no zoom-out below minimum)
+    expect(autoZoomTarget(0, 800, 600)).toBe(1); // degenerate input is a no-op, never NaN
   });
 });
 

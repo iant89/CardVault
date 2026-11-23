@@ -40,6 +40,17 @@
 .vp-zoom button:hover { background: rgba(255,255,255,.25); }
 .vp-zoom input[type="range"] { width: 84px; accent-color: #fff; cursor: pointer; }
 .vp-zoom .zoom-level { width: auto; padding: 0 8px; font-size: 12px; }
+/* feature rail: iPhone camera-app style icon toggles, kept out of the way on the right edge */
+.vp-features { position: absolute; right: 12px; top: 54px; z-index: 3; display: flex; flex-direction: column; gap: 8px; }
+.feat { width: 40px; height: 40px; border-radius: 50%; border: 1px solid rgba(255,255,255,.22); background: rgba(0,0,0,.55); backdrop-filter: blur(6px); color: #fff; display: grid; place-items: center; cursor: pointer; transition: background .15s, color .15s, border-color .15s, transform .1s; }
+.feat svg { width: 22px; height: 22px; }
+.feat:hover { background: rgba(255,255,255,.25); }
+.feat:active { transform: scale(.9); }
+.feat:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+/* iPhone camera features glow yellow when enabled */
+.feat.on { background: #ffd60a; border-color: #ffd60a; color: #1c1c1e; }
+.feat.on:hover { background: #ffdf4d; border-color: #ffdf4d; }
+.feat.dim { opacity: .45; }
 /* tap-to-focus ring */
 .focus-ring { position: absolute; width: 64px; height: 64px; margin: -32px 0 0 -32px; border: 2px solid var(--good); border-radius: 10px; pointer-events: none; z-index: 4; animation: focuspop .9s ease forwards; }
 @keyframes focuspop { 0% { transform: scale(1.7); opacity: 0; } 20% { opacity: 1; } 100% { transform: scale(1); opacity: .9; } }
@@ -148,7 +159,7 @@
   .scan-list { max-height: 65vh; }
   .scan-rail { grid-auto-flow: column; justify-content: center; padding: 12px; }
   .scan-rail .rail-label { writing-mode: horizontal-tb; }
-  .vp-status { right: 12px; top: 52px; }
+  .vp-status { right: 60px; top: 52px; }
 }
 .scan-item { grid-template-columns: 34px minmax(0, 1fr) auto; }
 .scan-actions .btn.icon.sm { width: 30px; height: 30px; color: var(--text-3); }
@@ -196,3 +207,8 @@
 .ocr-python-steps li.done { color: var(--good); }
 .ocr-python-steps li.now { color: var(--warn); font-weight: 600; }
 .ocr-python-steps li.next { color: var(--text-2); opacity: .7; }
+@media (max-height: 460px) {
+  .vp-features { gap: 6px; }
+  .feat { width: 34px; height: 34px; }
+  .feat svg { width: 18px; height: 18px; }
+}
