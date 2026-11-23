@@ -5,12 +5,23 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { and, auditLog, desc, eq, ocrEvaluations, ocrExams, ocrModels, ocrSamples, sql } from '@cardvault/database';
+import { and, auditLog, desc, eq, inArray, ocrEvaluations, ocrExams, ocrModels, ocrSamples, sql } from '@cardvault/database';
 import { resolveStoragePath } from '@cardvault/imaging';
 import type { AppContext } from '../context.js';
 import { requireAdmin, user as currentUser } from '../auth/plugin.js';
 import { badRequest, notFound } from '../errors.js';
 import { gates, trialGate, type EvalLike, type TrialLike } from '../services/ocr-gates.js';
+import {
+  forgetTask,
+  listTasks,
+  saveTask,
+  TASK_KEY,
+  taskKeyOf,
+  taskProgress,
+  toLabTask,
+  type TaskRecord,
+} from '@cardvault/jobs';
+import { etaFromEpochs, etaFromPace, percent, summarizeQueue } from '@cardvault/shared';
 
 /** Most groups (a scan's lines, or a harvested card's) an exam takes from each kind of source. */
 const EXAM_CAP = { real: 1500, harvest: 500 };
@@ -38,9 +49,36 @@ interface TrainStatus {
   python?: string;
   error?: string;
   log: string[];
+  /** overall step through the run, and the run's total (for the bar and the ETA) */
+  step?: number;
+  steps?: number;
+  batch?: number;
+  batches?: number;
+  etaSeconds?: number | null;
+  secondsPerEpoch?: number | null;
+  bestEpoch?: number;
+  bestName?: number | null;
+  bestNumber?: number | null;
+  history?: { epoch: number; loss: number; devName: number | null; devNumber: number | null; minutes: number }[];
+  recent?: TrainSample[];
+  requestedAt?: string;
   startedAt?: string;
   finishedAt?: string;
   updatedAt: string;
+}
+
+/** One held-out line as the trainer read it (see TrainStatus.recent). */
+export interface TrainSample {
+  id: number;
+  field: 'name' | 'number';
+  truth: string;
+  predicted: string;
+  /** 0..1 — the decoder's confidence in what it read */
+  confidence: number;
+  correct: boolean;
+  /** crop, relative to the storage folder */
+  crop: string | null;
+  epoch: number;
 }
 
 /** What the setup script does, in order — shown as a checklist while it runs. */
@@ -235,8 +273,19 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     const [exam] = await ctx.db.select({ id: ocrExams.id, version: ocrExams.version }).from(ocrExams).orderBy(desc(ocrExams.version)).limit(1);
     if (!exam) throw badRequest('Freeze an exam first.');
     const running = await ctx.db.execute(sql`SELECT 1 FROM ocr_evaluations WHERE status IN ('queued', 'running') LIMIT 1`);
-    if (running.length) throw badRequest('An evaluation is already running.');
+    if (running.length) throw badRequest('An evaluation is already running. Follow it in the queue (top right), or stop it there first.');
     const [ev] = await ctx.db.insert(ocrEvaluations).values({ examId: exam.id, examVersion: exam.version, engine, requestedBy: userId }).returning({ id: ocrEvaluations.id });
+    const engineLabel = engine.startsWith('model:') ? engine.slice('model:'.length) : 'Tesseract';
+    // in the queue straight away, so pressing the button visibly does something
+    await saveTask(ctx.redis, {
+      key: `ocr-evaluate:${ev!.id}`,
+      kind: 'evaluation',
+      name: `Score ${engineLabel} on exam v${exam.version}`,
+      state: 'queued',
+      progress: 0,
+      detail: 'Waiting for the worker…',
+      retry: { path: engine.startsWith('model:') ? `/api/dev/ocr/models/${engine.slice('model:'.length)}/evaluate` : '/api/dev/ocr/evaluations', label: 'Score again' },
+    });
     await ctx.queues.maintenance.add('ocr-evaluate', { evaluationId: ev!.id }, { removeOnComplete: 50, removeOnFail: 50 });
     return { id: ev!.id };
   };
@@ -253,6 +302,15 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
   app.post('/api/dev/ocr/import-harvest', guard, async (req) => {
     const b = z.object({ limit: z.number().int().min(0).max(100_000).optional() }).parse(req.body ?? {});
     await ctx.redis.set(IMPORT_KEY, JSON.stringify({ status: 'queued', updatedAt: new Date().toISOString() }), 'EX', 7 * 24 * 3600);
+    await saveTask(ctx.redis, {
+      key: 'ocr-import',
+      kind: 'import',
+      name: 'Import harvested cards',
+      state: 'queued',
+      progress: 0,
+      detail: b.limit ? `Up to ${b.limit.toLocaleString()} cards` : 'Every harvested card not imported yet',
+      retry: { path: '/api/dev/ocr/import-harvest', body: { limit: b.limit ?? 0 }, label: 'Import again' },
+    });
     await ctx.queues.maintenance.add('ocr-import-harvest', { limit: b.limit ?? 0 }, { removeOnComplete: 20, removeOnFail: 20 });
     return { ok: true };
   });
@@ -278,6 +336,22 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     return { samples: rows };
   });
 
+  /**
+   * The crop of a held-out training line, by its path in the storage folder.
+   * Training reads lines from an exported dataset, not from ocr_samples, so it
+   * has no sample id to ask with; the path is checked to stay inside storage.
+   */
+  app.get('/api/dev/ocr/training/crop', guard, async (req, reply) => {
+    const q = z.object({ path: z.string().min(3).max(400) }).parse(req.query);
+    if (q.path.includes('..') || path.isAbsolute(q.path)) throw badRequest('Bad crop path.');
+    const abs = resolveStoragePath(ctx.storageDir, q.path);
+    if (!(await stat(abs).catch(() => null))?.isFile()) throw notFound();
+    reply.header('content-type', 'image/png');
+    reply.header('cache-control', 'private, max-age=86400');
+    reply.header('x-content-type-options', 'nosniff');
+    return reply.send(createReadStream(abs));
+  });
+
   app.get<{ Params: { id: string } }>('/api/dev/ocr/samples/:id/crop', guard, async (req, reply) => {
     const id = z.string().uuid().parse(req.params.id);
     const [s] = await ctx.db.select({ path: ocrSamples.cropPath }).from(ocrSamples).where(eq(ocrSamples.id, id));
@@ -290,9 +364,251 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     return reply.send(createReadStream(abs));
   });
 
+  // ---------------------------------------------------------------- task queue
+
+  /**
+   * The queue as the page shows it: every task the lab has run, newest first.
+   *
+   * Most tasks are written by the worker as it works (packages/jobs tasks.ts).
+   * The stores that predate the queue — a training run's `ocr:train`, the
+   * Python setup's `ocr:python`, the harvest import, an evaluation row —
+   * are folded in here, so the queue is the one place to see what the lab is
+   * doing even when a worker restarted mid-task and never marked it finished.
+   */
+  app.get('/api/dev/ocr/queue', guard, async () => {
+    const records = new Map<string, TaskRecord>();
+    for (const t of await listTasks(ctx.redis)) records.set(t.key, t);
+
+    // ---- stores written before the queue existed: fold them in when the queue
+    // has nothing (or something older) to say about the same work
+    const upsert = (t: TaskRecord) => {
+      const before = records.get(t.key);
+      if (before && new Date(before.createdAt) >= new Date(t.createdAt)) return;
+      records.set(t.key, t);
+    };
+
+    const train = await readTraining(ctx);
+    if (train) {
+      const run = train;
+      const state = run.status === 'queued' ? 'queued' : run.status === 'starting' || run.status === 'running' ? 'running' : run.status;
+      const stepTotal = run.steps ?? 0;
+      const stepDone = run.step ?? 0;
+      upsert({
+        key: 'ocr-train',
+        kind: 'train',
+        name: 'Train a line reader',
+        state,
+        progress: state === 'done' ? 100 : state === 'queued' ? 0 : percent(stepDone, stepTotal),
+        progressLabel: stepTotal ? `${stepDone.toLocaleString()} / ${stepTotal.toLocaleString()} steps` : run.epochs ? `epoch ${run.epoch ?? 0} / ${run.epochs}` : null,
+        detail:
+          state === 'running'
+            ? `Epoch ${run.epoch ?? 0} of ${run.epochs ?? '?'}${run.loss != null ? ` · loss ${run.loss.toFixed(3)}` : ''}${run.devName != null ? ` · held out: names ${(run.devName * 100).toFixed(1)}%` : ''}`
+            : state === 'queued'
+              ? 'Waiting for the worker…'
+              : (run.error ?? `Finished ${run.modelId ?? ''}`.trim()),
+        etaSeconds: run.etaSeconds ?? null,
+        step: null,
+        createdAt: run.requestedAt ?? run.startedAt ?? run.updatedAt,
+        startedAt: run.startedAt ?? null,
+        finishedAt: run.finishedAt ?? null,
+        runtimeMs: run.startedAt && run.finishedAt ? new Date(run.finishedAt).getTime() - new Date(run.startedAt).getTime() : null,
+        error: state === 'failed' ? (run.error ?? 'The trainer failed.') : state === 'cancelled' ? 'Stopped.' : null,
+        result: run.modelId ?? null,
+        retry: {
+          path: '/api/dev/ocr/train',
+          body: { dataset: run.requested ?? 'latest', epochs: run.epochs ?? 30, synthetic: run.synthetic ?? 20_000 },
+          label: 'Train again',
+        },
+      });
+    }
+
+    const py = await trainerPython(ctx);
+    if (py.status === 'installing' || py.status === 'failed') {
+      const total = py.steps.length || 3;
+      const step = py.step ?? 0;
+      upsert({
+        key: 'ocr-python',
+        kind: 'python',
+        name: 'Set up the trainer’s Python',
+        state: py.status === 'installing' ? 'running' : 'failed',
+        progress: percent(step, total),
+        progressLabel: `Step ${step} / ${total}`,
+        detail: py.status === 'installing' ? (py.steps[step - 1] ?? 'Creating the environment…') : (py.error ?? 'The setup could not finish.'),
+        etaSeconds: null,
+        step: step ? { index: step, total, label: py.steps[step - 1] ?? '' } : null,
+        createdAt: py.startedAt ?? py.updatedAt ?? new Date().toISOString(),
+        startedAt: py.startedAt ?? null,
+        finishedAt: py.finishedAt ?? null,
+        runtimeMs: py.startedAt && py.finishedAt ? new Date(py.finishedAt).getTime() - new Date(py.startedAt).getTime() : null,
+        error: py.status === 'failed' ? (py.error ?? 'The setup failed.') : null,
+        result: py.status === 'installing' ? null : (py.python ?? null),
+        retry: py.status === 'failed' ? { path: '/api/dev/ocr/train/python', label: 'Try again' } : null,
+      });
+    }
+
+    const imp = await ctx.redis.get(IMPORT_KEY);
+    if (imp) {
+      const i = JSON.parse(imp) as { status: string; done?: number; total?: number; added?: number; skipped?: number; error?: string; updatedAt?: string };
+      upsert({
+        key: 'ocr-import',
+        kind: 'import',
+        name: 'Import harvested cards',
+        state: i.status === 'queued' ? 'queued' : i.status === 'running' ? 'running' : i.status === 'done' ? 'done' : 'failed',
+        progress: percent(i.done ?? 0, i.total ?? 0),
+        progressLabel: i.total ? `${(i.done ?? 0).toLocaleString()} / ${i.total.toLocaleString()} cards` : null,
+        detail: i.error ?? `${(i.added ?? 0).toLocaleString()} cards added${i.skipped ? ` · ${i.skipped} skipped` : ''}`,
+        etaSeconds: null,
+        step: null,
+        createdAt: i.updatedAt ?? new Date().toISOString(),
+        startedAt: null,
+        finishedAt: i.status === 'done' || i.status === 'failed' ? (i.updatedAt ?? null) : null,
+        runtimeMs: null,
+        error: i.status === 'failed' ? (i.error ?? 'The import failed.') : null,
+        result: null,
+        retry: i.status === 'failed' ? { path: '/api/dev/ocr/import-harvest', body: { limit: 500 }, label: 'Import again' } : null,
+      });
+    }
+
+    // evaluations have a row each (the worker keeps it up to date)
+    const evals = await ctx.db
+      .select({
+        id: ocrEvaluations.id,
+        engine: ocrEvaluations.engine,
+        examVersion: ocrEvaluations.examVersion,
+        status: ocrEvaluations.status,
+        progress: ocrEvaluations.progress,
+        error: ocrEvaluations.error,
+        createdAt: ocrEvaluations.createdAt,
+        completedAt: ocrEvaluations.completedAt,
+        summary: ocrEvaluations.summary,
+      })
+      .from(ocrEvaluations)
+      .orderBy(desc(ocrEvaluations.createdAt))
+      .limit(12);
+    for (const e of evals) {
+      const engineLabel = e.engine.startsWith('model:') ? e.engine.slice('model:'.length) : 'Tesseract';
+      const s = e.summary as { name?: { accuracy?: number | null }; number?: { accuracy?: number | null } };
+      const pctText = (v: number | null | undefined) => (v == null ? '—' : `${(v * 100).toFixed(1)}%`);
+      const done = e.progress?.done ?? 0;
+      const total = e.progress?.total ?? 0;
+      upsert({
+        key: `ocr-evaluate:${e.id}`,
+        kind: 'evaluation',
+        name: `Score ${engineLabel} on exam v${e.examVersion ?? '?'}`,
+        state: e.status === 'queued' ? 'queued' : e.status === 'running' ? 'running' : e.status === 'done' ? 'done' : 'failed',
+        progress: e.status === 'done' ? 100 : percent(done, total),
+        progressLabel: total ? `${done.toLocaleString()} / ${total.toLocaleString()} groups` : null,
+        detail:
+          e.status === 'done'
+            ? `Names ${pctText(s.name?.accuracy)} · numbers ${pctText(s.number?.accuracy)}`
+            : e.status === 'failed'
+              ? (e.error ?? 'The score failed.')
+              : e.status === 'queued'
+                ? 'Waiting for the worker…'
+                : `${engineLabel} is reading the frozen exam…`,
+        etaSeconds: null,
+        step: null,
+        createdAt: e.createdAt.toISOString(),
+        startedAt: e.status === 'queued' ? null : e.createdAt.toISOString(),
+        finishedAt: e.completedAt?.toISOString() ?? null,
+        runtimeMs: e.completedAt && e.status !== 'queued' ? e.completedAt.getTime() - e.createdAt.getTime() : null,
+        error: e.status === 'failed' ? (e.error ?? 'The score failed.') : null,
+        result: null,
+        retry: {
+          path: e.engine.startsWith('model:') ? `/api/dev/ocr/models/${e.engine.slice('model:'.length)}/evaluate` : '/api/dev/ocr/evaluations',
+          label: 'Score again',
+        },
+      });
+    }
+
+    const tasks = [...records.values()]
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .map((t) => toLabTask(t));
+    // one rule for counts, the active task and its progress, shared with the app
+    return { ...summarizeQueue(tasks), updatedAt: new Date().toISOString() };
+  });
+
+  /** Stop a task: training exits at the next step; a Python setup cancels like any job. */
+  app.post<{ Params: { id: string } }>('/api/dev/ocr/queue/:id/cancel', guard, async (req) => {
+    const raw = await ctx.redis.get(TASK_KEY(req.params.id));
+    if (!raw) throw notFound();
+    const task = JSON.parse(raw) as TaskRecord;
+    if (!['running', 'queued'].includes(task.state)) throw badRequest('That task has already finished.');
+    if (task.kind === 'train') {
+      // the trainer checks this between steps and stops cleanly, keeping nothing
+      await ctx.redis.set(TRAIN_CANCEL_KEY, '1', 'EX', 300);
+      await taskProgress(ctx.redis, task.key, { detail: 'Stopping after this step…' });
+      return { ok: true, stopping: true };
+    }
+    if (task.kind === 'evaluation') {
+      // mark the row too, so a running or queued evaluation stops wrapping up as
+      // 'done' after a cancel (it reports 'failed — cancelled' and is labelled)
+      const id = task.key.slice('ocr-evaluate:'.length);
+      await ctx.db
+        .update(ocrEvaluations)
+        .set({ status: 'failed', error: 'Cancelled.', completedAt: new Date() })
+        .where(and(eq(ocrEvaluations.id, id), inArray(ocrEvaluations.status, ['queued', 'running'])));
+    }
+    const queue = ctx.queues.maintenance;
+    const job = await queue.getJobs(['active', 'waiting', 'delayed', 'prioritized']).then((jobs) => jobs.find((j) => taskKeyOf(j.name, j.data as Record<string, unknown>) === task.key));
+    if (job) {
+      // an active job cannot be removed: discard it (it stops at the next await)
+      try {
+        await job.remove();
+      } catch {
+        await Promise.resolve(job.discard()).catch(() => undefined);
+      }
+    }
+    await saveTask(ctx.redis, { key: task.key, kind: task.kind, name: task.name, state: 'cancelled', error: 'Cancelled.', detail: 'Cancelled before it finished.' });
+    return { ok: true };
+  });
+
+  /** Queue the same request again (failed, cancelled, or to compare two runs). */
+  app.post<{ Params: { id: string } }>('/api/dev/ocr/queue/:id/retry', guard, async (req) => {
+    const raw = await ctx.redis.get(TASK_KEY(req.params.id));
+    if (!raw) throw notFound();
+    const task = JSON.parse(raw) as TaskRecord;
+    if (!task.retry) throw badRequest('This task cannot be repeated from the queue.');
+    await forgetTask(ctx.redis, task.key);
+    const r = await app.inject({ method: 'POST', url: task.retry.path, payload: task.retry.body ?? {}, headers: req.headers as Record<string, string> });
+    if (r.statusCode >= 400) {
+      const why = String((JSON.parse(r.body) as { error?: string }).error ?? 'Could not repeat the task.');
+      throw badRequest(`${why} The finished entry has been cleared, so it is no longer in the queue list.`);
+    }
+    return { ok: true, queued: task.retry.label };
+  });
+
+  /** Drop a finished entry from the queue. */
+  app.delete<{ Params: { id: string } }>('/api/dev/ocr/queue/:id', guard, async (req) => {
+    const raw = await ctx.redis.get(TASK_KEY(req.params.id));
+    if (raw) {
+      const task = JSON.parse(raw) as TaskRecord;
+      if (['running', 'queued'].includes(task.state)) throw badRequest('Stop the task before removing it.');
+    }
+    await forgetTask(ctx.redis, req.params.id);
+    return { ok: true };
+  });
+
+  /** Clear every finished entry (done, failed, cancelled). */
+  app.post('/api/dev/ocr/queue/clear', guard, async () => {
+    const tasks = await listTasks(ctx.redis);
+    const finished = tasks.filter((t) => ['done', 'failed', 'cancelled'].includes(t.state));
+    await Promise.all(finished.map((t) => forgetTask(ctx.redis, t.key)));
+    return { ok: true, removed: finished.length };
+  });
+
   // ---------------------------------------------------------------- training data & models
 
   app.post('/api/dev/ocr/export', guard, async () => {
+    await saveTask(ctx.redis, {
+      key: 'ocr-export',
+      kind: 'export',
+      name: 'Export training data',
+      state: 'queued',
+      progress: 0,
+      detail: 'Waiting for the worker…',
+      retry: { path: '/api/dev/ocr/export', label: 'Export again' },
+    });
     await ctx.queues.maintenance.add('ocr-export-dataset', {}, { removeOnComplete: 20, removeOnFail: 20 });
     return { ok: true };
   });
@@ -321,9 +637,28 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     } else if (!datasets.some((d) => d.id === b.dataset)) {
       throw badRequest(`No usable dataset ${b.dataset}. Export training data first.`);
     }
-    const status: TrainStatus = { status: 'queued', requested: b.dataset, epochs: b.epochs, synthetic: b.synthetic, log: [], updatedAt: new Date().toISOString() };
+    const status: TrainStatus = {
+      status: 'queued',
+      requested: b.dataset,
+      epochs: b.epochs,
+      synthetic: b.synthetic,
+      log: [],
+      history: [],
+      recent: [],
+      requestedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
     await ctx.redis.set(TRAIN_KEY, JSON.stringify(status), 'EX', 7 * 24 * 3600);
     await ctx.redis.del(TRAIN_CANCEL_KEY);
+    await saveTask(ctx.redis, {
+      key: 'ocr-train',
+      kind: 'train',
+      name: 'Train a line reader',
+      state: 'queued',
+      progress: 0,
+      detail: `${b.epochs} epochs · ${b.synthetic.toLocaleString()} synthetic lines per epoch`,
+      retry: { path: '/api/dev/ocr/train', body: b, label: 'Train again' },
+    });
     await ctx.queues.maintenance.add('ocr-train-model', b, { removeOnComplete: 20, removeOnFail: 20 });
     req.log.info({ dataset: b.dataset, epochs: b.epochs }, 'OCR training queued');
     return { ok: true };
@@ -347,11 +682,21 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     const current = await readTraining(ctx);
     if (current && ['queued', 'starting', 'running'].includes(current.status)) throw badRequest('Training is running; stop it before changing the trainer’s Python.');
     await ctx.redis.del(PYTHON_KEY);
+    await saveTask(ctx.redis, {
+      key: 'ocr-python',
+      kind: 'python',
+      name: 'Set up the trainer’s Python',
+      state: 'queued',
+      progress: 0,
+      detail: 'Waiting for the worker…',
+      retry: { path: '/api/dev/ocr/train/python', label: 'Run again' },
+    });
     await ctx.queues.maintenance.add('ocr-python-setup', {}, { removeOnComplete: 20, removeOnFail: 20 });
     return { ok: true };
   });
 
   app.post('/api/dev/ocr/models/rescan', guard, async () => {
+    await saveTask(ctx.redis, { key: 'ocr-rescan', kind: 'rescan', name: 'Look for new models', state: 'queued', progress: 0, detail: 'Waiting for the worker…' });
     await ctx.queues.maintenance.add('ocr-scan-models', {}, { removeOnComplete: 20, removeOnFail: 20 });
     return { ok: true };
   });
@@ -487,6 +832,7 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
 
   /** Recompute trial and watch statistics now (normally every 15 minutes). */
   app.post('/api/dev/ocr/models/watch', guard, async () => {
+    await saveTask(ctx.redis, { key: 'ocr-watch', kind: 'watch', name: 'Refresh trials & live watch', state: 'queued', progress: 0, detail: 'Waiting for the worker…' });
     await ctx.queues.maintenance.add('ocr-watch', {}, { removeOnComplete: 20, removeOnFail: 20 });
     return { ok: true };
   });

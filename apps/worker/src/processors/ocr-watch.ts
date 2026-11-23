@@ -2,6 +2,7 @@ import { auditLog, eq, ocrModels, sql } from '@cardvault/database';
 import type { WorkerContext } from '../context.js';
 import { compareTrial, namePrediction, numberPrediction, rollbackDecision, type LiveUnit, type WatchRules, type WatchWindow } from '../identification/ocr-data.js';
 import { resetLiveEngine } from '../identification/engines.js';
+import { ensureTask, saveTask } from '@cardvault/jobs';
 
 interface Row {
   id: string;
@@ -87,7 +88,20 @@ export async function switchBack(ctx: WorkerContext, modelId: string, reason: st
  */
 export async function runWatch(ctx: WorkerContext) {
   const out: Record<string, unknown> = {};
+  // a short task, but it belongs in the same queue as everything else the lab runs
+  const task = await ensureTask(ctx.redis, { key: 'ocr-watch', kind: 'watch', name: 'Refresh trials & live watch', detail: 'Comparing confirmed lines…', state: 'running' });
   const models = await ctx.db.select().from(ocrModels);
+  const finish = (detail: string) =>
+    saveTask(ctx.redis, {
+      key: task.key,
+      kind: 'watch',
+      name: task.name,
+      state: 'done',
+      progress: 100,
+      detail,
+      result: typeof out.rolledBackTo === 'string' ? out.rolledBackTo : null,
+      error: null,
+    });
 
   for (const m of models.filter((x) => x.status === 'shadow' && x.trialStartedAt)) {
     const rows = await labelledRows(ctx, { since: m.trialStartedAt!, shadowEngine: `model:${m.id}` });
@@ -117,5 +131,11 @@ export async function runWatch(ctx: WorkerContext) {
     out.watch = { model: active.id, ...watch };
     if (d.rollback) out.rolledBackTo = await switchBack(ctx, active.id, d.reasons.join('; '));
   }
+  const bits = [
+    out.trial ? `trial for ${(out.trial as { model: string }).model} updated` : null,
+    out.watch ? `live watch for ${(out.watch as { model: string }).model} updated` : null,
+    out.rolledBackTo ? `rolled back to ${String(out.rolledBackTo)}` : null,
+  ].filter(Boolean);
+  await finish(bits.length ? bits.join(' · ') : 'Nothing on trial and no live watch to update');
   return out;
 }

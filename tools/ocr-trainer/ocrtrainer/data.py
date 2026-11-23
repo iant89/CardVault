@@ -190,6 +190,11 @@ class LineDataset(torch.utils.data.Dataset):
         self.synthetic_count = synthetic_count if synthetic else 0
         self.seed = seed
 
+    @property
+    def paths(self) -> list[str | None]:
+        """Crop path of each real line (None for synthetic): lets reports show the line itself."""
+        return [ln.path for ln in self.lines]
+
     def __len__(self) -> int:
         return len(self.lines) + self.synthetic_count
 

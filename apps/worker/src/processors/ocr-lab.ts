@@ -10,6 +10,8 @@ import { engineFor } from '../identification/engines.js';
 import { cer, eraOf, fnv1a, metrics, namePrediction, nameNorm, numberPrediction, sliceReport, splitFor, type ScoredItem } from '../identification/ocr-data.js';
 import { labelScanSamples } from '../identification/samples.js';
 import { nameIndex } from '../identification/dictionary.js';
+import { etaFromPace, percent } from '@cardvault/shared';
+import { ensureTask, saveTask, taskProgress } from '@cardvault/jobs';
 
 type Sample = typeof ocrSamples.$inferSelect;
 
@@ -31,8 +33,19 @@ export async function evaluate(ctx: WorkerContext, data: { evaluationId: string 
   const started = Date.now();
   const [ev] = await ctx.db.select().from(ocrEvaluations).where(eq(ocrEvaluations.id, data.evaluationId));
   if (!ev) return null;
+  // the queue's entry for this run (the API created it with the evaluation)
+  const taskKey = `ocr-evaluate:${ev.id}`;
+  const engineLabel = ev.engine.startsWith('model:') ? ev.engine.slice('model:'.length) : 'Tesseract';
+  const task = await ensureTask(ctx.redis, {
+    key: taskKey,
+    kind: 'evaluation',
+    name: `Score ${engineLabel} on the exam`,
+    detail: 'Reading the frozen exam lines…',
+    state: 'running',
+  });
   const fail = async (error: string) => {
     await ctx.db.update(ocrEvaluations).set({ status: 'failed', error, completedAt: new Date() }).where(eq(ocrEvaluations.id, ev.id));
+    await saveTask(ctx.redis, { key: task.key, kind: 'evaluation', name: task.name, state: 'failed', error, progress: 0 });
     return { error };
   };
   try {
@@ -56,6 +69,12 @@ export async function evaluate(ctx: WorkerContext, data: { evaluationId: string 
     for (const rows of numberGroups.values()) units.push({ field: 'number', rows: rows.sort((a, b) => a.region - b.region) });
     units.sort((a, b) => fnv1a(a.rows[0]!.groupKey) - fnv1a(b.rows[0]!.groupKey));
 
+    // a cancelled evaluation must not start (its row says 'failed' already)
+    const [stillWanted] = await ctx.db.select({ status: ocrEvaluations.status }).from(ocrEvaluations).where(eq(ocrEvaluations.id, ev.id));
+    if (stillWanted && stillWanted.status === 'failed') {
+      await saveTask(ctx.redis, { key: taskKey, kind: 'evaluation', name: task.name, state: 'cancelled', error: 'Cancelled before it started.', progress: 0 });
+      return { error: 'cancelled' };
+    }
     const engine = await engineFor(ctx, ev.engine.startsWith('model:') ? ev.engine : 'tesseract');
     await ctx.db.update(ocrEvaluations).set({ status: 'running', engine: engine.id, examId: exam.id, examVersion: exam.version, progress: { done: 0, total: units.length } }).where(eq(ocrEvaluations.id, ev.id));
 
@@ -64,6 +83,14 @@ export async function evaluate(ctx: WorkerContext, data: { evaluationId: string 
     let missing = 0, lines = 0, readMs = 0;
     const dictionaries = new Map<string, Awaited<ReturnType<typeof nameIndex>>>();
     for (const [i, u] of units.entries()) {
+      // stopping: the row was marked failed ('Cancelled.') by the API
+      if (i % 20 === 0) {
+        const [now] = await ctx.db.select({ status: ocrEvaluations.status }).from(ocrEvaluations).where(eq(ocrEvaluations.id, ev.id));
+        if (now?.status === 'failed') {
+          await saveTask(ctx.redis, { key: task.key, kind: 'evaluation', name: task.name, state: 'cancelled', error: 'Stopped on request.', progress: percent(i, units.length) });
+          return { error: 'cancelled' };
+        }
+      }
       const first = u.rows[0]!;
       const game = first.game;
       const layout = GAME_MODULES[game as GameSlug]?.ocrLayout;
@@ -117,6 +144,14 @@ export async function evaluate(ctx: WorkerContext, data: { evaluationId: string 
         misses.push({ field: u.field, game, source: first.labelSource, regression, predicted, raw: texts.join(' | ').slice(0, 120), label: first.labelText ?? label, samples: u.rows.map((r) => r.id) });
       }
       if (i % 10 === 9) await ctx.db.update(ocrEvaluations).set({ progress: { done: i + 1, total: units.length } }).where(eq(ocrEvaluations.id, ev.id));
+      if (i % 5 === 4 || i + 1 === units.length) {
+        await taskProgress(ctx.redis, task.key, {
+          progress: percent(i + 1, units.length),
+          progressLabel: `${(i + 1).toLocaleString()} / ${units.length.toLocaleString()} groups`,
+          detail: `${engineLabel} · ${items.length ? Math.round((items.filter((x) => x.correct).length / items.length) * 100) : 0}% right so far`,
+          etaSeconds: etaFromPace(i + 1, units.length, Date.now() - started),
+        });
+      }
     }
 
     const slices = sliceReport(items);
@@ -146,6 +181,17 @@ export async function evaluate(ctx: WorkerContext, data: { evaluationId: string 
       .set({ status: 'done', summary, slices: slices as unknown as Record<string, unknown>[], misses, progress: { done: units.length, total: units.length }, completedAt: new Date() })
       .where(eq(ocrEvaluations.id, ev.id));
     ctx.log.info({ evaluation: ev.id, name: summary.name?.accuracy, number: summary.number?.accuracy }, 'OCR evaluation finished');
+    const pctText = (v: number | null | undefined) => (v == null ? '—' : `${(v * 100).toFixed(1)}%`);
+    await saveTask(ctx.redis, {
+      key: task.key,
+      kind: 'evaluation',
+      name: task.name,
+      state: 'done',
+      progress: 100,
+      progressLabel: `${units.length.toLocaleString()} / ${units.length.toLocaleString()} groups`,
+      detail: `Names ${pctText(summary.name?.accuracy)} · numbers ${pctText(summary.number?.accuracy)} · ${summary.units?.toLocaleString() ?? units.length} items scored`,
+      error: null,
+    });
     return { ok: true };
   } catch (e) {
     return fail((e as Error).message);
@@ -175,10 +221,27 @@ interface HarvestCard {
 export async function importHarvest(ctx: WorkerContext, data: { limit?: number; lang?: string }) {
   const lang = data.lang ?? 'en';
   const root = path.resolve(ctx.config.HARVESTER_OUT_DIR ?? path.join(ctx.config.STORAGE_DIR, 'tcgdex-data'));
+  const task = await ensureTask(ctx.redis, {
+    key: 'ocr-import',
+    kind: 'import',
+    name: 'Import harvested cards',
+    detail: 'Reading the TCGdex harvest…',
+    state: 'running',
+  });
+  const started = Date.now();
   const status = async (s: Record<string, unknown>) => ctx.redis.set(IMPORT_KEY, JSON.stringify({ ...s, updatedAt: new Date().toISOString() }), 'EX', 7 * 24 * 3600);
+  const report = (done: number, total: number, added: number, extra = '') =>
+    void taskProgress(ctx.redis, task.key, {
+      progress: percent(done, total),
+      progressLabel: `${done.toLocaleString()} / ${total.toLocaleString()} cards`,
+      detail: `${added.toLocaleString()} cards added${extra}`,
+      etaSeconds: etaFromPace(done, total, Date.now() - started),
+    });
   const cards = JSON.parse(await readFile(path.join(root, lang, 'cards.json'), 'utf8').catch(() => 'null')) as HarvestCard[] | null;
   if (!cards) {
-    await status({ status: 'failed', error: `No ${lang}/cards.json in ${root}. Run the TCGdex Harvester (Developer menu) first.` });
+    const error = `No ${lang}/cards.json in ${root}. Run the TCGdex Harvester (Developer menu) first.`;
+    await status({ status: 'failed', error });
+    await saveTask(ctx.redis, { key: task.key, kind: 'import', name: task.name, state: 'failed', error, progress: 0 });
     return { error: 'no harvest' };
   }
   const usable = cards.filter((c) => c.image && c.data);
@@ -190,6 +253,7 @@ export async function importHarvest(ctx: WorkerContext, data: { limit?: number; 
   const sets = new Map<string, { official?: number; release?: string } | null>();
   let added = 0, skipped = 0;
   await status({ status: 'running', done: 0, total: todo.length, added, skipped, alreadyImported: existing.size });
+  report(0, todo.length, 0, ` · ${todo.length.toLocaleString()} new of ${usable.length.toLocaleString()} harvested`);
   for (const [i, c] of todo.entries()) {
     try {
       const setFile = path.join(root, path.dirname(path.dirname(c.data!)), 'set.json');
@@ -236,9 +300,22 @@ export async function importHarvest(ctx: WorkerContext, data: { limit?: number; 
       skipped++;
       ctx.log.warn({ card: c.id, err: (e as Error).message }, 'harvest import: card skipped');
     }
-    if (i % 25 === 24) await status({ status: 'running', done: i + 1, total: todo.length, added, skipped, alreadyImported: existing.size });
+    if (i % 25 === 24) {
+      await status({ status: 'running', done: i + 1, total: todo.length, added, skipped, alreadyImported: existing.size });
+      report(i + 1, todo.length, added, skipped ? ` · ${skipped} skipped` : '');
+    }
   }
   await status({ status: 'done', done: todo.length, total: todo.length, added, skipped, alreadyImported: existing.size });
+  await saveTask(ctx.redis, {
+    key: task.key,
+    kind: 'import',
+    name: task.name,
+    state: 'done',
+    progress: 100,
+    progressLabel: `${todo.length.toLocaleString()} / ${todo.length.toLocaleString()} cards`,
+    detail: `${added.toLocaleString()} cards added${skipped ? ` · ${skipped} skipped` : ''}`,
+    error: null,
+  });
   return { added, skipped };
 }
 
@@ -262,6 +339,8 @@ export function printedNumber(text: string): string {
  */
 export async function exportDataset(ctx: WorkerContext) {
   const id = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '').replace('T', '-');
+  const task = await ensureTask(ctx.redis, { key: 'ocr-export', kind: 'export', name: 'Export training data', detail: 'Selecting training lines…', state: 'running' });
+  await taskProgress(ctx.redis, task.key, { progress: 5, detail: 'Selecting training lines…' });
   const rows = await ctx.db.execute(sql`
     SELECT id, group_key, game, field, region, crop_path, label_text, label_norm, label_source, regression, meta
     FROM ocr_samples
@@ -317,6 +396,17 @@ export async function exportDataset(ctx: WorkerContext) {
   await writeFileSafe(ctx.storageDir, `ocr/datasets/${id}/train.jsonl`, Buffer.from(body));
   await writeFileSafe(ctx.storageDir, `ocr/datasets/${id}/info.json`, Buffer.from(JSON.stringify(info, null, 2)));
   await ctx.redis.set(DATASET_KEY, JSON.stringify({ ...info, dir: path.join(ctx.storageDir, 'ocr', 'datasets', id) }));
+  await saveTask(ctx.redis, {
+    key: task.key,
+    kind: 'export',
+    name: task.name,
+    state: 'done',
+    progress: 100,
+    progressLabel: `${lines.length.toLocaleString()} lines`,
+    detail: `${lines.length.toLocaleString()} lines in ${id} (${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')})`,
+    result: id,
+    error: null,
+  });
   ctx.log.info({ dataset: id, rows: lines.length }, 'OCR training data exported');
   return info;
 }

@@ -199,6 +199,23 @@ scripts/         backup.sh, restore.sh
    Two near-tied candidates (for example reprints) are capped below 95%.
 5. **Manual review** stores the original identification next to the human correction, with who made it and when. A card that isn't in any catalog (common for sports cards) becomes a new catalog entry.
 
+### The OCR Lab (Developer → OCR Lab)
+
+Administrators get a workbench for the line reader behind every scan. It is split into four tabs, and every long-running action — scoring, exports, training, the trainer's Python setup, TCGdex imports, trial refreshes — goes through **one task queue**, shown by the button in the page's upper right:
+
+- The button carries a progress ring with the active task's percentage while anything is running, and turns to an idle track and a failure badge when the queue is quiet or something failed.
+- The popup lists every entry — running first, then queued, then finished — each with its name, what it is doing, its state, a progress bar, the time it has taken (live, ticking every second) and, while running, the time until finished.
+- Tasks can be stopped (training exits at the next step; a score stops between groups) and finished ones can be repeated or cleared.
+
+| Tab | What it shows |
+|---|---|
+| **Overview** | Where the labels come from (person-confirmed, corroborated, harvest, self), the frozen exam and its version, the TCGdex import, and every score on the exam with its slices and misreads |
+| **Models** | The export → train → score → trial → promote pipeline, each model's gates, live trial and the automatic watch that rolls a bad model back |
+| **Training** | Start a run and watch it: elapsed time, **time until finished** (from the pace so far, once the first epoch is timed), epoch and step counters, the held-out accuracy curve per epoch, and the **recent held-out lines** the model re-reads after every epoch — each with its crop, what it read, whether that was right, and how sure it was |
+| **Collected data** | Every collected line with its crop, filterable by label source and field, and the dataset exports |
+
+The held-out lines are how training is judged while it runs: they are chosen by card and never trained on, so a model that starts reading them correctly — and confidently — is learning, while one that is confidently wrong needs more data or more epochs. The final verdict is still the frozen exam.
+
 ### Providers
 
 Each source implements `CardProvider` (`search / getCard / getPrices / getSales / getImages`) and returns normalized data. Every provider gets its own rate limiter, bounded retries with exponential backoff (honouring `Retry-After`), timeout, circuit breaker, fixed User-Agent and request logging. Admins can enable or disable providers at runtime.
@@ -284,5 +301,5 @@ Copy `./backups` to another disk or machine as well.
 - **Upside-down captures** aren't auto-rotated by 180°.
 - **eBay sold prices** need Marketplace Insights API access. Without it, eBay adds listed prices only, and sold-style figures come from the TCGplayer, Scryfall and YGOPRODeck aggregates.
 - **Themes** use CSS gradients only and ship no third-party artwork. To use your own images, set `backgroundImage` in `apps/web/src/themes/index.ts` and put the files in `apps/web/public/themes/`.
-- **Custom OCR trainer** (Developer → OCR Lab → Models → Train) needs a Python with PyTorch on the worker's machine. The native installer sets it up in `storage/ocr/venv`, and OCR Lab's **Set up the OCR trainer** does the same later (a few hundred MB, one time). In Docker it lives on the `storage` volume, so it survives `docker compose up --build`; the download needs the worker container to reach PyPI. On an offline server, run `bash scripts/ocr-python.sh` with a local wheel mirror in `OCR_TRAIN_TORCH_INDEX`.
+- **Custom OCR trainer** (Developer → OCR Lab → Train) needs a Python with PyTorch on the worker's machine. The native installer sets it up in `storage/ocr/venv`, and OCR Lab's **Set up the OCR trainer** does the same later (a few hundred MB, one time). In Docker it lives on the `storage` volume, so it survives `docker compose up --build`; the download needs the worker container to reach PyPI. On an offline server, run `bash scripts/ocr-python.sh` with a local wheel mirror in `OCR_TRAIN_TORCH_INDEX`.
 - Future-features list (trading, want lists, binders, deck builders, alerts): not started.
