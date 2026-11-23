@@ -32,6 +32,17 @@
 .viewport { position: relative; border-radius: 20px; overflow: hidden; background: #000; aspect-ratio: 4 / 3; max-height: calc(100vh - 230px); min-height: 380px; width: 100%; border: 1px solid var(--line); }
 @media (max-width: 760px) { .viewport { aspect-ratio: 3 / 4; border-radius: 16px; margin: 0 -4px; } }
 .viewport video, .viewport canvas.overlay-canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.viewport video { touch-action: none; cursor: pointer; }
+.viewport canvas.overlay-canvas { pointer-events: none; }
+/* zoom cluster: slider + steppers over the preview (pinch / wheel / double-tap also zoom) */
+.vp-zoom { position: absolute; right: 12px; bottom: 104px; z-index: 3; display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: 12px; background: rgba(0,0,0,.6); backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,.15); }
+.vp-zoom button { width: 30px; height: 30px; border: 0; border-radius: 8px; background: rgba(255,255,255,.12); color: #fff; font: inherit; font-size: 16px; font-weight: 800; cursor: pointer; line-height: 1; }
+.vp-zoom button:hover { background: rgba(255,255,255,.25); }
+.vp-zoom input[type="range"] { width: 84px; accent-color: #fff; cursor: pointer; }
+.vp-zoom .zoom-level { width: auto; padding: 0 8px; font-size: 12px; }
+/* tap-to-focus ring */
+.focus-ring { position: absolute; width: 64px; height: 64px; margin: -32px 0 0 -32px; border: 2px solid var(--good); border-radius: 10px; pointer-events: none; z-index: 4; animation: focuspop .9s ease forwards; }
+@keyframes focuspop { 0% { transform: scale(1.7); opacity: 0; } 20% { opacity: 1; } 100% { transform: scale(1); opacity: .9; } }
 .guide { position: absolute; left: 50%; top: 50%; height: 78%; aspect-ratio: 63 / 88; transform: translate(-50%, -50%); border-radius: 14px; pointer-events: none;
   box-shadow: 0 0 0 9999px rgba(0, 0, 0, .45); border: 2px dashed rgba(255,255,255,.55); transition: border-color .2s; }
 .guide.found { border: 2px solid var(--good); }

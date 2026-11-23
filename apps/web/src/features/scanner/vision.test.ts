@@ -6,9 +6,9 @@ import { detectCard, expandQuad, refineCrop, regionSignature, signatureDiff, CAR
  * border, a body and a bright title bar near the top (the case that used to
  * pull the detected top edge onto the text).
  */
-function frame(opts: { deg: number; bg: number; border: number; body: number; title: number; w?: number; h?: number }) {
+function frame(opts: { deg: number; bg: number; border: number; body: number; title: number; w?: number; h?: number; ch?: number; guideMul?: number }) {
   const W = opts.w ?? 360, H = opts.h ?? 203;
-  const ch = 158, cw = ch * CARD_RATIO;
+  const ch = opts.ch ?? 158, cw = ch * CARD_RATIO;
   const cx = W / 2, cy = H / 2;
   const a = (opts.deg * Math.PI) / 180, cos = Math.cos(a), sin = Math.sin(a);
   const g = new Float32Array(W * H);
@@ -31,7 +31,7 @@ function frame(opts: { deg: number; bg: number; border: number; body: number; ti
   const corner = (u: number, v: number): Pt => ({ x: cx + u * cos - v * sin, y: cy + u * sin + v * cos });
   const truth = [corner(-cw / 2, -ch / 2), corner(cw / 2, -ch / 2), corner(cw / 2, ch / 2), corner(-cw / 2, ch / 2)];
   // guide drawn by the UI: upright, 78%-of-height card outline centred in view
-  const gh = ch * 1.02, gw = gh * CARD_RATIO;
+  const gh = ch * 1.02 * (opts.guideMul ?? 1), gw = gh * CARD_RATIO;
   return { g, W, H, truth, guide: { x: cx - gw / 2, y: cy - gh / 2, w: gw, h: gh } };
 }
 
@@ -94,6 +94,22 @@ describe('detectCard', () => {
   it('returns nothing on an empty table', () => {
     const f = frame({ deg: 0, bg: 21, border: 21, body: 21, title: 21 });
     expect(detectCard(f.g, f.W, f.H, f.guide)).toBeNull();
+  });
+
+  it('finds a card held smaller than the guide (multi-scale search)', () => {
+    // card at ~60% of the guide: its top/bottom edges fall outside the
+    // guide's own search bands, so only a scaled guide can find it
+    const f = frame({ deg: 2, bg: 21, border: 230, body: 245, title: 20, ch: 95, guideMul: 1.67 });
+    const d = detectCard(f.g, f.W, f.H, f.guide);
+    expect(d).not.toBeNull();
+    expect(maxCornerError(d!.corners, f.truth)).toBeLessThan(3);
+  });
+
+  it('locates edges to sub-pixel accuracy', () => {
+    const f = frame({ deg: 0, bg: 21, border: 230, body: 245, title: 20 });
+    const d = detectCard(f.g, f.W, f.H, f.guide);
+    expect(d).not.toBeNull();
+    expect(maxCornerError(d!.corners, f.truth)).toBeLessThan(1.5);
   });
 });
 

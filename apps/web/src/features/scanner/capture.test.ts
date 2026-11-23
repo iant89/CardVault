@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { CARD_RATIO, planCapture, rectQuad, warpCard, type Pt, type Quad } from './vision';
+import { CARD_RATIO, correctPhoto, planCapture, rectQuad, sharpen, warpCard, type Pt, type Quad } from './vision';
 
 beforeAll(() => {
   // node has no ImageData; a minimal stand-in is all the vision code uses
@@ -100,6 +100,45 @@ describe('planCapture', () => {
     const p = planCapture(img, rectQuad(guide), guide);
     expect(p.needsReview).toBe(true);
     expect(p.adjusted).toBeNull();
+  });
+});
+
+describe('correctPhoto (uploaded photos)', () => {
+  it('straightens the card found in the photo', () => {
+    const { img, guide } = scene(5, -12, 8);
+    const corrected = correctPhoto(img, guide);
+    expect(corrected).not.toBeNull();
+    expect(corrected!.width).toBe(750);
+    expect(corrected!.height).toBe(Math.round(750 / CARD_RATIO));
+  });
+
+  it('keeps the photo when no card can be found', () => {
+    const img = new ImageData(W, H);
+    img.data.fill(90);
+    const { guide } = scene(0);
+    expect(correctPhoto(img, guide)).toBeNull();
+  });
+});
+
+describe('sharpen', () => {
+  it('increases edge contrast', () => {
+    const img = new ImageData(5, 5);
+    for (let y = 0; y < 5; y++) {
+      for (let x = 0; x < 5; x++) {
+        const v = x < 2 ? 40 : 200;
+        const o = (y * 5 + x) * 4;
+        img.data[o] = img.data[o + 1] = img.data[o + 2] = v;
+        img.data[o + 3] = 255;
+      }
+    }
+    sharpen(img, 0.5);
+    const at = (x: number, y: number) => img.data[(y * 5 + x) * 4]!;
+    // the dark pixel beside the edge gets darker, the bright one brighter
+    expect(at(1, 2)).toBeLessThan(40);
+    expect(at(2, 2)).toBeGreaterThan(200);
+    // far from the edge nothing changes
+    expect(at(0, 2)).toBe(40);
+    expect(at(4, 2)).toBe(200);
   });
 });
 
