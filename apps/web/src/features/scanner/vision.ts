@@ -30,7 +30,100 @@ export interface Detection {
   confidence: number;
 }
 
+export type QuarterTurn = 0 | 90 | 180 | 270;
+export type DetectionTurn = 0 | 90 | 270;
+
+/** A normalized title-line region, using fractions of the card's width and height. */
+export interface OrientationRegion {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+export interface OrientationCorrection {
+  image: ImageData;
+  /** Clockwise degrees applied to the card image. */
+  rotation: 0 | 180;
+  /** Confidence that a half-turn was needed (0–1; zero when left untouched). */
+  confidence: number;
+}
+
 export const CARD_RATIO = 63 / 88;
+
+/** Rotate an ImageData clockwise without a canvas round-trip. */
+export function rotateImageData(img: ImageData, degrees: QuarterTurn): ImageData {
+  if (degrees === 0) return img;
+  const width = degrees === 180 ? img.width : img.height;
+  const height = degrees === 180 ? img.height : img.width;
+  const out = new ImageData(width, height);
+  for (let y = 0; y < img.height; y++) {
+    for (let x = 0; x < img.width; x++) {
+      let dx: number, dy: number;
+      if (degrees === 90) (dx = img.height - 1 - y), (dy = x);
+      else if (degrees === 180) (dx = img.width - 1 - x), (dy = img.height - 1 - y);
+      else (dx = y), (dy = img.width - 1 - x);
+      const from = (y * img.width + x) * 4;
+      const to = (dy * width + dx) * 4;
+      out.data[to] = img.data[from]!;
+      out.data[to + 1] = img.data[from + 1]!;
+      out.data[to + 2] = img.data[from + 2]!;
+      out.data[to + 3] = img.data[from + 3]!;
+    }
+  }
+  return out;
+}
+
+function regionEdgeScore(img: ImageData, region: OrientationRegion): number {
+  const x0 = Math.max(2, Math.floor(region.left * img.width));
+  const y0 = Math.max(2, Math.floor(region.top * img.height));
+  const x1 = Math.min(img.width - 2, Math.ceil((region.left + region.width) * img.width));
+  const y1 = Math.min(img.height - 2, Math.ceil((region.top + region.height) * img.height));
+  if (x1 - x0 < 6 || y1 - y0 < 6) return 0;
+  const lum = (x: number, y: number) => {
+    const i = (y * img.width + x) * 4;
+    return 0.299 * img.data[i]! + 0.587 * img.data[i + 1]! + 0.114 * img.data[i + 2]!;
+  };
+  let score = 0, strong = 0, count = 0;
+  // Sample at half resolution; the title uses larger strokes than the tiny
+  // copyright/footer text, and the two-pixel derivative ignores camera noise.
+  for (let y = y0 + 2; y < y1 - 2; y += 2) {
+    for (let x = x0 + 2; x < x1 - 2; x += 2) {
+      const edge = Math.abs(lum(x + 2, y) - lum(x - 2, y)) + Math.abs(lum(x, y + 2) - lum(x, y - 2));
+      score += Math.max(0, Math.min(1, (edge - 22) / 300));
+      if (edge >= 55) strong++;
+      count++;
+    }
+  }
+  return count ? score / count + (strong / count) * 0.15 : 0;
+}
+
+/**
+ * Normalize a cropped card to its title-at-top orientation. The decision is
+ * deliberately conservative: compare edge energy in each game's known name
+ * region with the region that would occupy the same spot after a half-turn;
+ * ambiguous or texture-heavy crops are left untouched.
+ */
+export function correctCardOrientation(img: ImageData, nameRegions: readonly OrientationRegion[] = []): OrientationCorrection {
+  if (!nameRegions.length || img.width < 8 || img.height < 8) return { image: img, rotation: 0, confidence: 0 };
+  let topScore = 0, bottomScore = 0;
+  for (const r of nameRegions) {
+    if (![r.left, r.top, r.width, r.height].every(Number.isFinite) || r.width <= 0 || r.height <= 0) continue;
+    const top = regionEdgeScore(img, r);
+    const bottom = regionEdgeScore(img, { ...r, left: 1 - r.left - r.width, top: 1 - r.top - r.height });
+    topScore = Math.max(topScore, top);
+    bottomScore = Math.max(bottomScore, bottom);
+  }
+  const margin = bottomScore - topScore;
+  const ratio = bottomScore / Math.max(topScore, 0.004);
+  // A modest evidence floor suppresses flips caused by the card's footer or artwork.
+  if (bottomScore >= 0.018 && margin >= 0.008 && ratio >= 1.65) {
+    const confidence = Math.max(0, Math.min(1, margin / Math.max(bottomScore, 0.02)));
+    return { image: rotateImageData(img, 180), rotation: 180, confidence };
+  }
+  return { image: img, rotation: 0, confidence: 0 };
+}
+
 /** Sobel magnitude that counts as a card edge (≈ 15 grey levels of contrast). */
 const EDGE_FLOOR = 60;
 
@@ -198,6 +291,64 @@ export function detectCard(gray: Float32Array, w: number, h: number, guide: Rect
     const d = detectAtScale(gray, w, h, sc === 1 ? guide : scaleRect(guide, sc));
     if (d && (!best || d.confidence > best.confidence)) best = d;
     if (best && best.confidence >= 0.6) break;
+  }
+  return best;
+}
+
+export interface OrientedDetection extends Detection {
+  /** Rotate the source clockwise by this amount to make the card portrait. */
+  rotation: DetectionTurn;
+}
+
+function rotateGray(gray: Float32Array, w: number, h: number, degrees: DetectionTurn): { gray: Float32Array; w: number; h: number } {
+  if (degrees === 0) return { gray, w, h };
+  const width = h, height = w, out = new Float32Array(width * height);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const dx = degrees === 90 ? h - 1 - y : y;
+      const dy = degrees === 90 ? x : w - 1 - x;
+      out[dy * width + dx] = gray[y * w + x]!;
+    }
+  }
+  return { gray: out, w: width, h: height };
+}
+
+function pointInSource(p: Pt, w: number, h: number, degrees: DetectionTurn): Pt {
+  if (degrees === 90) return { x: p.y, y: h - 1 - p.x };
+  if (degrees === 270) return { x: w - 1 - p.y, y: p.x };
+  return p;
+}
+
+function guideInRotatedFrame(guide: Rect, w: number, h: number, degrees: DetectionTurn): Rect {
+  if (degrees === 0) return guide;
+  const cx = guide.x + guide.w / 2, cy = guide.y + guide.h / 2;
+  const center = degrees === 90 ? { x: h - 1 - cy, y: cx } : { x: cy, y: w - 1 - cx };
+  // `guide` describes the portrait target; after rotating the frame, keep its
+  // dimensions and move its centre with the image.
+  return { x: center.x - guide.w / 2, y: center.y - guide.h / 2, w: guide.w, h: guide.h };
+}
+
+/**
+ * Detect a portrait card whether the source image is upright or turned on its
+ * side. The returned corner order follows the card's logical top-left, so a
+ * later homography can both straighten and orient a 90°/270° source.
+ */
+export function detectCardAnyOrientation(gray: Float32Array, w: number, h: number, guide: Rect, includeUpright = true): OrientedDetection | null {
+  let best: OrientedDetection | null = null;
+  const rotations: readonly DetectionTurn[] = includeUpright ? [0, 90, 270] : [90, 270];
+  for (const rotation of rotations) {
+    const rotated = rotateGray(gray, w, h, rotation);
+    const rotatedGuide = guideInRotatedFrame(guide, w, h, rotation);
+    const detection = detectCard(rotated.gray, rotated.w, rotated.h, rotatedGuide);
+    if (!detection) continue;
+    const candidate: OrientedDetection = {
+      ...detection,
+      corners: detection.corners.map((p) => pointInSource(p, w, h, rotation)) as Detection['corners'],
+      rotation,
+    };
+    // Prefer the unrotated interpretation when evidence ties; side turns are
+    // only needed when the expected portrait search did not fit the card.
+    if (!best || candidate.confidence > best.confidence + 0.015) best = candidate;
   }
   return best;
 }
@@ -459,7 +610,7 @@ export function expandQuad(q: Quad, pad: number): Quad {
 }
 
 /** A capture is treated as misaligned when a corner is off by more than this fraction of the card width. */
-export const MISALIGNED = 0.02;
+export const MISALIGNED = 0.01;
 
 export interface Refinement {
   /** the card's real corners in the padded crop's coordinates */
@@ -540,12 +691,33 @@ function locateAround(frame: ImageData, quad: Quad, pad: number, analysisW: numb
   return { corners: r.corners.map(toFrame) as Quad, deviation: r.deviation };
 }
 
+function quadDeviation(corners: Quad, expected: Quad): number {
+  const width = Math.hypot(expected[1].x - expected[0].x, expected[1].y - expected[0].y);
+  if (!(width > 0)) return Infinity;
+  return Math.max(...corners.map((p, i) => Math.hypot(p.x - expected[i]!.x, p.y - expected[i]!.y))) / width;
+}
+
+/** Find an upright or side-turned card in the full frame, then map its logical corners back. */
+function locateAnyOrientation(frame: ImageData, guide: Rect, analysisW: number): { corners: Quad; rotation: DetectionTurn; confidence: number } | null {
+  const { g, w, h, sc } = grayDownscale(frame, analysisW);
+  const scaledGuide = { x: guide.x * sc, y: guide.y * sc, w: guide.w * sc, h: guide.h * sc };
+  let detection = detectCardAnyOrientation(g, w, h, scaledGuide);
+  if (!detection) detection = detectCardAnyOrientation(enhanceGray(g, w, h), w, h, scaledGuide);
+  if (!detection) return null;
+  return {
+    corners: detection.corners.map((p) => ({ x: p.x / sc, y: p.y / sc })) as Quad,
+    rotation: detection.rotation,
+    confidence: detection.confidence,
+  };
+}
+
 /**
  * Decide what a capture produces. The photo is saved without asking only when
  * the card's real edges were re-found and match the crop. A wrong live outline
  * (cut-off, angled crop) or one that can't be checked goes to review: first
- * the card is searched for around the outline, then, wider, around the guide
- * the user placed it in. If it is found, a corrected crop is offered.
+ * the card is searched for around the outline, then around the guide, then in
+ * the full frame at upright and side-turned orientations. If found, a corrected
+ * crop is offered.
  */
 export function planCapture(frame: ImageData, live: Quad | null, guide: Rect, minW = 750, analysisW = 360, maxW = minW): CapturePlan {
   const base = live ?? rectQuad(guide);
@@ -558,27 +730,46 @@ export function planCapture(frame: ImageData, live: Quad | null, guide: Rect, mi
   if (found && found.deviation <= MISALIGNED) return { original, adjusted: null, deviation: found.deviation, needsReview: false };
   let deviation = found?.deviation ?? null;
   if (!found) {
+    const expected = base;
     const g = locateAround(frame, rectQuad(guide), GUIDE_PAD, analysisW);
     if (g) {
-      // compare against the crop actually taken
-      const dev = Math.max(...g.corners.map((p, i) => Math.hypot(p.x - base[i]!.x, p.y - base[i]!.y))) / Math.hypot(base[1].x - base[0].x, base[1].y - base[0].y);
+      const dev = quadDeviation(g.corners, expected);
       if (dev <= MISALIGNED) return { original, adjusted: null, deviation: dev, needsReview: false };
       found = { corners: g.corners, deviation: dev };
-      deviation = dev;
     }
+
+    // A portrait-only search misses a card that was photographed on its side.
+    // Retry the full frame at 90°/270° and prefer a real side-turn over a weak
+    // guide-local fit; an accepted result becomes the corrected review crop.
+    const oriented = locateAnyOrientation(frame, guide, analysisW);
+    if (oriented) {
+      const dev = quadDeviation(oriented.corners, expected);
+      if (oriented.rotation !== 0 || !found || dev < found.deviation) found = { corners: oriented.corners, deviation: dev };
+    }
+    deviation = found?.deviation ?? null;
+    if (found && found.deviation <= MISALIGNED) return { original, adjusted: null, deviation: found.deviation, needsReview: false };
   }
   return { original, adjusted: found ? warpCard(frame, found.corners, outW) : null, deviation, needsReview: true };
 }
 
 /**
- * Correct an uploaded photo: find the card around `guide` and return a
- * straightened, polished crop — or null when no card is found, in which case
- * the photo is kept as it is. Same corrector as the camera, without the
- * keep/retake review (there is nothing to retake).
+ * Convenience form for an uploaded photo: find the card around `guide` and
+ * return a straightened, polished crop, or null if the card cannot be found.
+ * `nameRegions` enables conservative 180° correction; callers that need a
+ * keep/retake decision should use `planCapture` and present its crops.
  */
-export function correctPhoto(frame: ImageData, guide: Rect, minW = 750, analysisW = 360, maxW = 1500): ImageData | null {
+export function correctPhoto(
+  frame: ImageData,
+  guide: Rect,
+  minW = 750,
+  analysisW = 360,
+  maxW = 1500,
+  nameRegions: readonly OrientationRegion[] = [],
+): ImageData | null {
   const plan = planCapture(frame, null, guide, minW, analysisW, maxW);
   const img = plan.adjusted ?? (plan.needsReview ? null : plan.original);
-  if (img) finishCard(img);
-  return img;
+  if (!img) return null;
+  const orientation = correctCardOrientation(img, nameRegions);
+  finishCard(orientation.image);
+  return orientation.image;
 }

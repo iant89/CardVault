@@ -1,5 +1,20 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { CARD_RATIO, correctPhoto, planCapture, rectQuad, sharpen, warpCard, type Pt, type Quad } from './vision';
+import {
+  CARD_RATIO,
+  correctCardOrientation,
+  correctPhoto,
+  detectCardAnyOrientation,
+  grayDownscale,
+  MISALIGNED,
+  planCapture,
+  rectQuad,
+  rotateImageData,
+  sharpen,
+  warpCard,
+  type OrientationRegion,
+  type Pt,
+  type Quad,
+} from './vision';
 
 beforeAll(() => {
   // node has no ImageData; a minimal stand-in is all the vision code uses
@@ -15,6 +30,11 @@ beforeAll(() => {
 
 const W = 960, H = 540;
 const CH = 420, CW = CH * CARD_RATIO;
+
+function centeredPhotoGuide(w: number, h: number) {
+  const gh = Math.min(h * 0.85, (w * 0.85) / CARD_RATIO);
+  return { x: (w - gh * CARD_RATIO) / 2, y: (h - gh) / 2, w: gh * CARD_RATIO, h: gh };
+}
 
 /** A camera frame: a patterned card, rotated `deg`, offset by (ox, oy), on a darker table. */
 function scene(deg: number, ox = 0, oy = 0) {
@@ -50,12 +70,67 @@ function diff(a: ImageData, b: ImageData) {
   return s / (a.data.length / 4);
 }
 
+function titleCardSample() {
+  const img = new ImageData(750, Math.round(750 / CARD_RATIO));
+  for (let i = 0; i < img.data.length; i += 4) {
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = 238;
+    img.data[i + 3] = 255;
+  }
+  const x0 = Math.round(0.15 * img.width) + 12;
+  const y0 = Math.round(0.035 * img.height) + 12;
+  const fill = (x: number, y: number, w: number, h: number) => {
+    for (let yy = y; yy < y + h; yy++) for (let xx = x; xx < x + w; xx++) {
+      const i = (yy * img.width + xx) * 4;
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = 25;
+    }
+  };
+  // A line of high-contrast glyph-like strokes in the known title band.
+  for (let n = 0; n < 13; n++) {
+    const x = x0 + n * 22, h = 20 + (n % 3) * 4;
+    fill(x, y0 + 18, 5, h);
+    if (n % 2 === 0) fill(x + 9, y0 + 18, 5, h);
+    fill(x, y0 + 18, 14, 4);
+    fill(x, y0 + 18 + Math.floor(h / 2), 14, 4);
+  }
+  return img;
+}
+
 describe('planCapture', () => {
   it('saves without asking when the live outline is on the card', () => {
     const { img, truth, guide } = scene(3);
     const p = planCapture(img, truth, guide);
     expect(p.needsReview).toBe(false);
     expect(p.adjusted).toBeNull();
+  });
+
+  it('flags a one-percent crop offset for alignment review', () => {
+    const { img, truth, guide } = scene(0);
+    const dx = CW * 0.01;
+    const slightlyOff = truth.map((p) => ({ x: p.x + dx, y: p.y })) as Quad;
+    const p = planCapture(img, slightlyOff, guide);
+    expect(p.deviation).toBeGreaterThan(MISALIGNED);
+    expect(p.needsReview).toBe(true);
+    expect(p.adjusted).not.toBeNull();
+  });
+
+  it('finds a card held on its side and offers a portrait correction', () => {
+    const { img } = scene(0);
+    const sideways = rotateImageData(img, 90);
+    const guide = centeredPhotoGuide(sideways.width, sideways.height);
+    const small = grayDownscale(sideways, 360);
+    const detection = detectCardAnyOrientation(small.g, small.w, small.h, {
+      x: guide.x * small.sc,
+      y: guide.y * small.sc,
+      w: guide.w * small.sc,
+      h: guide.h * small.sc,
+    }, false);
+    expect(detection).not.toBeNull();
+    expect(detection!.rotation).not.toBe(0);
+    const p = planCapture(sideways, null, guide);
+    expect(p.needsReview).toBe(true);
+    expect(p.adjusted).not.toBeNull();
+    expect(p.adjusted!.width).toBe(750);
+    expect(p.adjusted!.height).toBe(Math.round(750 / CARD_RATIO));
   });
 
   it('a skewed, wrong live outline is caught and a corrected crop is offered', () => {
@@ -117,6 +192,60 @@ describe('correctPhoto (uploaded photos)', () => {
     img.data.fill(90);
     const { guide } = scene(0);
     expect(correctPhoto(img, guide)).toBeNull();
+  });
+});
+
+describe('orientation correction', () => {
+  const titleRegion: OrientationRegion = { left: 0.15, top: 0.035, width: 0.6, height: 0.07 };
+
+  it('rotates an upside-down card only when the title band clearly sits at the bottom', () => {
+    const upright = titleCardSample();
+    expect(correctCardOrientation(upright, [titleRegion]).rotation).toBe(0);
+    const upsideDown = rotateImageData(upright, 180);
+    const corrected = correctCardOrientation(upsideDown, [titleRegion]);
+    expect(corrected.rotation).toBe(180);
+    expect(corrected.confidence).toBeGreaterThan(0);
+    expect(diff(corrected.image, upright)).toBe(0);
+  });
+
+  it('does not guess a half-turn without title-layout evidence', () => {
+    const upsideDown = rotateImageData(titleCardSample(), 180);
+    expect(correctCardOrientation(upsideDown).rotation).toBe(0);
+  });
+
+  it('warps a side-turned photo back to portrait and resolves the 90° direction', () => {
+    const upright = titleCardSample();
+    const sidewaysCard = rotateImageData(upright, 90);
+    const frame = new ImageData(1400, 1100);
+    for (let i = 0; i < frame.data.length; i += 4) {
+      frame.data[i] = frame.data[i + 1] = frame.data[i + 2] = 32;
+      frame.data[i + 3] = 255;
+    }
+    const ox = Math.floor((frame.width - sidewaysCard.width) / 2);
+    const oy = Math.floor((frame.height - sidewaysCard.height) / 2);
+    for (let y = 0; y < sidewaysCard.height; y++) {
+      for (let x = 0; x < sidewaysCard.width; x++) {
+        const from = (y * sidewaysCard.width + x) * 4;
+        const to = ((oy + y) * frame.width + ox + x) * 4;
+        frame.data.set(sidewaysCard.data.subarray(from, from + 4), to);
+      }
+    }
+    const guide = centeredPhotoGuide(frame.width, frame.height);
+    const small = grayDownscale(frame, 360);
+    const detection = detectCardAnyOrientation(small.g, small.w, small.h, {
+      x: guide.x * small.sc,
+      y: guide.y * small.sc,
+      w: guide.w * small.sc,
+      h: guide.h * small.sc,
+    });
+    expect(detection).not.toBeNull();
+    expect(detection!.rotation).not.toBe(0);
+    const corners = detection!.corners.map((p) => ({ x: p.x / small.sc, y: p.y / small.sc })) as Quad;
+    const crop = warpCard(frame, corners, upright.width);
+    const normalized = correctCardOrientation(crop, [titleRegion]);
+    expect(normalized.image.width).toBe(upright.width);
+    expect(normalized.image.height).toBe(upright.height);
+    expect(diff(normalized.image, upright)).toBeLessThan(5);
   });
 });
 
