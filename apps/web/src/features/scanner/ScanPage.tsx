@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOfflineQueue } from './offlineQueue';
+import { GAME_MODULES } from '@cardvault/card-model';
 import {
   assessQuality,
   CARD_RATIO,
-  correctPhoto,
+  correctCardOrientation,
   detectCard,
+  detectCardAnyOrientation,
   enhanceGray,
   finishCard,
   planCapture,
@@ -13,6 +15,7 @@ import {
   signatureDiff,
   toGray,
   type Detection,
+  type OrientationRegion,
   type Quad,
   type Quality,
   type Rect,
@@ -36,6 +39,11 @@ const GAMES = [
   { slug: 'basketball', label: 'Basketball' },
   { slug: 'hockey', label: 'Hockey' },
 ];
+const DEFAULT_TITLE_REGIONS: OrientationRegion[] = Object.values(GAME_MODULES).flatMap((module) => module.ocrLayout?.name ?? []);
+const titleRegionsFor = (slug: string): readonly OrientationRegion[] => {
+  const module = GAME_MODULES[slug as keyof typeof GAME_MODULES];
+  return module?.ocrLayout?.name.length ? module.ocrLayout.name : DEFAULT_TITLE_REGIONS;
+};
 const RESOLUTIONS = { '720p': [1280, 720], '1080p': [1920, 1080], '4K': [3840, 2160] } as const;
 type Res = keyof typeof RESOLUTIONS;
 const ANALYSIS_W = 360;
@@ -147,7 +155,18 @@ interface AlignReview {
   /** the straightened crop; null when the card's edges couldn't be found to correct it */
   adjusted: { blob: Blob; url: string } | null;
   quality: Record<string, unknown>;
+  originalRotation: 0 | 180;
+  adjustedRotation: 0 | 180 | null;
   target: { scanId: string; name: string } | null;
+}
+
+interface UploadCorrection {
+  original: Blob;
+  adjusted: Blob | null;
+  needsReview: boolean;
+  deviation: number | null;
+  originalRotation: 0 | 180;
+  adjustedRotation: 0 | 180 | null;
 }
 
 const pref = (k: string, d: string) => {
@@ -609,6 +628,8 @@ export default function ScanPage() {
   /** Queue a final image and continue the single/batch flow. */
   const commitCapture = useCallback(
     async (blob: Blob, quality: Record<string, unknown>, target: { scanId: string; name: string } | null) => {
+      retakeRef.current = null;
+      setRetakeState(null);
       toast(target ? `Captured — replacing the photo of ${target.name}` : 'Captured', 'success');
       const localId = await add(blob, { gameHint: game || undefined, replaceScanId: target?.scanId, label: target?.name, quality });
       if (batch) {
@@ -649,7 +670,11 @@ export default function ScanPage() {
       // real edges; anything not verified goes to the keep/retake review
       const live = det ? (det.corners.map((p) => ({ x: p.x * k, y: p.y * k })) as Quad) : null;
       const plan = planCapture(frame, live, guide, OUT_W, ANALYSIS_W, MAX_OUT_W);
-      const original = plan.original;
+      const titleRegions = titleRegionsFor(game);
+      const originalOrientation = correctCardOrientation(plan.original, titleRegions);
+      const adjustedOrientation = plan.adjusted ? correctCardOrientation(plan.adjusted, titleRegions) : null;
+      const original = originalOrientation.image;
+      const adjustedImage = adjustedOrientation?.image ?? null;
 
       setFlash((f) => f + 1);
       if (sound) beep();
@@ -668,21 +693,23 @@ export default function ScanPage() {
       const originalBlob = await toBlob(original);
       if (!originalBlob) return;
       if (!plan.needsReview) {
-        await commitCapture(originalBlob, quality, target);
+        await commitCapture(originalBlob, { ...quality, orientation: originalOrientation.rotation }, target);
         return;
       }
 
       // not verified: offer the corrected crop (if the card was found) and ask
       let adjusted: { blob: Blob; url: string } | null = null;
-      if (plan.adjusted) {
-        finishCard(plan.adjusted);
-        const b = await toBlob(plan.adjusted);
+      if (adjustedImage) {
+        finishCard(adjustedImage);
+        const b = await toBlob(adjustedImage);
         if (b) adjusted = { blob: b, url: URL.createObjectURL(b) };
       }
       setReview({
         original: { blob: originalBlob, url: URL.createObjectURL(originalBlob) },
         adjusted,
         quality,
+        originalRotation: originalOrientation.rotation,
+        adjustedRotation: adjustedOrientation?.rotation ?? null,
         target,
       });
     },
@@ -702,18 +729,23 @@ export default function ScanPage() {
     const rv = reviewRef.current;
     if (!rv?.adjusted) return;
     closeReview();
-    await commitCapture(rv.adjusted.blob, { ...rv.quality, adjusted: true }, rv.target);
+    await commitCapture(rv.adjusted.blob, { ...rv.quality, adjusted: true, orientation: rv.adjustedRotation ?? 0 }, rv.target);
   };
   const useOriginal = async () => {
     const rv = reviewRef.current;
     if (!rv) return;
     closeReview();
-    await commitCapture(rv.original.blob, { ...rv.quality, adjusted: false }, rv.target);
+    await commitCapture(rv.original.blob, { ...rv.quality, adjusted: false, orientation: rv.originalRotation }, rv.target);
   };
   const retakeCapture = () => {
     const rv = reviewRef.current;
     closeReview();
     if (rv?.target) setRetake(rv.target); // a sidebar retake stays a retake
+    if (rv?.quality.source === 'file') {
+      toast('Choose another photo to retry the alignment check', 'info');
+      setTimeout(() => fileInputRef.current?.click(), 0);
+      return;
+    }
     // the same card is expected back in frame: arm for it immediately
     lastSigRef.current = null;
     Object.assign(detRef.current, { armed: true, stable: 0, newCard: 0, emptySince: null });
@@ -799,6 +831,7 @@ export default function ScanPage() {
     if (camState !== 'on') return;
     let raf = 0;
     let last = 0;
+    let lastTurnedSearch = 0;
     analysisRef.current ??= document.createElement('canvas');
     const loop = (t: number) => {
       raf = requestAnimationFrame(loop);
@@ -825,9 +858,15 @@ export default function ScanPage() {
       }
       // ease the outline toward each new measurement so it stops jittering;
       // a card that jumps (swap, hand-off) snaps instead of smearing.
-      // detection assist: retry on a contrast-enhanced frame when the raw one yields nothing
-      const raw =
-        detectCard(g, a.width, a.height, guide) ?? (featRef.current.assist ? detectCard(enhanceGray(g, a.width, a.height), a.width, a.height, guide) : null);
+      // detection assist retries low-contrast frames; a throttled side-turn probe
+      // keeps sideways cards available to auto-capture without tripling every frame's work.
+      let raw = detectCard(g, a.width, a.height, guide);
+      if (!raw && featRef.current.assist) raw = detectCard(enhanceGray(g, a.width, a.height), a.width, a.height, guide);
+      if (!raw && t - lastTurnedSearch >= 500) {
+        lastTurnedSearch = t;
+        raw = detectCardAnyOrientation(g, a.width, a.height, guide, false);
+        if (!raw && featRef.current.assist) raw = detectCardAnyOrientation(enhanceGray(g, a.width, a.height), a.width, a.height, guide, false);
+      }
       const det = smoothDetection(st.smooth, raw, guide.w);
       st.smooth = det;
       const sig = det ? regionSignature(g, a.width, guide) : null;
@@ -940,10 +979,11 @@ export default function ScanPage() {
                   ? 'HOLD STILL…'
                   : 'READY';
 
-  /** Run the camera's corrector over an uploaded photo; null when no card is found. */
-  const correctUpload = async (blob: Blob): Promise<Blob | null> => {
+  /** Find/correct an uploaded card and retain both crops when alignment needs review. */
+  const correctUpload = async (blob: Blob): Promise<UploadCorrection | null> => {
+    let url: string | null = null;
     try {
-      const url = URL.createObjectURL(blob);
+      url = URL.createObjectURL(blob);
       const img = new Image();
       img.src = url;
       await img.decode();
@@ -956,20 +996,40 @@ export default function ScanPage() {
       c.height = h;
       const ctx = c.getContext('2d', { willReadFrequently: true })!;
       ctx.drawImage(img, 0, 0, w, h);
-      URL.revokeObjectURL(url);
       const frame = ctx.getImageData(0, 0, w, h);
-      // a centred card-ratio guide filling most of the smaller dimension
+      // A centred card-ratio guide filling most of the smaller dimension.
       const gh = Math.min(h * 0.85, (w * 0.85) / CARD_RATIO);
       const guide = { x: (w - gh * CARD_RATIO) / 2, y: (h - gh) / 2, w: gh * CARD_RATIO, h: gh };
-      const corrected = correctPhoto(frame, guide, OUT_W, ANALYSIS_W, MAX_OUT_W);
-      if (!corrected) return null;
-      const oc = document.createElement('canvas');
-      oc.width = corrected.width;
-      oc.height = corrected.height;
-      oc.getContext('2d')!.putImageData(corrected, 0, 0);
-      return await new Promise<Blob | null>((r) => oc.toBlob(r, 'image/jpeg', 0.92));
+      const plan = planCapture(frame, null, guide, OUT_W, ANALYSIS_W, MAX_OUT_W);
+      if (plan.needsReview && !plan.adjusted) return null; // keep the untouched upload if edges are uncertain
+
+      const regions = titleRegionsFor(game);
+      const originalOrientation = correctCardOrientation(plan.original, regions);
+      finishCard(originalOrientation.image);
+      const original = await toBlob(originalOrientation.image);
+      if (!original) return null;
+
+      let adjusted: Blob | null = null;
+      let adjustedRotation: 0 | 180 | null = null;
+      if (plan.adjusted) {
+        const corrected = correctCardOrientation(plan.adjusted, regions);
+        finishCard(corrected.image);
+        adjusted = await toBlob(corrected.image);
+        if (!adjusted) return null;
+        adjustedRotation = corrected.rotation;
+      }
+      return {
+        original,
+        adjusted,
+        needsReview: plan.needsReview,
+        deviation: plan.deviation,
+        originalRotation: originalOrientation.rotation,
+        adjustedRotation,
+      };
     } catch {
       return null;
+    } finally {
+      if (url) URL.revokeObjectURL(url);
     }
   };
 
@@ -979,9 +1039,22 @@ export default function ScanPage() {
     try {
       toast('Preparing photo…', 'info');
       const prepared = await preparePhoto(f);
-      // straighten the card if it can be found in the photo, else keep it as-is
-      const blob = (await correctUpload(prepared)) ?? prepared;
-      const localId = await add(blob, { gameHint: game || undefined, quality: { source: 'file' }, replaceScanId: target?.scanId, label: target?.name });
+      const correction = await correctUpload(prepared);
+      if (correction?.needsReview && correction.adjusted) {
+        setReview({
+          original: { blob: correction.original, url: URL.createObjectURL(correction.original) },
+          adjusted: { blob: correction.adjusted, url: URL.createObjectURL(correction.adjusted) },
+          quality: { source: 'file', alignment: correction.deviation == null ? null : Math.round(correction.deviation * 1000) / 1000 },
+          originalRotation: correction.originalRotation,
+          adjustedRotation: correction.adjustedRotation,
+          target,
+        });
+        return;
+      }
+      // If no confident card boundary was found, preserve the upload unchanged.
+      const blob = correction?.original ?? prepared;
+      const quality = correction ? { source: 'file', alignment: correction.deviation, orientation: correction.originalRotation } : { source: 'file' };
+      const localId = await add(blob, { gameHint: game || undefined, quality, replaceScanId: target?.scanId, label: target?.name });
       if (!localId) {
         toast('Not signed in — sign in again and retry.', 'error');
         return;
@@ -1359,6 +1432,7 @@ function AlignmentReview({
   onRetake: () => void;
 }) {
   const corrected = review.adjusted;
+  const isUpload = review.quality.source === 'file';
   return (
     <div className="single-result align-review" role="dialog" aria-label="Check card alignment">
       <div className={`align-pair ${corrected ? '' : 'single'}`}>
@@ -1369,21 +1443,21 @@ function AlignmentReview({
           </figure>
         )}
         <figure className="align-option">
-          <img src={review.original.url} alt="Original capture" />
-          <figcaption>Original</figcaption>
+          <img src={review.original.url} alt={isUpload ? 'Original card crop' : 'Original capture'} />
+          <figcaption>{isUpload ? 'Original crop' : 'Original'}</figcaption>
         </figure>
       </div>
       <div className="single-card panel">
-        <strong>{corrected ? 'This card looked misaligned, so we corrected it.' : 'We couldn’t find the card’s edges to check this photo.'}</strong>
+        <strong>{corrected ? `This ${isUpload ? 'photo' : 'card'} looked misaligned, so we corrected it.` : 'We couldn’t find the card’s edges to check this photo.'}</strong>
         <div className="faint" style={{ fontSize: 13 }}>
-          {corrected ? 'Compare the two and choose which photo to keep — or retake it.' : 'Make sure the whole card is in the photo and straight. Keep it, or retake?'}
+          {corrected ? `Compare the two and choose which ${isUpload ? 'crop' : 'photo'} to keep — or ${isUpload ? 'choose another photo' : 'retake it'}.` : 'Make sure the whole card is in the photo and straight. Keep it, or retake?'}
         </div>
         <div className="row wrap" style={{ gap: 6, justifyContent: 'flex-end' }}>
           <button className="btn sm ghost" onClick={onRetake}>
-            Retake
+            {isUpload ? 'Choose another' : 'Retake'}
           </button>
           <button className={`btn sm ${corrected ? '' : 'primary'}`} onClick={onKeepOriginal} autoFocus={!corrected}>
-            Keep original
+            {isUpload ? 'Keep original crop' : 'Keep original'}
           </button>
           {corrected && (
             <button className="btn sm primary" onClick={onKeepCorrected} autoFocus>
