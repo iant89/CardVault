@@ -5,9 +5,11 @@ import {
   CARD_RATIO,
   correctPhoto,
   detectCard,
+  enhanceGray,
   finishCard,
   planCapture,
   regionSignature,
+  autoZoomTarget,
   signatureDiff,
   toGray,
   type Detection,
@@ -48,6 +50,88 @@ const SAME_CARD_DIFF = 12;
 const NEW_CARD_FRAMES = 8;
 
 type Phase = 'idle' | 'captured' | 'ready';
+
+/** Track capabilities we use that are not (yet) in the DOM lib types. */
+type CameraCaps = MediaTrackCapabilities & {
+  torch?: boolean;
+  focusMode?: string[];
+  exposureMode?: string[];
+  exposureCompensation?: { min: number; max: number; step: number };
+  whiteBalanceMode?: string[];
+};
+
+/**
+ * Fixed-position (tripod) tuning: lock focus, white balance and exposure in
+ * place and nudge exposure toward mid-gray once, based on the measured scene
+ * brightness. Locked values survive the whole session — nothing pumps
+ * frame-to-frame and fights the detection algorithm.
+ *
+ * `includeFocus: false` leaves focus on continuous (used at camera start,
+ * before autofocus has settled — the analysis loop applies the focus lock a
+ * moment later once the scene is stable).
+ */
+async function lockForFixedSpot(track: MediaStreamTrack, brightness: number | null, includeFocus = true) {
+  const c = (track.getCapabilities?.() ?? {}) as CameraCaps;
+  const set: Record<string, unknown>[] = [];
+  if (includeFocus && c.focusMode?.includes('locked')) set.push({ focusMode: 'locked' });
+  if (c.whiteBalanceMode?.includes('locked')) set.push({ whiteBalanceMode: 'locked' });
+  if (c.exposureMode?.includes('locked')) set.push({ exposureMode: 'locked' });
+  if (set.length) await track.applyConstraints({ advanced: set as MediaTrackConstraintSet[] }).catch(() => undefined);
+  if (c.exposureCompensation && brightness != null) {
+    const r = c.exposureCompensation;
+    // nudge toward a mid-gray hold: darker scenes get positive compensation, bright ones negative
+    let ev = ((128 - brightness) / 255) * 1.6;
+    ev = Math.max(r.min, Math.min(r.max, ev));
+    if (r.step > 0) ev = Math.round(ev / r.step) * r.step;
+    await track.applyConstraints({ advanced: [{ exposureCompensation: Math.round(ev * 100) / 100 } as MediaTrackConstraintSet] }).catch(() => undefined);
+  }
+}
+
+/** Release the fixed-spot lock: hand focus, exposure and white balance back to the camera. */
+async function restoreAutoModes(track: MediaStreamTrack) {
+  const c = (track.getCapabilities?.() ?? {}) as CameraCaps;
+  const set: Record<string, unknown>[] = [];
+  if (c.focusMode?.includes('continuous')) set.push({ focusMode: 'continuous' });
+  if (c.exposureMode?.includes('continuous')) set.push({ exposureMode: 'continuous' });
+  if (c.whiteBalanceMode?.includes('continuous')) set.push({ whiteBalanceMode: 'continuous' });
+  if (set.length) await track.applyConstraints({ advanced: set as MediaTrackConstraintSet[] }).catch(() => undefined);
+  // drop the tuned compensation so automatic exposure starts from a neutral baseline
+  if (c.exposureCompensation) {
+    const zero = Math.max(c.exposureCompensation.min, Math.min(c.exposureCompensation.max, 0));
+    await track.applyConstraints({ advanced: [{ exposureCompensation: zero } as MediaTrackConstraintSet] }).catch(() => undefined);
+  }
+}
+
+// ---- feature icons (iPhone camera-app style)
+const svgProps = { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true };
+const IconAutoZoom = () => (
+  <svg {...svgProps}>
+    <circle cx="10.5" cy="10.5" r="6.3" />
+    <line x1="15.3" y1="15.3" x2="20.4" y2="20.4" />
+    <path d="M10.5 7.7v5.6M7.7 10.5h5.6" />
+  </svg>
+);
+const IconRefocus = () => (
+  <svg {...svgProps}>
+    <path d="M4 9V5.5A1.5 1.5 0 0 1 5.5 4H9" />
+    <path d="M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9" />
+    <path d="M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15" />
+    <path d="M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15" />
+    <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
+  </svg>
+);
+const IconAssist = () => (
+  <svg {...svgProps} stroke="none" fill="currentColor">
+    <path d="M11.2 3.4l1.95 5.3 5.3 1.95-5.3 1.95-1.95 5.3-1.95-5.3-5.3-1.95 5.3-1.95 1.95-5.3z" />
+    <path d="M18.6 13.2l.95 2.6 2.6.95-2.6.95-.95 2.6-.95-2.6-2.6-.95 2.6-.95.95-2.6z" />
+  </svg>
+);
+const IconFixed = () => (
+  <svg {...svgProps}>
+    <circle cx="12" cy="4.6" r="2.2" />
+    <path d="M12 6.8v4M12 10.8L6.6 20M12 10.8L17.4 20M12 10.8V20" />
+  </svg>
+);
 
 /** Output width of a captured card image (height follows the 63:88 ratio). */
 const OUT_W = 750;
@@ -189,6 +273,25 @@ export default function ScanPage() {
   const [focusPt, setFocusPt] = useState<{ x: number; y: number } | null>(null);
   const focusTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   useEffect(() => () => clearTimeout(zoomTimer.current), []);
+  // ---- capability toggles (iPhone-style icons on the camera view)
+  const [autoZoom, setAutoZoom] = useState(pref('autoZoom', 'true') === 'true');
+  const [autoRefocus, setAutoRefocus] = useState(pref('autoRefocus', 'true') === 'true');
+  const [assist, setAssist] = useState(pref('assist', 'true') === 'true');
+  /** fixed position (tripod): tune once for the environment, then stop adjusting */
+  const [fixed, setFixed] = useState(pref('fixed', 'false') === 'true');
+  const featRef = useRef({ autoZoom, autoRefocus, assist, fixed });
+  useEffect(() => {
+    featRef.current = { autoZoom, autoRefocus, assist, fixed };
+  }, [autoZoom, autoRefocus, assist, fixed]);
+  /** the one-shot exposure tune in fixed mode already ran (reset on camera start / fixed off) */
+  const fixedTunedRef = useRef(false);
+  /** consecutive blurry analysis frames, for the sustained-blur refocus trigger */
+  const blurRun = useRef(0);
+  const lastRefocus = useRef(0);
+  const refocusCount = useRef(0);
+  /** last time the user zoomed by hand — auto-zoom stays out of the way for a while after */
+  const userZoomHoldRef = useRef(0);
+  const lastAutoZoom = useRef(0);
   const [flash, setFlash] = useState(0);
   const [phase, setPhaseState] = useState<Phase>('idle');
   const [torch, setTorch] = useState<boolean | null>(null);
@@ -259,7 +362,7 @@ export default function ScanPage() {
       }
       streamRef.current = stream;
       const track = stream.getVideoTracks()[0];
-      const caps = (track?.getCapabilities?.() ?? {}) as MediaTrackCapabilities & { torch?: boolean; focusMode?: string[]; zoom?: { min: number; max: number; step: number } };
+      const caps = (track?.getCapabilities?.() ?? {}) as CameraCaps & { zoom?: { min: number; max: number; step: number } };
       if (caps.focusMode?.includes('continuous')) await track!.applyConstraints({ advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet] }).catch(() => undefined);
       focusManualRef.current = !!caps.focusMode?.includes('manual');
       setTorch(caps.torch ? false : null);
@@ -275,6 +378,10 @@ export default function ScanPage() {
         cameraZoomRef.current = false;
         setZoomMax(1);
       }
+      // fixed position: lock exposure/white balance now; the analysis loop locks focus
+      // a moment later, once autofocus has settled on the scene
+      fixedTunedRef.current = false;
+      if (featRef.current.fixed && track) await lockForFixedSpot(track, null, false);
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play().catch(() => undefined);
@@ -313,6 +420,58 @@ export default function ScanPage() {
     setTorch(!torch);
   };
 
+  // ---- feature toggles (the icons on the camera view)
+  const toggleFeat = (which: 'autoZoom' | 'autoRefocus' | 'assist') => {
+    const next = !featRef.current[which];
+    featRef.current = { ...featRef.current, [which]: next };
+    if (which === 'autoZoom') setAutoZoom(next);
+    else if (which === 'autoRefocus') setAutoRefocus(next);
+    else setAssist(next);
+    savePref(which, String(next));
+  };
+
+  const toggleFixed = async () => {
+    const next = !featRef.current.fixed;
+    featRef.current = { ...featRef.current, fixed: next };
+    setFixed(next);
+    savePref('fixed', String(next));
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (next) {
+      // tune right away from the last quality reading; if the camera is mid-start,
+      // the analysis loop applies the EV tune on the first frame instead
+      fixedTunedRef.current = !!track;
+      if (track) await lockForFixedSpot(track, qualityRef.current?.brightness ?? null);
+    } else {
+      fixedTunedRef.current = false;
+      if (track) await restoreAutoModes(track);
+    }
+    toast(
+      next ? 'Fixed position — focus, exposure and white balance tuned and locked' : 'Fixed position off — the camera adjusts automatically again',
+      'info',
+    );
+  };
+
+  /** Nudge the camera to re-hunt focus on the card after sustained blur. False when the device exposes no focus control. */
+  const refocus = (det: Detection | null): boolean => {
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (!track) return false;
+    const c = (track.getCapabilities?.() ?? {}) as CameraCaps;
+    const modes = c.focusMode ?? [];
+    const mode = modes.includes('continuous') ? 'continuous' : modes.includes('single-shot') ? 'single-shot' : modes.includes('manual') ? 'manual' : null;
+    if (!mode) return false;
+    let poi = { x: 0.5, y: 0.5 };
+    const a = analysisRef.current;
+    if (det && a?.width && a.height) {
+      const cx = det.corners.reduce((s, p) => s + p.x, 0) / 4;
+      const cy = det.corners.reduce((s, p) => s + p.y, 0) / 4;
+      poi = { x: Math.min(1, Math.max(0, cx / a.width)), y: Math.min(1, Math.max(0, cy / a.height)) };
+    }
+    // nudge the point of interest so the lens re-evaluates even with identical values
+    poi = { x: Math.min(1, Math.max(0, poi.x + (refocusCount.current % 2 ? 0.02 : -0.02))), y: poi.y };
+    void track.applyConstraints({ advanced: [{ focusMode: mode, pointsOfInterest: [poi] } as MediaTrackConstraintSet] }).catch(() => undefined);
+    return true;
+  };
+
   // ---- geometry: guide rectangle in video pixel space
   // The guide is fixed on screen. Camera zoom narrows the stream itself, so
   // the guide maps as at 1×; CSS zoom shows the frame's centre enlarged, so
@@ -332,7 +491,8 @@ export default function ScanPage() {
 
   // ---- zoom controls
   const changeZoom = useCallback(
-    (z: number) => {
+    (z: number, user = true) => {
+      if (user) userZoomHoldRef.current = performance.now();
       const max = cameraZoomRef.current ? zoomMax : CSS_ZOOM_MAX;
       const clamped = Math.max(1, Math.min(max, z));
       zoomRef.current = clamped;
@@ -371,7 +531,7 @@ export default function ScanPage() {
     const vx = Math.max(0, Math.min(1, (px - (W - dw) / 2) / dw));
     const vy = Math.max(0, Math.min(1, (py - (H - dh) / 2) / dh));
     void track
-      .applyConstraints({ advanced: [{ focusMode: 'manual', pointsOfInterest: [{ x: vx, y: vy }] } as MediaTrackConstraintSet] })
+      .applyConstraints({ advanced: [{ focusMode: featRef.current.fixed ? 'locked' : 'manual', pointsOfInterest: [{ x: vx, y: vy }] } as MediaTrackConstraintSet] })
       .catch(() => undefined);
     setFocusPt({ x: px, y: py });
     clearTimeout(focusTimer.current);
@@ -657,9 +817,17 @@ export default function ScanPage() {
       const guide = { x: guideV.x * s, y: guideV.y * s, w: guideV.w * s, h: guideV.h * s };
       const q = assessQuality(g, max, a.width, guide);
       const st = detRef.current;
+      // fixed position: the one-time focus lock + exposure tune, now that autofocus has settled and we have a scene reading
+      if (featRef.current.fixed && !fixedTunedRef.current) {
+        fixedTunedRef.current = true; // one shot — the lock holds it steady from here
+        const track = streamRef.current?.getVideoTracks()[0];
+        if (track) void lockForFixedSpot(track, q.brightness);
+      }
       // ease the outline toward each new measurement so it stops jittering;
-      // a card that jumps (swap, hand-off) snaps instead of smearing
-      const raw = detectCard(g, a.width, a.height, guide);
+      // a card that jumps (swap, hand-off) snaps instead of smearing.
+      // detection assist: retry on a contrast-enhanced frame when the raw one yields nothing
+      const raw =
+        detectCard(g, a.width, a.height, guide) ?? (featRef.current.assist ? detectCard(enhanceGray(g, a.width, a.height), a.width, a.height, guide) : null);
       const det = smoothDetection(st.smooth, raw, guide.w);
       st.smooth = det;
       const sig = det ? regionSignature(g, a.width, guide) : null;
@@ -689,12 +857,45 @@ export default function ScanPage() {
       setQuality(q);
       setFound(!!det);
       setConf(det?.confidence ?? 0);
+      // sustained blur → ask the camera to re-hunt focus on the card
+      // (skipped in fixed mode: focus is locked there by design)
+      if (q.blurry && featRef.current.autoRefocus && !featRef.current.fixed) {
+        blurRun.current += 1;
+        if (blurRun.current >= 12 && t - lastRefocus.current > 2600 && refocusCount.current < 4 && refocus(det)) {
+          lastRefocus.current = t;
+          refocusCount.current += 1;
+        }
+      } else {
+        blurRun.current = 0;
+        if (!q.blurry) refocusCount.current = 0;
+      }
+      // zoom until the card fills the guide (eased, rate-limited, yields to the user)
+      if (featRef.current.autoZoom && det && t - lastAutoZoom.current > 1200 && performance.now() - userZoomHoldRef.current > 6000 && !reviewRef.current) {
+        const vp = vpRef.current,
+          vEl = videoRef.current;
+        if (vp && vEl?.videoWidth) {
+          const xs = det.corners.map((p) => p.x);
+          const bw = (Math.max(...xs) - Math.min(...xs)) / a.width; // card width as a fraction of the frame
+          const sCover = Math.max(vp.clientWidth / vEl.videoWidth, vp.clientHeight / vEl.videoHeight);
+          const dw = vEl.videoWidth * sCover;
+          const target = autoZoomTarget(bw, dw, vp.clientHeight);
+          const zNow = zoomRef.current;
+          const zCap = cameraZoomRef.current ? zoomMax : CSS_ZOOM_MAX;
+          const want = Math.max(1, Math.min(zCap, target));
+          const ratio = want / zNow;
+          if (ratio > 1.12 || ratio < 1 / 1.12) {
+            const stepped = ratio > 1 ? zNow * Math.min(ratio, 1.35) : zNow * Math.max(ratio, 1 / 1.35);
+            lastAutoZoom.current = t;
+            changeZoom(stepped, false);
+          }
+        }
+      }
       drawOverlay(det, s);
       if (auto && st.armed && det && q.ok && st.stable >= STABLE_FRAMES && !reviewRef.current) void capture('auto');
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [camState, auto, capture, guideInVideo]);
+  }, [camState, auto, capture, guideInVideo, changeZoom, zoomMax]);
 
   const drawOverlay = (det: Detection | null, s: number) => {
     const c = overlayRef.current,
@@ -874,6 +1075,53 @@ export default function ScanPage() {
             </div>
 
             {camState === 'on' && !review && !captured && (
+              <div className="vp-features" role="group" aria-label="Detection features">
+                <button
+                  className={`feat ${autoZoom ? 'on' : ''}`}
+                  onClick={() => toggleFeat('autoZoom')}
+                  aria-pressed={autoZoom}
+                  title={`Auto zoom to the detected card — ${autoZoom ? 'on' : 'off'}`}
+                  aria-label="Auto zoom to frame"
+                >
+                  <IconAutoZoom />
+                </button>
+                <button
+                  className={`feat ${autoRefocus && !fixed ? 'on' : ''} ${fixed ? 'dim' : ''}`}
+                  onClick={() => {
+                    if (fixed) {
+                      toast('Auto refocus is suspended while the camera is locked in a fixed position', 'info');
+                      return;
+                    }
+                    toggleFeat('autoRefocus');
+                  }}
+                  aria-pressed={autoRefocus && !fixed}
+                  title={fixed ? 'Auto refocus — suspended in fixed position (turn fixed position off to use)' : `Auto refocus when blur persists — ${autoRefocus ? 'on' : 'off'}`}
+                  aria-label="Auto refocus"
+                >
+                  <IconRefocus />
+                </button>
+                <button
+                  className={`feat ${assist ? 'on' : ''}`}
+                  onClick={() => toggleFeat('assist')}
+                  aria-pressed={assist}
+                  title={`Detection assist — retry on a contrast-enhanced frame — ${assist ? 'on' : 'off'}`}
+                  aria-label="Detection assist"
+                >
+                  <IconAssist />
+                </button>
+                <button
+                  className={`feat ${fixed ? 'on' : ''}`}
+                  onClick={() => void toggleFixed()}
+                  aria-pressed={fixed}
+                  title={fixed ? 'Fixed position — focus, exposure and white balance locked (tap to restore auto)' : 'Fixed position (tripod) — tune once for this spot, then stop adjusting'}
+                  aria-label="Fixed position camera"
+                >
+                  <IconFixed />
+                </button>
+              </div>
+            )}
+
+            {camState === 'on' && !review && !captured && (
               <div className="vp-zoom" role="group" aria-label="Zoom">
                 <button onClick={() => changeZoom(zoom - 0.25)} aria-label="Zoom out" title="Zoom out">
                   −
@@ -971,6 +1219,18 @@ export default function ScanPage() {
                   </label>
                   <label className="checkbox">
                     <input type="checkbox" checked={sound} onChange={(e) => (setSound(e.target.checked), savePref('sound', String(e.target.checked)))} /> Beep on capture
+                  </label>
+                  <label className="checkbox">
+                    <input type="checkbox" checked={fixed} onChange={() => void toggleFixed()} /> Fixed position (tripod) — tune for this spot, then lock focus, exposure and white balance
+                  </label>
+                  <label className="checkbox">
+                    <input type="checkbox" checked={autoZoom} onChange={() => toggleFeat('autoZoom')} /> Auto zoom to frame when a card is found
+                  </label>
+                  <label className="checkbox">
+                    <input type="checkbox" checked={autoRefocus} disabled={fixed} onChange={() => toggleFeat('autoRefocus')} /> Auto refocus on sustained blur{fixed ? ' (suspended in fixed position)' : ''}
+                  </label>
+                  <label className="checkbox">
+                    <input type="checkbox" checked={assist} onChange={() => toggleFeat('assist')} /> Detection assist — retry on a contrast-enhanced frame
                   </label>
                   <div className="faint" style={{ fontSize: 13 }}>
                     Tips: plain dark background, even light from above, card flat inside the frame. Sleeves and top-loaders add glare.

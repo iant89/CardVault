@@ -111,6 +111,19 @@ function fitLine(pts: { u: number; v: number }[]): { a: number; b: number; inlie
 }
 
 /**
+ * Zoom level that would make a card whose width is `cardWFrac` of the frame
+ * fill `fill` of the on-screen guide. Viewport height sets the guide size
+ * (78% of it); `frameDisplayedW` is the video's rendered width. The result is
+ * not clamped — the caller limits it to the device's zoom range and adds a
+ * dead band, so a card that nearly fits doesn't nudge the zoom.
+ */
+export function autoZoomTarget(cardWFrac: number, frameDisplayedW: number, viewportH: number, fill = 0.85): number {
+  if (!(cardWFrac > 0) || !(frameDisplayedW > 0) || !(viewportH > 0)) return 1;
+  const guideW = viewportH * 0.78 * CARD_RATIO;
+  return (fill * guideW) / (cardWFrac * frameDisplayedW);
+}
+
+/**
  * Detect the card around the on-screen guide. For each side we cast short
  * scan-lines across the expected edge, take the outermost strong gradient
  * and fit a line; the four line intersections are the card corners.
@@ -307,6 +320,44 @@ export function warpCard(src: ImageData, corners: [Pt, Pt, Pt, Pt], outW = 750):
     }
   }
   return dst;
+}
+
+/**
+ * Contrast-stretch a grayscale frame for detection: percentile stretch
+ * (1st–99th) plus a mild sharpen. Used as a fallback when the raw frame
+ * yields no card — low-contrast scenes (haze, dim light, a dark card on a
+ * dark table) push the card's gradients below the edge floor, and this lifts
+ * them back above it. Only ever a fallback, so it can't do worse than the
+ * raw frame (which already failed).
+ */
+export function enhanceGray(g: Float32Array, w: number, h: number): Float32Array {
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < g.length; i++) hist[Math.max(0, Math.min(255, Math.round(g[i]!)))]!++;
+  const total = g.length;
+  let acc = 0, lo = 0, hi = 255;
+  for (let i = 0; i < 256; i++) {
+    acc += hist[i]!;
+    if (acc < total * 0.01) lo = i;
+    if (acc < total * 0.99) hi = i;
+  }
+  const out = new Float32Array(g.length);
+  if (hi - lo < 6) {
+    out.set(g); // near-uniform: stretching would only amplify noise
+    return out;
+  }
+  const k = 255 / (hi - lo);
+  for (let i = 0; i < g.length; i++) out[i] = Math.max(0, Math.min(255, (g[i]! - lo) * k));
+  // mild sharpen: soft edges lose gradient magnitude, and the detector needs it
+  const src = new Float32Array(out);
+  const amt = 0.25;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const lap = 4 * src[i]! - src[i - 1]! - src[i + 1]! - src[i - w]! - src[i + w]!;
+      out[i] = Math.max(0, Math.min(255, src[i]! + amt * lap));
+    }
+  }
+  return out;
 }
 
 /** Normalize exposure: stretch luminance to the 1st–99th percentile. */
