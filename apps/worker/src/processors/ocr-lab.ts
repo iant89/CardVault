@@ -12,6 +12,8 @@ import { labelScanSamples } from '../identification/samples.js';
 import { nameIndex } from '../identification/dictionary.js';
 import { etaFromPace, percent } from '@cardvault/shared';
 import { ensureTask, saveTask, taskProgress } from '@cardvault/jobs';
+import { writeVisionDataset, type VisionGroup } from '../identification/vision-dataset.js';
+import { evaluateClassifier, isClassifierRow, scanVisionModels } from './ocr-lab-vision.js';
 
 type Sample = typeof ocrSamples.$inferSelect;
 
@@ -74,6 +76,52 @@ export async function evaluate(ctx: WorkerContext, data: { evaluationId: string 
     if (stillWanted && stillWanted.status === 'failed') {
       await saveTask(ctx.redis, { key: taskKey, kind: 'evaluation', name: task.name, state: 'cancelled', error: 'Cancelled before it started.', progress: 0 });
       return { error: 'cancelled' };
+    }
+    // a game classifier is scored on cards, not lines: its units are the exam's
+    // images and its answer is a game, so it has its own path through this
+    if (ev.engine.startsWith('model:')) {
+      const [row] = await ctx.db.select().from(ocrModels).where(eq(ocrModels.id, ev.engine.slice('model:'.length)));
+      if (row && isClassifierRow(row.card)) {
+        const engineId = `classifier:${row.id}`;
+        await ctx.db.update(ocrEvaluations).set({ status: 'running', engine: engineId, examId: exam.id, examVersion: exam.version, progress: { done: 0, total: 1 } }).where(eq(ocrEvaluations.id, ev.id));
+        await taskProgress(ctx.redis, task.key, { progress: 10, detail: 'Classifying the exam’s cards…' });
+        const r = await evaluateClassifier(ctx, { id: row.id, dir: row.dir, card: row.card }, exam.sampleIds);
+        const sliceOf = (slice: string) => r.slices.find((x) => x.slice === slice) ?? null;
+        const summary = {
+          engine: engineId,
+          kind: 'card-classifier',
+          examVersion: exam.version,
+          units: r.units,
+          exam: r.units,
+          correct: r.correct,
+          abstained: r.abstained,
+          missingImages: r.missingImages,
+          game: sliceOf('all · game'),
+          name: null,
+          number: null,
+          regression: { name: null, number: null },
+          msPerLine: r.msPerCard,
+          durationMs: Date.now() - started,
+          comparedTo: null,
+        };
+        await ctx.db
+          .update(ocrEvaluations)
+          .set({ status: 'done', summary, slices: r.slices as unknown as Record<string, unknown>[], misses: r.misses, progress: { done: 1, total: 1 }, completedAt: new Date() })
+          .where(eq(ocrEvaluations.id, ev.id));
+        const pctGame = r.units ? `${((r.correct / r.units) * 100).toFixed(1)}%` : '—';
+        await saveTask(ctx.redis, {
+          key: task.key,
+          kind: 'evaluation',
+          name: task.name,
+          state: 'done',
+          progress: 100,
+          progressLabel: `${r.units.toLocaleString()} cards`,
+          detail: `Games ${pctGame} right · ${r.abstained} abstained · ${r.msPerCard ?? '?'} ms/card`,
+          error: null,
+        });
+        ctx.log.info({ evaluation: ev.id, game: r.units ? r.correct / r.units : null }, 'card classifier evaluation finished');
+        return { ok: true };
+      }
     }
     const engine = await engineFor(ctx, ev.engine.startsWith('model:') ? ev.engine : 'tesseract');
     await ctx.db.update(ocrEvaluations).set({ status: 'running', engine: engine.id, examId: exam.id, examVersion: exam.version, progress: { done: 0, total: units.length } }).where(eq(ocrEvaluations.id, ev.id));
@@ -383,17 +431,61 @@ export async function exportDataset(ctx: WorkerContext) {
   }
   const body = lines.join('\n') + '\n';
   const { createHash } = await import('node:crypto');
+  const jsonlSha256 = createHash('sha256').update(body).digest('hex');
+  await writeFileSafe(ctx.storageDir, `ocr/datasets/${id}/train.jsonl`, Buffer.from(body));
+
+  // ---- the same snapshot in CardVault-Vision's manifest format: whole cards
+  // with every field's box, which is what `vision train` reads. Written from the
+  // rows that are trustworthy training data, never the exam side.
+  await taskProgress(ctx.redis, task.key, { progress: 60, detail: 'Writing the CardVault-Vision dataset…' });
+  const groups = new Map<string, VisionGroup>();
+  const imageOf = await groupImages(ctx, all.map((r) => r.group_key));
+  for (const r of all) {
+    const meta = (r.meta ?? {}) as Record<string, unknown>;
+    const g = groups.get(r.group_key) ?? {
+      groupKey: r.group_key,
+      game: r.game,
+      cardId: null,
+      imagePath: imageOf.get(r.group_key) ?? '',
+      harvest: r.label_source === 'harvest',
+      nameRegion: null,
+      numberRegion: null,
+      nameText: null,
+      numberText: null,
+      meta: { era: meta.era, set: meta.set, source: r.label_source },
+    };
+    if (!g.imagePath) continue;
+    if (r.field === 'name' && r.label_text && g.nameText == null) {
+      g.nameText = r.label_text;
+      g.nameRegion = r.region;
+    }
+    if (r.field === 'number' && g.numberRegion == null) {
+      const text = r.label_source === 'harvest' ? (numberRegion[String(meta.set)] === r.region ? printedNumber(r.label_text ?? '') : null) : r.label_text;
+      if (text) {
+        g.numberText = text;
+        g.numberRegion = r.region;
+      }
+    }
+    groups.set(r.group_key, g);
+  }
+  const createdAt = new Date().toISOString();
+  const vision = await writeVisionDataset(ctx, id, [...groups.values()], { jsonlSha256, counts, createdAt, split: 'train' }).catch((e: Error) => {
+    ctx.log.warn({ dataset: id, err: e.message }, 'could not write the CardVault-Vision dataset');
+    return null;
+  });
+
   const info = {
     id,
-    createdAt: new Date().toISOString(),
+    createdAt,
     rows: lines.length,
     counts,
-    sha256: createHash('sha256').update(body).digest('hex'),
+    sha256: jsonlSha256,
     numberRegions: numberRegion,
     storage: ctx.storageDir,
     rules: 'split=train only; sources review/corroborated/harvest; review x2, regression x3',
+    /** the CardVault-Vision manifest beside train.jsonl (`vision train --dataset <dir>`) */
+    vision: vision ? { dir: vision.dir, samples: vision.samples, cards: vision.cards, fields: vision.fields, skipped: vision.skipped, contentHash: vision.contentHash } : null,
   };
-  await writeFileSafe(ctx.storageDir, `ocr/datasets/${id}/train.jsonl`, Buffer.from(body));
   await writeFileSafe(ctx.storageDir, `ocr/datasets/${id}/info.json`, Buffer.from(JSON.stringify(info, null, 2)));
   await ctx.redis.set(DATASET_KEY, JSON.stringify({ ...info, dir: path.join(ctx.storageDir, 'ocr', 'datasets', id) }));
   await saveTask(ctx.redis, {
@@ -403,17 +495,69 @@ export async function exportDataset(ctx: WorkerContext) {
     state: 'done',
     progress: 100,
     progressLabel: `${lines.length.toLocaleString()} lines`,
-    detail: `${lines.length.toLocaleString()} lines in ${id} (${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')})`,
+    detail: `${lines.length.toLocaleString()} lines in ${id} (${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')})${vision ? ` · ${vision.samples.toLocaleString()} whole cards for CardVault-Vision` : ''}`,
     result: id,
     error: null,
   });
-  ctx.log.info({ dataset: id, rows: lines.length }, 'OCR training data exported');
+  ctx.log.info({ dataset: id, rows: lines.length, vision: vision?.samples ?? 0 }, 'OCR training data exported');
   return info;
+}
+
+/**
+ * The full image each training group was read from: a scan's photo, or a
+ * harvested card's official image (made camera-like when the manifest is
+ * written). Groups with no image are left out — a sample cannot be annotated
+ * without the pixels its boxes refer to.
+ */
+async function groupImages(ctx: WorkerContext, groupKeys: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (!groupKeys.length) return out;
+  const rows = (await ctx.db.execute(sql`
+    SELECT group_key, max(image_path) AS image_path FROM (
+      SELECT s.group_key, sc.image_path
+      FROM ocr_samples s JOIN scans sc ON sc.id = s.scan_id
+      WHERE s.group_key IN (SELECT jsonb_array_elements_text(${JSON.stringify(groupKeys)}::jsonb))
+      UNION ALL
+      SELECT s.group_key, NULL::text AS image_path
+      FROM ocr_samples s WHERE s.group_key IN (SELECT jsonb_array_elements_text(${JSON.stringify(groupKeys)}::jsonb)) AND s.label_source = 'harvest'
+    ) x GROUP BY group_key`)) as unknown as { group_key: string; image_path: string | null }[];
+  for (const r of rows) if (r.image_path) out.set(r.group_key, r.image_path);
+  // harvested groups: the original card image lives beside the crop in the
+  // harvest folder, keyed by the card id in the group key (`harvest:<lang>:<id>`)
+  for (const key of groupKeys) {
+    if (out.has(key) || !key.startsWith('harvest:')) continue;
+    const path = await harvestImagePath(ctx, key);
+    if (path) out.set(key, path);
+  }
+  return out;
+}
+
+/** The download a `harvest:<lang>:<cardId>` group came from, if it is still there. */
+async function harvestImagePath(ctx: WorkerContext, groupKey: string): Promise<string | null> {
+  const parts = groupKey.split(':');
+  const lang = parts[1];
+  const cardId = parts.slice(2).join(':');
+  if (!lang || !cardId) return null;
+  const root = path.resolve(ctx.config.HARVESTER_OUT_DIR ?? path.join(ctx.storageDir, 'tcgdex-data'));
+  const cards = JSON.parse(await readFile(path.join(root, lang, 'cards.json'), 'utf8').catch(() => 'null')) as { id: string; image?: string }[] | null;
+  const card = cards?.find((c) => c.id === cardId);
+  if (!card?.image) return null;
+  const abs = path.join(root, card.image);
+  const { stat } = await import('node:fs/promises');
+  if (!(await stat(abs).catch(() => null))?.isFile()) return null;
+  // the manifest's paths are relative to the storage folder, like every other
+  // sample's, so the artifact stays inside storage
+  return path.relative(ctx.storageDir, abs);
 }
 
 // ------------------------------------------------------------------ model registry
 
-/** Register models the trainer wrote to storage/ocr/models/<id>/ (model.onnx + card.json). */
+/**
+ * Register every model on disk that OCR Lab can score:
+ *  - what tools/ocr-trainer wrote to `ocr/models/<id>/` (model.onnx + card.json)
+ *  - CardVault-Vision exports under the Vision roots (`ocr/vision/exports`,
+ *    VISION_MODELS_DIR): one row per OCR pair, one per card classifier
+ */
 export async function scanModels(ctx: WorkerContext) {
   const { readdir } = await import('node:fs/promises');
   const root = path.join(ctx.storageDir, 'ocr', 'models');
@@ -424,11 +568,18 @@ export async function scanModels(ctx: WorkerContext) {
     const card = JSON.parse(await readFile(path.join(root, d.name, 'card.json'), 'utf8').catch(() => 'null')) as { id?: string } | null;
     const onnx = await readFile(path.join(root, d.name, 'model.onnx')).then(() => true, () => false);
     if (!card?.id || !onnx) continue;
-    const r = await ctx.db.insert(ocrModels).values({ id: card.id, dir: `ocr/models/${d.name}`, card: card as Record<string, unknown> }).onConflictDoNothing().returning({ id: ocrModels.id });
+    const values = { id: card.id, dir: `ocr/models/${d.name}`, card: { kind: 'trainer', ...card } as Record<string, unknown> };
+    const r = await ctx.db.insert(ocrModels).values(values).onConflictDoNothing().returning({ id: ocrModels.id });
     added += r.length;
   }
-  if (added) ctx.log.info({ added }, 'OCR models registered');
-  return { added };
+  // CardVault-Vision artifacts: verified (checksum, contract) before they are
+  // registered, so a broken export shows its reason instead of loading later
+  const vision = await scanVisionModels(ctx).catch((e: Error) => {
+    ctx.log.warn({ err: e.message }, 'could not scan CardVault-Vision exports');
+    return { models: [] as string[], errors: [{ dir: '', error: e.message }], registered: [], found: [] };
+  });
+  if (added || vision.models.length) ctx.log.info({ added: added + vision.models.length, vision: vision.models }, 'OCR models registered');
+  return { added: added + vision.models.length, legacy: added, vision: vision.models, errors: vision.errors };
 }
 
 export { ENGINE_ID, metrics };

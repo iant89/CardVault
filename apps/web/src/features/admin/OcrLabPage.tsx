@@ -3,9 +3,12 @@ import type { LabQueue, LabTask } from '@cardvault/shared';
 import { api, ApiError } from '../../services/api';
 import { useAsync } from '../../hooks/useAsync';
 import { Dialog, Loading, Empty } from '../../components/ui';
+import { ProgressRing } from '../../components/ProgressRing';
+import { formatEta } from './ocr/labFormat';
 import { toast } from '../../stores/toasts';
 import { queueSummaryText } from './ocr/labFormat';
 import {
+  AlertIcon,
   CheckIcon,
   ChevronIcon,
   ClockIcon,
@@ -18,6 +21,7 @@ import {
   ScanIcon,
   ShieldIcon,
   SparkIcon,
+  StopIcon,
   TargetIcon,
   XIcon,
 } from '../../components/icons';
@@ -45,6 +49,12 @@ export interface Summary {
   missingCrops?: number;
   name?: Slice | null;
   number?: Slice | null;
+  /** a game classifier's exam score: cards, not lines */
+  kind?: string;
+  correct?: number;
+  abstained?: number;
+  missingImages?: number;
+  game?: Slice | null;
   regression?: { name: Slice | null; number: Slice | null };
   msPerLine?: number | null;
   durationMs?: number;
@@ -95,6 +105,15 @@ interface Watch {
 interface Model {
   id: string;
   status: 'candidate' | 'shadow' | 'active' | 'retired';
+  /** what reads the card: a CardVault-Vision OCR pair or classifier, or a legacy trainer model */
+  kind?: 'vision-ocr' | 'card-classifier' | 'trainer';
+  task?: string;
+  version?: string | null;
+  heads?: { name?: string; number?: string } | null;
+  exportedAt?: string | null;
+  validation?: unknown;
+  gitCommit?: string | null;
+  canTrial?: boolean;
   trial: Trial | null;
   trialStartedAt: string | null;
   watch: Watch | null;
@@ -113,6 +132,7 @@ interface Model {
 interface Models {
   examVersion: number | null;
   champion: { engine: string; evaluationId: string | null } | null;
+  classifierChampion: { engine: string; evaluationId: string | null } | null;
   trialMinLines: number;
   models: Model[];
   events: { action: string; entityId: string; metadata: Record<string, unknown>; createdAt: string }[];
@@ -122,6 +142,32 @@ interface DatasetInfo {
   rows: number;
   counts: Record<string, number>;
   createdAt: string | null;
+  /** the whole-card manifest written beside the lines, for CardVault-Vision */
+  vision: { samples: number; cards: number; fields: Record<string, number> } | null;
+}
+
+/** A CardVault-Vision run (`vision train` + `vision export` per head). */
+export interface VisionRun {
+  status: 'queued' | 'starting' | 'running' | 'exporting' | 'done' | 'failed' | 'cancelled';
+  kind: string;
+  dataset: string;
+  version?: string;
+  epochs?: number;
+  device?: string;
+  stages: { task: string; state: string; bestMetric?: number | null; metricName?: string | null; epochs?: number; exportDir?: string; modelId?: string; error?: string }[];
+  task?: string;
+  epoch?: number;
+  cer?: number | null;
+  macroF1?: number | null;
+  history?: { epoch: number; loss: number; cer?: number | null; macroF1?: number | null }[];
+  step?: number;
+  steps?: number;
+  etaSeconds?: number | null;
+  python?: string;
+  error?: string;
+  log?: string[];
+  startedAt?: string;
+  finishedAt?: string;
 }
 export interface Overview {
   counts: { source: string; field: string; split: string; n: number }[];
@@ -132,6 +178,7 @@ export interface Overview {
   dataset: { id: string; createdAt: string; rows: number; counts: Record<string, number>; dir: string; storage: string } | null;
   datasets: DatasetInfo[];
   training: TrainingRun | null;
+  vision: VisionRun | null;
   python: TrainerPython;
   evaluations: Evaluation[];
 }
@@ -399,7 +446,8 @@ export function OverviewTab({
 }) {
   const count = (source: string, field: string, split?: string) =>
     d.counts.filter((c) => c.source === source && c.field === field && (!split || c.split === split)).reduce((a, c) => a + c.n, 0);
-  const active = m?.models.find((x) => x.status === 'active');
+  const active = m?.models.find((x) => x.status === 'active' && x.kind !== 'card-classifier');
+  const classifier = m?.models.find((x) => x.status === 'active' && x.kind === 'card-classifier');
   return (
     <div className="stack lg">
       <div className="grid-2">
@@ -658,8 +706,10 @@ export function EvaluationDetail({ detail }: { detail: Evaluation }) {
       <div>
         <h2 style={{ margin: 0 }}>Score details · exam v{detail.examVersion}</h2>
         <p className="faint" style={{ margin: 0 }}>
-          {detail.summary.units?.toLocaleString()} items · {Math.round((detail.summary.durationMs ?? 0) / 1000)}s
+          {detail.summary.units?.toLocaleString()} {detail.summary.kind === 'card-classifier' ? 'cards' : 'items'} · {Math.round((detail.summary.durationMs ?? 0) / 1000)}s
           {detail.summary.missingCrops ? ` · ${detail.summary.missingCrops} crops missing on disk` : ''}
+          {detail.summary.missingImages ? ` · ${detail.summary.missingImages} card images missing on disk` : ''}
+          {detail.summary.kind === 'card-classifier' && ` · declined to route ${(detail.summary.abstained ?? 0).toLocaleString()}`}
         </p>
       </div>
       <div className="table-wrap" style={{ maxHeight: 360, overflow: 'auto' }}>
@@ -668,11 +718,11 @@ export function EvaluationDetail({ detail }: { detail: Evaluation }) {
             <tr>
               <th>Slice</th>
               <th>n</th>
-              <th>Accuracy</th>
-              <th>+ dictionary</th>
-              <th>CER</th>
-              <th>When ≥90% sure</th>
-              <th>Calibration error</th>
+              <th>{detail.summary.kind === 'card-classifier' ? 'Games right' : 'Accuracy'}</th>
+              {detail.summary.kind !== 'card-classifier' && <th>+ dictionary</th>}
+              {detail.summary.kind !== 'card-classifier' && <th>CER</th>}
+              {detail.summary.kind !== 'card-classifier' && <th>When ≥90% sure</th>}
+              {detail.summary.kind !== 'card-classifier' && <th>Calibration error</th>}
             </tr>
           </thead>
           <tbody>
@@ -681,10 +731,10 @@ export function EvaluationDetail({ detail }: { detail: Evaluation }) {
                 <td>{s.slice}</td>
                 <td>{s.n}</td>
                 <td>{pct(s.accuracy)}</td>
-                <td>{pct(s.accuracyWithDictionary)}</td>
-                <td>{pct(s.cer)}</td>
-                <td>{s.confidentAccuracy == null ? '—' : `${pct(s.confidentAccuracy)} of ${s.confident}`}</td>
-                <td>{pct(s.calibrationError)}</td>
+                {detail.summary.kind !== 'card-classifier' && <td>{pct(s.accuracyWithDictionary)}</td>}
+                {detail.summary.kind !== 'card-classifier' && <td>{pct(s.cer)}</td>}
+                {detail.summary.kind !== 'card-classifier' && <td>{s.confidentAccuracy == null ? '—' : `${pct(s.confidentAccuracy)} of ${s.confident}`}</td>}
+                {detail.summary.kind !== 'card-classifier' && <td>{pct(s.calibrationError)}</td>}
               </tr>
             ))}
           </tbody>
@@ -702,8 +752,11 @@ export function EvaluationDetail({ detail }: { detail: Evaluation }) {
               <span className="faint">→ {m.label}</span>
             </div>
             <div className="ocr-sample-tags faint">
-              {m.field} · {m.game} · {m.source}
+              {m.field}
+              {m.game ? ` · ${m.game}` : ''}
+              {m.source ? ` · ${m.source}` : ''}
               {m.regression ? ' · regression' : ''}
+              {m.raw ? ` · said ${m.raw}` : ''}
             </div>
           </div>
         ))}
@@ -738,7 +791,8 @@ export function ModelsTab({
       toast(e instanceof ApiError ? e.message : 'Failed', 'error');
     }
   };
-  const active = m?.models.find((x) => x.status === 'active');
+  const active = m?.models.find((x) => x.status === 'active' && x.kind !== 'card-classifier');
+  const classifier = m?.models.find((x) => x.status === 'active' && x.kind === 'card-classifier');
   return (
     <div className="stack lg">
       <div className="panel">
@@ -756,13 +810,20 @@ export function ModelsTab({
                 </>
               )}
               {active && ' (Tesseract for lines it isn’t sure of)'}
+              {' · '}
+              game routing: <strong style={{ color: 'var(--text)' }}>{classifier ? classifier.id : 'Tesseract keyword guess'}</strong>
             </span>
             <button className="btn sm ghost" onClick={() => void act(() => api.post('/api/dev/ocr/models/watch', {}), 'Refreshing trial and watch')}>
               <RefreshIcon size={13} /> Refresh
             </button>
             {active && (
-              <button className="btn sm danger" onClick={() => void act(() => api.post('/api/dev/ocr/models/rollback', {}), 'Rolled back')}>
+              <button className="btn sm danger" onClick={() => void act(() => api.post('/api/dev/ocr/models/rollback', { kind: 'ocr' }), 'Rolled back')}>
                 <XIcon size={13} /> Roll back to {active.previousEngine?.startsWith('model:') ? active.previousEngine.slice(6) : 'Tesseract'}
+              </button>
+            )}
+            {classifier && (
+              <button className="btn sm ghost" title="Stop routing cards with the classifier (the line reader keeps working)" onClick={() => void act(() => api.post('/api/dev/ocr/models/rollback', { kind: 'card-classifier' }), 'Game classifier stopped')}>
+                <XIcon size={13} /> Stop the classifier
               </button>
             )}
           </div>
@@ -826,10 +887,16 @@ export function ModelsTab({
                       <code>{x.id}</code>
                     </strong>{' '}
                     <span className={`ocr-status ${x.status}`}>{x.status}</span>
+                    {x.kind === 'vision-ocr' && <span className="badge accent" title="Separate name-ocr and number-ocr heads exported by CardVault-Vision">Vision · {x.heads?.name && x.heads?.number ? 'name + number' : x.heads?.name ? 'name only' : 'number only'}</span>}
+                    {x.kind === 'card-classifier' && <span className="badge warn" title="Reads the whole card and routes it to a game layout before any text is read">Game classifier</span>}
                     <div className="faint" style={{ fontSize: 12 }}>
                       {new Date(x.createdAt).toLocaleString()}
-                      {x.dataset && ` · trained on ${x.dataset.rows?.toLocaleString()} lines (${x.dataset.id})`}
-                      {x.training && ` · ${x.training.epochs} epochs, ${x.training.minutes} min, ${(x.training.parameters / 1e6).toFixed(1)}M params`}
+                      {x.version && ` · version ${x.version}`}
+                      {x.exportedAt && x.kind !== 'trainer' && ` · exported ${new Date(x.exportedAt).toLocaleString()}`}
+                      {x.dataset && ` · trained on ${x.dataset.rows ? `${x.dataset.rows.toLocaleString()} lines` : 'dataset'} (${x.dataset.id})`}
+                      {x.training && x.training.epochs != null && ` · ${x.training.epochs} epochs`}
+                      {x.training && x.training.minutes != null && `, ${x.training.minutes} min`}
+                      {x.training && x.training.parameters != null && `, ${(x.training.parameters / 1e6).toFixed(1)}M params`}
                       {x.dev && ` · held-out: names ${pct(x.dev.name?.accuracy)}, numbers ${pct(x.dev.number?.accuracy)}`}
                     </div>
                   </div>
@@ -841,7 +908,7 @@ export function ModelsTab({
                       <button className="btn sm ghost" onClick={() => void act(() => api.post(`/api/dev/ocr/models/${x.id}/trial/stop`, {}), 'Live trial stopped')}>
                         Stop trial
                       </button>
-                    ) : x.status !== 'active' && m.trialMinLines > 0 && x.evaluation ? (
+                    ) : x.status !== 'active' && x.canTrial !== false && m.trialMinLines > 0 && x.evaluation ? (
                       <button className="btn sm" disabled={busy} onClick={() => void act(() => api.post(`/api/dev/ocr/models/${x.id}/trial`, {}), 'Live trial started')}>
                         <PulseIcon size={13} /> Start live trial
                       </button>
@@ -876,9 +943,16 @@ export function ModelsTab({
                 {x.status === 'active' && !x.watch && <p className="faint" style={{ fontSize: 13, margin: '8px 0 0' }}>Live watch starts with the next check (every 15 minutes).</p>}
                 {s && (
                   <div className="row wrap" style={{ gap: 18, marginTop: 8, fontSize: 13 }}>
-                    <span>
-                      Exam v{x.evaluation!.examVersion}: names <strong>{pct(s.name?.accuracy)}</strong>, numbers <strong>{pct(s.number?.accuracy)}</strong>, {s.msPerLine} ms/line
-                    </span>
+                    {x.kind === 'card-classifier' ? (
+                      <span>
+                        Exam v{x.evaluation!.examVersion}: game <strong>{pct((s as unknown as { game?: { accuracy?: number } }).game?.accuracy)}</strong> of{' '}
+                        {(s as unknown as { units?: number }).units?.toLocaleString() ?? '—'} cards, {s.msPerLine} ms/card
+                      </span>
+                    ) : (
+                      <span>
+                        Exam v{x.evaluation!.examVersion}: names <strong>{pct(s.name?.accuracy)}</strong>, numbers <strong>{pct(s.number?.accuracy)}</strong>, {s.msPerLine} ms/line
+                      </span>
+                    )}
                     <button className="btn sm ghost" onClick={() => void openDetail(x.evaluation!.id)}>
                       Details
                     </button>
@@ -1070,6 +1144,171 @@ export function TrainingTab({ d, act, busy, trainActive }: { d: Overview; act: (
           </div>
         </div>
       </div>
+
+      <VisionPanel d={d} act={act} busy={busy} trainActive={trainActive} />
+    </div>
+  );
+}
+
+/**
+ * Train with CardVault-Vision: the model factory's `vision` CLI, which trains
+ * *separate* heads (name-ocr, number-ocr) and the whole-card game classifier,
+ * then exports each as a versioned ONNX bundle. The bundles are registered for
+ * scoring automatically, so the exam, the live trial and the promotion gates
+ * are the same ones every other model goes through.
+ */
+export function VisionPanel({ d, act, busy, trainActive }: { d: Overview; act: (fn: () => Promise<unknown>, ok: string) => Promise<void>; busy: boolean; trainActive: boolean }) {
+  const v = d.vision;
+  const [form, setForm] = useState({ dataset: 'latest', kind: 'ocr-pair', epochs: 30, device: 'auto' });
+  const live = !!v && ['queued', 'starting', 'running', 'exporting'].includes(v.status);
+  const withManifest = [...d.datasets].reverse().filter((ds) => ds.vision);
+  const chosen = form.dataset === 'latest' ? withManifest[0] : withManifest.find((ds) => ds.id === form.dataset);
+  const pctStage = (() => {
+    if (!v) return 0;
+    if (v.status === 'done') return 100;
+    return v.steps ? Math.min(99, Math.round(((v.step ?? 0) / v.steps) * 100)) : 0;
+  })();
+  const last = v?.history?.at(-1);
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h3>
+          <SparkIcon size={14} /> Train with CardVault-Vision
+        </h3>
+        {v && <span className="badge">{v.status}</span>}
+      </div>
+      <p className="faint" style={{ margin: '0 0 14px' }}>
+        The model factory trains <strong>separate</strong> name and number heads and a whole-card game classifier, then exports each as a versioned ONNX bundle CardVault
+        runs itself. A classifier routes a card to its layout in milliseconds before any text is read — and a pair of heads reads its lines.
+      </p>
+
+      {live && v && (
+        <div className="ocr-trainlive running">
+          <div className="ocr-trainlive-head">
+            <ProgressRing value={pctStage} size={54} stroke={4} color="var(--accent)" colorTo="var(--accent-2)">
+              <strong style={{ fontSize: 13 }}>{pctStage}%</strong>
+            </ProgressRing>
+            <div style={{ minWidth: 0 }}>
+              <strong>
+                {v.task ?? v.kind} · {v.dataset}
+              </strong>
+              <div className="faint" style={{ fontSize: 13 }}>
+                {v.epoch && v.epochs ? `epoch ${v.epoch} of ${v.epochs}` : 'starting'} · version {v.version} · {v.device}
+                {last?.cer != null && ` · held-out CER ${(last.cer * 100).toFixed(2)}%`}
+                {last?.macroF1 != null && ` · macro F1 ${last.macroF1.toFixed(4)}`}
+                {v.etaSeconds != null && ` · ${formatEta(v.etaSeconds)}`}
+              </div>
+              <div className="ocr-stage-list">
+                {v.stages.map((s) => (
+                  <span key={s.task} className={`ocr-stage ${s.state}`} title={s.error ?? s.exportDir ?? ''}>
+                    {s.state === 'done' ? '✓' : s.state === 'failed' ? '✕' : s.state === 'training' ? '•' : s.state === 'exporting' ? '↑' : '·'} {s.task}
+                    {s.bestMetric != null && ` ${s.metricName === 'cer' ? `CER ${(s.bestMetric * 100).toFixed(1)}%` : `F1 ${s.bestMetric.toFixed(3)}`}`}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className="ocr-bar">
+            <i style={{ width: `${pctStage}%` }} />
+          </div>
+          <details className="ocr-cmd-details">
+            <summary>Show the trainer’s log</summary>
+            <pre className="ocr-log">{(v.log ?? []).slice(-40).join('\n')}</pre>
+          </details>
+          <button className="btn sm danger" onClick={() => void act(() => api.post('/api/dev/ocr/vision/cancel', {}), 'Stopping after the current step')}>
+            <StopIcon size={13} /> Stop
+          </button>
+        </div>
+      )}
+
+      {!live && v && (v.status === 'failed' || v.status === 'done' || v.status === 'cancelled') && (
+        <div className={`ocr-trainlive ${v.status}`}>
+          <div className="row" style={{ gap: 12 }}>
+            <span className={`ocr-python-mark ${v.status === 'done' ? 'ready' : v.status === 'cancelled' ? 'unknown' : 'missing'}`}>
+              {v.status === 'done' ? <CheckIcon size={16} /> : v.status === 'cancelled' ? <StopIcon size={16} /> : <AlertIcon size={16} />}
+            </span>
+            <div style={{ minWidth: 0 }}>
+              <strong>{v.status === 'done' ? 'Finished' : v.status === 'cancelled' ? 'Stopped' : 'Failed'}</strong>
+              <div className="faint" style={{ fontSize: 13 }}>
+                {v.error ?? `${v.kind} on ${v.dataset} · version ${v.version}`}
+              </div>
+              {!!v.stages.length && (
+                <div className="ocr-stage-list">
+                  {v.stages.map((s) => (
+                    <span key={s.task} className={`ocr-stage ${s.state}`} title={s.exportDir ?? s.error ?? ''}>
+                      {s.state === 'done' ? '✓' : s.state === 'failed' ? '✕' : '·'} {s.task}
+                      {s.modelId ? ` → ${s.modelId}` : ''}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          {(v.status === 'failed') && (
+            <details className="ocr-cmd-details">
+              <summary>Show the trainer’s log</summary>
+              <pre className="ocr-log">{(v.log ?? []).slice(-40).join('\n')}</pre>
+            </details>
+          )}
+        </div>
+      )}
+
+      {!live && (
+        <div className="ocr-form ocr-form-card" style={{ marginTop: 12 }}>
+          <div className="ocr-form-title">New CardVault-Vision run</div>
+          {!withManifest.length && (
+            <p className="faint" style={{ fontSize: 12, margin: 0 }}>
+              Export training data first: it writes the whole-card manifest this trainer reads (older exports have none — export again).
+            </p>
+          )}
+          <label>
+            Dataset
+            <select className="select" value={form.dataset} onChange={(e) => setForm({ ...form, dataset: e.target.value })}>
+              <option value="latest">Newest export with a manifest{withManifest[0] ? ` (${withManifest[0].id})` : ''}</option>
+              {withManifest.map((ds) => (
+                <option key={ds.id} value={ds.id}>
+                  {ds.id} · {ds.vision?.samples.toLocaleString()} cards
+                  {ds.vision?.fields.name ? ` · ${ds.vision.fields.name.toLocaleString()} names` : ''}
+                  {ds.vision?.fields.number ? ` · ${ds.vision.fields.number.toLocaleString()} numbers` : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="ocr-form-row">
+            <label>
+              Heads
+              <select className="select" value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })}>
+                <option value="ocr-pair">Name + number (a scan’s pair)</option>
+                <option value="name-ocr">Name only</option>
+                <option value="number-ocr">Number only</option>
+                <option value="card-classifier">Game classifier</option>
+                <option value="all">All three</option>
+              </select>
+            </label>
+            <label>
+              Epochs (each head)
+              <input className="input" type="number" min={1} max={500} value={form.epochs} onChange={(e) => setForm({ ...form, epochs: +e.target.value })} />
+            </label>
+          </div>
+          {chosen?.vision && (
+            <p className="faint" style={{ fontSize: 12, margin: 0 }}>
+              {chosen.vision.samples.toLocaleString()} whole cards ({chosen.vision.cards.toLocaleString()} unique)
+              {chosen.vision.fields.name ? ` · ${chosen.vision.fields.name.toLocaleString()} with a name box` : ' · no name boxes'}
+              {chosen.vision.fields.number ? ` · ${chosen.vision.fields.number.toLocaleString()} with a number box` : ' · no number boxes'}
+            </p>
+          )}
+          {v?.python && <p className="faint" style={{ fontSize: 12, margin: 0 }}>Trainer Python: {v.python}</p>}
+          <button
+            className="btn primary"
+            disabled={busy || !withManifest.length || trainActive}
+            title={trainActive ? 'The other trainer is running' : undefined}
+            onClick={() => void act(() => api.post('/api/dev/ocr/vision/train', form), 'CardVault-Vision training queued — follow it in the queue')}
+          >
+            <PlayIcon size={14} /> Train &amp; export
+          </button>
+          {trainActive && <span className="faint">Stop the running trainer before starting this one.</span>}
+        </div>
+      )}
     </div>
   );
 }
@@ -1155,6 +1394,7 @@ export function DataTab({ d, act, busy }: { d: Overview; act: (fn: () => Promise
                   <th>Export</th>
                   <th>Lines</th>
                   <th>Breakdown</th>
+                  <th>CardVault-Vision</th>
                   <th>Created</th>
                 </tr>
               </thead>
@@ -1166,6 +1406,11 @@ export function DataTab({ d, act, busy }: { d: Overview; act: (fn: () => Promise
                     </td>
                     <td className="ocr-num">{ds.rows.toLocaleString()}</td>
                     <td className="faint">{Object.entries(ds.counts).map(([k, v]) => `${k} ${v}`).join(' · ')}</td>
+                    <td className="faint" title={ds.vision ? 'Written beside the lines: the whole-card manifest the Vision trainer reads' : undefined}>
+                      {ds.vision
+                        ? `${ds.vision.samples.toLocaleString()} cards${ds.vision.fields.name ? ` · ${ds.vision.fields.name.toLocaleString()} names` : ''}${ds.vision.fields.number ? ` · ${ds.vision.fields.number.toLocaleString()} numbers` : ''}`
+                        : 'no manifest (export again)'}
+                    </td>
                     <td className="faint">{ds.createdAt ? new Date(ds.createdAt).toLocaleString() : '—'}</td>
                   </tr>
                 ))}

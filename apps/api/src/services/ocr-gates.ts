@@ -129,3 +129,33 @@ export function gates(candidate: EvalLike, champion: EvalLike | null): Gate[] {
   }
   return out;
 }
+
+/**
+ * A whole-card game classifier's gates.
+ *
+ * It runs *beside* the line reader, so the line-reader gates do not apply: it
+ * has no live trial (nothing competes for lines) and no watch. What it must do
+ * is be scored on the current exam and name the game at least as often as the
+ * classifier already reading scans (half a point of noise allowed). With no
+ * classifier active yet, any score passes — Tesseract's keyword guess is the
+ * baseline, and the exam is the judge.
+ */
+export function classifierGates(candidate: EvalLike | null, champion: EvalLike | null): Gate[] {
+  if (!candidate || candidate.status !== 'done') return [{ id: 'scored', label: 'Scored on the current exam', pass: false, detail: 'Score it first.' }];
+  const pick = (e: EvalLike | null) => e?.slices.find((s) => s.slice === 'all · game') ?? null;
+  const mine = pick(candidate);
+  if (!mine) return [{ id: 'scored', label: 'Scored on the current exam', pass: false, detail: 'The score has no games slice; score it again.' }];
+  const theirs = pick(champion);
+  const out: Gate[] = [
+    {
+      id: 'game-overall',
+      label: 'Games right at least as often as now',
+      pass: !theirs || mine.accuracy >= theirs.accuracy - OVERALL_TOLERANCE,
+      detail: theirs ? `${pct(mine.accuracy)} vs ${pct(theirs.accuracy)} now` : `${pct(mine.accuracy)} of ${mine.n} cards (nothing to compare with yet)`,
+    },
+  ];
+  if (champion && champion.examVersion !== candidate.examVersion) {
+    out.push({ id: 'same-exam', label: 'Same exam version', pass: false, detail: `Scored on v${candidate.examVersion}, the active one on v${champion.examVersion}.` });
+  }
+  return out;
+}

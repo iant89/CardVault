@@ -19,6 +19,9 @@
 #                           tools/ocr-trainer/requirements.txt)
 #   OCR_TRAIN_BASE_PYTHON   interpreter used to create the environment
 #   OCR_TRAIN_OFFLINE=1     never touch the network; only check what is there
+#   CARDVAULT_VISION_DIR    a CardVault-Vision checkout to install (editable)
+#                           beside the trainer's packages, so OCR Lab can train
+#                           with its `vision` CLI too; found beside the repo when unset
 #
 # Exit codes: 0 ready · 1 failed · 2 no usable python3 to build from.
 
@@ -174,7 +177,27 @@ if [[ -f $REQUIREMENTS ]]; then
   rm -f "$req_log"
 fi
 
+# CardVault-Vision, when there is a checkout: its `vision` CLI is the second
+# trainer OCR Lab offers (separate name-OCR and number-OCR heads, the whole-card
+# classifier, versioned ONNX bundles). It is installed editable, so pulling the
+# checkout updates the trainer without touching the venv. A missing checkout is
+# not an error: CardVault's own trainer still works.
+VISION_DIR=${CARDVAULT_VISION_DIR:-}
+if [[ -z $VISION_DIR ]]; then
+  for candidate in "$REPO_DIR/vendor/CardVault-Vision" "$REPO_DIR/../CardVault-Vision"; do
+    [[ -f $candidate/pyproject.toml ]] && { VISION_DIR=$candidate; break; }
+  done
+fi
+if [[ -n $VISION_DIR && -f $VISION_DIR/pyproject.toml && ${OCR_TRAIN_OFFLINE:-0} != 1 ]]; then
+  say "==> installing CardVault-Vision from $VISION_DIR"
+  if ! PIP_NO_CACHE_DIR=1 "$PY_BIN" -m pip install --quiet -e "$VISION_DIR" >"${TMPDIR:-/tmp}/cardvault-vision-install.log" 2>&1; then
+    say "    CardVault-Vision could not be installed (CardVault's own trainer still works):"
+    tail -n 6 "${TMPDIR:-/tmp}/cardvault-vision-install.log" >&2 || true
+  fi
+fi
+
 if ready "$PY_BIN"; then
+  "$PY_BIN" -c 'import cardvault_vision' >/dev/null 2>&1 && say "vision yes" || say "vision no (CardVault's own trainer only)"
   say "python $PY_BIN"
   say "ready $PY_BIN $(versions "$PY_BIN")"
   exit 0

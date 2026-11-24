@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { gates, trialGate, type EvalLike, type SliceLike } from './ocr-gates.js';
+import { classifierGates, gates, trialGate, type EvalLike, type SliceLike } from './ocr-gates.js';
 
 const s = (slice: string, accuracy: number, n = 100, confidentAccuracy: number | null = null, confident = 0): SliceLike => ({ slice, n, accuracy, confidentAccuracy, confident });
 const ev = (slices: SliceLike[], o: Partial<EvalLike> = {}): EvalLike => ({ id: 'x', engine: 'e', examVersion: 3, status: 'done', summary: { msPerLine: 20 }, slices, ...o });
@@ -68,5 +68,43 @@ describe('live trial gate', () => {
   });
   it('can be turned off', () => {
     expect(trialGate(null, 0)).toBeNull();
+  });
+});
+
+describe('game classifier gates', () => {
+  const card = (accuracy: number, n = 100, o: Partial<EvalLike> = {}) => ev([s('all · game', accuracy, n)], o);
+
+  it('passes a scored classifier when nothing is routing yet', () => {
+    const g = classifierGates(card(0.88), null);
+    expect(g.map((x) => x.id)).toEqual(['game-overall']);
+    expect(g[0]!.pass).toBe(true);
+    expect(g[0]!.detail).toContain('88.0% of 100 cards');
+    expect(g[0]!.detail).toContain('nothing to compare with yet');
+  });
+
+  it('requires a score first', () => {
+    expect(classifierGates(null, null)[0]).toMatchObject({ id: 'scored', pass: false });
+    expect(classifierGates(card(0.9, 100, { status: 'running' }), null)[0]).toMatchObject({ id: 'scored', pass: false });
+  });
+
+  it('asks for a re-score when the row has no games slice (a line-reader score)', () => {
+    const wrongKind = ev([s('all · name', 0.9), s('all · number', 0.8)]);
+    expect(classifierGates(wrongKind, null)[0]).toMatchObject({ id: 'scored', pass: false });
+  });
+
+  it('lets half a point of noise through, not a real drop', () => {
+    expect(classifierGates(card(0.875), card(0.88))[0]!.pass).toBe(true);
+    expect(classifierGates(card(0.86), card(0.88))[0]!.pass).toBe(false);
+  });
+
+  it('says which exam it was scored on when it is not the active one', () => {
+    const g = classifierGates(card(0.95, 100, { examVersion: 2 }), card(0.8, 100, { examVersion: 3 }));
+    expect(g.map((x) => x.id)).toEqual(['game-overall', 'same-exam']);
+    expect(g.every((x) => !x.pass)).toBe(false);
+    expect(g.find((x) => x.id === 'same-exam')!.pass).toBe(false);
+  });
+
+  it('never asks for a live trial: a classifier runs beside the reader', () => {
+    expect(classifierGates(card(0.9), null).map((x) => x.id)).not.toContain('trial');
   });
 });

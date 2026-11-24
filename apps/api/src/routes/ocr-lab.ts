@@ -10,7 +10,7 @@ import { resolveStoragePath } from '@cardvault/imaging';
 import type { AppContext } from '../context.js';
 import { requireAdmin, user as currentUser } from '../auth/plugin.js';
 import { badRequest, notFound } from '../errors.js';
-import { gates, trialGate, type EvalLike, type TrialLike } from '../services/ocr-gates.js';
+import { classifierGates, gates, trialGate, type EvalLike, type TrialLike } from '../services/ocr-gates.js';
 import {
   forgetTask,
   listTasks,
@@ -31,6 +31,11 @@ const DATASET_KEY = 'ocr:dataset';
 const TRAIN_KEY = 'ocr:train';
 const TRAIN_CANCEL_KEY = 'ocr:train:cancel';
 const PYTHON_KEY = 'ocr:python';
+const VISION_KEY = 'ocr:vision';
+const VISION_CANCEL_KEY = 'ocr:vision:cancel';
+
+/** Is an `ocr_models.card` a whole-card game classifier rather than a line reader? */
+const isClassifierCard = (card: unknown): boolean => (card as { task?: string } | null)?.task === 'card-classifier';
 
 /** Training run in progress, mirroring apps/worker/src/processors/ocr-train.ts. */
 interface TrainStatus {
@@ -65,6 +70,32 @@ interface TrainStatus {
   startedAt?: string;
   finishedAt?: string;
   updatedAt: string;
+}
+
+/** A CardVault-Vision run (`vision train` + `vision export` per head). */
+interface VisionStatus {
+  status: 'queued' | 'starting' | 'running' | 'exporting' | 'done' | 'failed' | 'cancelled';
+  kind: string;
+  dataset: string;
+  manifest?: string;
+  version?: string;
+  epochs?: number;
+  device?: string;
+  stages: { task: string; state: string; bestMetric?: number | null; metricName?: string | null; epochs?: number; exportDir?: string; modelId?: string; error?: string }[];
+  task?: string;
+  epoch?: number;
+  cer?: number | null;
+  macroF1?: number | null;
+  history?: { epoch: number; loss: number; cer?: number | null; macroF1?: number | null }[];
+  step?: number;
+  steps?: number;
+  etaSeconds?: number | null;
+  python?: string;
+  error?: string;
+  log: string[];
+  startedAt?: string;
+  finishedAt?: string;
+  updatedAt?: string;
 }
 
 /** One held-out line as the trainer read it (see TrainStatus.recent). */
@@ -110,6 +141,12 @@ interface TrainerPython {
 const readTraining = async (ctx: AppContext): Promise<TrainStatus | null> => {
   const raw = await ctx.redis.get(TRAIN_KEY);
   return raw ? (JSON.parse(raw) as TrainStatus) : null;
+};
+
+/** The CardVault-Vision run in progress (mirrors apps/worker/src/processors/ocr-vision.ts). */
+const readVision = async (ctx: AppContext): Promise<VisionStatus | null> => {
+  const raw = await ctx.redis.get(VISION_KEY);
+  return raw ? (JSON.parse(raw) as VisionStatus) : null;
 };
 
 /** Find scripts/ocr-python.sh by walking up from this file (src/ or dist/ layouts). */
@@ -170,12 +207,33 @@ const trainerPython = async (ctx: AppContext): Promise<TrainerPython> => {
  */
 const listDatasets = async (ctx: AppContext) => {
   const root = path.join(ctx.storageDir, 'ocr', 'datasets');
-  const out: { id: string; rows: number; counts: Record<string, number>; createdAt: string | null }[] = [];
+  const out: { id: string; rows: number; counts: Record<string, number>; createdAt: string | null; vision: { samples: number; cards: number; fields: Record<string, number> } | null }[] = [];
   for (const name of (await readdir(root, { withFileTypes: true }).catch(() => [])).sort((a, b) => a.name.localeCompare(b.name))) {
     if (!name.isDirectory()) continue;
     try {
-      const info = JSON.parse(await readFile(path.join(root, name.name, 'info.json'), 'utf8')) as { rows?: number; counts?: Record<string, number>; createdAt?: string };
-      out.push({ id: name.name, rows: info.rows ?? 0, counts: info.counts ?? {}, createdAt: info.createdAt ?? null });
+      const info = JSON.parse(await readFile(path.join(root, name.name, 'info.json'), 'utf8')) as {
+        rows?: number;
+        counts?: Record<string, number>;
+        createdAt?: string;
+        vision?: { samples: number; cards: number; fields: Record<string, number> } | null;
+      };
+      // an older export has no Vision manifest; the folder may still hold one
+      // written by hand, so look rather than assume
+      let vision = info.vision ?? null;
+      if (!vision) {
+        const manifest = await readFile(path.join(root, name.name, 'vision', 'manifest.json'), 'utf8').catch(() => null);
+        if (manifest) {
+          try {
+            const m = JSON.parse(manifest) as { samples?: unknown[]; counts?: { cards?: number } };
+            const fields: Record<string, number> = {};
+            for (const s of (m.samples ?? []) as { annotation?: { fields?: Record<string, unknown> } }[]) for (const f of Object.keys(s.annotation?.fields ?? {})) fields[f] = (fields[f] ?? 0) + 1;
+            vision = { samples: (m.samples ?? []).length, cards: m.counts?.cards ?? 0, fields };
+          } catch {
+            vision = null;
+          }
+        }
+      }
+      out.push({ id: name.name, rows: info.rows ?? 0, counts: info.counts ?? {}, createdAt: info.createdAt ?? null, vision });
     } catch {
       /* interrupted export or stray folder: not usable */
     }
@@ -237,6 +295,7 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
       dataset: dataset ? JSON.parse(dataset) : null,
       datasets: await listDatasets(ctx),
       training: await readTraining(ctx),
+      vision: await readVision(ctx),
       python: await trainerPython(ctx),
       evaluations,
     };
@@ -701,6 +760,101 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     return { ok: true };
   });
 
+  // ---------------------------------------------------------------- CardVault-Vision
+
+  /**
+   * Train and export with CardVault-Vision's `vision` CLI, on the dataset the
+   * Export button wrote (it now writes the whole-card manifest beside the JSONL
+   * lines). One run can train both OCR heads — the pair a scan uses — and the
+   * card classifier; each is exported as a versioned ONNX artifact and
+   * registered for scoring automatically.
+   */
+  app.post('/api/dev/ocr/vision/train', guard, async (req) => {
+    const b = z
+      .object({
+        dataset: z.string().regex(/^(latest|[A-Za-z0-9][A-Za-z0-9._-]*)$/).default('latest'),
+        kind: z.enum(['ocr-pair', 'name-ocr', 'number-ocr', 'card-classifier', 'all']).default('ocr-pair'),
+        epochs: z.coerce.number().int().min(1).max(500).default(30),
+        architecture: z.string().max(40).optional(),
+        device: z.enum(['auto', 'cpu', 'cuda']).default('auto'),
+        version: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/).max(48).optional(),
+        maxTrain: z.coerce.number().int().min(1).max(1_000_000).optional(),
+      })
+      .parse(req.body ?? {});
+    const current = await readVision(ctx);
+    if (current && ['queued', 'starting', 'running', 'exporting'].includes(current.status)) throw badRequest('A CardVault-Vision run is already in progress.');
+    const legacy = await readTraining(ctx);
+    if (legacy && ['queued', 'starting', 'running'].includes(legacy.status)) throw badRequest('The other trainer is running; stop it before starting a CardVault-Vision run.');
+    const datasets = await listDatasets(ctx);
+    // 'latest' means the newest export the factory can actually read, not the
+    // newest export overall: a dataset without the whole-card manifest would
+    // only fail later, inside `vision train`.
+    const requested = b.dataset === 'latest' ? [...datasets].reverse().find((d) => d.vision)?.id : b.dataset;
+    if (!requested) throw badRequest('No exported datasets yet. Press Export training data first.');
+    if (!datasets.some((d) => d.id === requested)) throw badRequest(`No usable dataset ${requested}. Export training data first.`);
+    const dataset = datasets.find((d) => d.id === requested)!;
+    if (!dataset.vision) throw badRequest(`Dataset ${requested} has no CardVault-Vision manifest. Export training data again to write one.`);
+    await saveTask(ctx.redis, {
+      key: 'ocr-vision-train',
+      kind: 'train',
+      name: 'Train with CardVault-Vision',
+      state: 'queued',
+      progress: 0,
+      detail: `${b.kind} · ${b.epochs} epochs on ${requested}`,
+      retry: { path: '/api/dev/ocr/vision/train', body: { ...b, dataset: requested }, label: 'Train again' },
+    });
+    await ctx.queues.maintenance.add('ocr-vision-train', { ...b, dataset: requested }, { removeOnComplete: 20, removeOnFail: 20 });
+    req.log.info({ dataset: requested, kind: b.kind, epochs: b.epochs }, 'CardVault-Vision training queued');
+    return { ok: true, dataset: requested };
+  });
+
+  /** Stop a CardVault-Vision run (it stops after the current step and exports nothing more). */
+  app.post('/api/dev/ocr/vision/cancel', guard, async () => {
+    await ctx.redis.set(VISION_CANCEL_KEY, '1', 'EX', 600);
+    return { ok: true };
+  });
+
+  /**
+   * Register CardVault-Vision exports found on disk, and say what was found,
+   * including each export that failed verification and why. The same scan runs
+   * on worker start and after every training run.
+   */
+  app.post('/api/dev/ocr/vision/rescan', guard, async () => {
+    await saveTask(ctx.redis, { key: 'ocr-rescan', kind: 'rescan', name: 'Look for new models', state: 'queued', progress: 0, detail: 'Waiting for the worker…' });
+    await ctx.queues.maintenance.add('ocr-scan-models', {}, { removeOnComplete: 20, removeOnFail: 20 });
+    return { ok: true };
+  });
+
+  /** Where a CardVault-Vision export is looked for, and what is there now. */
+  app.get('/api/dev/ocr/vision', guard, async () => {
+    const roots = [path.join(ctx.storageDir, 'ocr', 'vision', 'exports')];
+    if (ctx.config.VISION_MODELS_DIR) roots.push(...ctx.config.VISION_MODELS_DIR.split(path.delimiter).map((d) => path.resolve(ctx.storageDir, d.trim())).filter(Boolean));
+    const exports = [];
+    for (const root of roots) {
+      for (const task of await readdir(root, { withFileTypes: true }).catch(() => [])) {
+        if (!task.isDirectory()) continue;
+        for (const version of await readdir(path.join(root, task.name), { withFileTypes: true }).catch(() => [])) {
+          if (!version.isDirectory()) continue;
+          const files = await readdir(path.join(root, task.name, version.name)).catch(() => []);
+          exports.push({ root: path.relative(ctx.storageDir, root), task: task.name, version: version.name, files: files.length });
+        }
+      }
+    }
+    const production: Record<string, unknown> = {};
+    for (const task of ['name-ocr', 'number-ocr', 'card-classifier']) {
+      const raw = await readFile(path.join(roots[0]!, task, 'production.json'), 'utf8').catch(() => null);
+      if (raw) production[task] = JSON.parse(raw);
+    }
+    return {
+      status: await readVision(ctx),
+      roots: roots.map((r) => path.relative(ctx.storageDir, r) || r),
+      configuredDir: ctx.config.CARDVAULT_VISION_DIR ?? null,
+      python: ctx.config.OCR_TRAIN_PYTHON ?? path.join(ctx.config.OCR_TRAIN_VENV ?? path.join(ctx.storageDir, 'ocr', 'venv'), 'bin', 'python'),
+      exports,
+      production,
+    };
+  });
+
   /** Latest finished evaluation of an engine on an exam version. */
   const latestEval = async (engine: string, examVersion: number) => {
     const [e] = await ctx.db
@@ -712,9 +866,14 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     return (e as unknown as EvalLike) ?? null;
   };
 
-  /** The engine reading live scans now, and its score on the given exam version. */
+  /**
+   * The line reader reading live scans now, and its score on the exam version.
+   * A game classifier is active independently of the line reader (one decides
+   * the layout, the other reads the lines), so it is never the line champion.
+   */
   const champion = async (examVersion: number) => {
-    const [active] = await ctx.db.select({ id: ocrModels.id }).from(ocrModels).where(eq(ocrModels.status, 'active')).limit(1);
+    const activeRows = await ctx.db.select({ id: ocrModels.id, card: ocrModels.card }).from(ocrModels).where(eq(ocrModels.status, 'active'));
+    const active = activeRows.find((r) => !isClassifierCard(r.card));
     if (active) return { engine: `model:${active.id}`, eval: await latestEval(`model:${active.id}`, examVersion) };
     const tess = await ctx.db.execute(sql`
       SELECT engine FROM ocr_evaluations WHERE engine LIKE 'tesseract%' AND exam_version = ${examVersion} AND status = 'done'
@@ -727,16 +886,28 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     const [exam] = await ctx.db.select({ version: ocrExams.version }).from(ocrExams).orderBy(desc(ocrExams.version)).limit(1);
     const models = await ctx.db.select().from(ocrModels).orderBy(desc(ocrModels.createdAt));
     const champ = exam ? await champion(exam.version) : null;
+    const activeClassifier = models.find((m) => m.status === 'active' && isClassifierCard(m.card));
+    const classifierChamp = exam && activeClassifier ? await latestEval(`model:${activeClassifier.id}`, exam.version) : null;
     const rows = [];
     for (const m of models) {
       const ev = exam ? await latestEval(`model:${m.id}`, exam.version) : null;
-      const g = ev && m.status !== 'active' ? gates(ev, champ?.eval ?? null) : [];
-      const tg = ev && m.status !== 'active' ? trialGate(m.trial as TrialLike | null, ctx.config.OCR_TRIAL_MIN_LINES) : null;
-      if (tg) g.push(tg);
       const card = m.card as Record<string, unknown>;
+      const classifier = isClassifierCard(card);
+      const g = classifier
+        ? m.status !== 'active' ? classifierGates(ev, classifierChamp) : []
+        : ev && m.status !== 'active' ? gates(ev, champ?.eval ?? null) : [];
+      const tg = !classifier && ev && m.status !== 'active' ? trialGate(m.trial as TrialLike | null, ctx.config.OCR_TRIAL_MIN_LINES) : null;
+      if (tg) g.push(tg);
       rows.push({
         id: m.id,
         status: m.status,
+        kind: classifier ? 'card-classifier' : card.kind === 'vision' ? 'vision-ocr' : 'trainer',
+        task: card.task ?? 'ocr',
+        version: card.version ?? null,
+        heads: card.heads ?? null,
+        exportedAt: card.exportedAt ?? null,
+        validation: card.validation ?? null,
+        gitCommit: card.gitCommit ?? null,
         createdAt: m.createdAt,
         activatedAt: m.activatedAt,
         dataset: card.dataset ?? null,
@@ -747,6 +918,7 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
         canPromote: m.status !== 'active' && g.length > 0 && g.every((x) => x.pass),
         trial: m.trial ?? null,
         trialStartedAt: m.trialStartedAt,
+        canTrial: !classifier,
         watch: m.watch ?? null,
         previousEngine: m.previousEngine,
         retiredAt: m.retiredAt,
@@ -762,6 +934,7 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     return {
       examVersion: exam?.version ?? null,
       champion: champ ? { engine: champ.engine, evaluationId: champ.eval?.id ?? null } : null,
+      classifierChampion: activeClassifier ? { engine: `model:${activeClassifier.id}`, evaluationId: classifierChamp?.id ?? null } : null,
       trialMinLines: ctx.config.OCR_TRIAL_MIN_LINES,
       models: rows,
       events,
@@ -785,14 +958,27 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
       const failed = m.gates.filter((g) => !g.pass).map((g) => `${g.label}: ${g.detail}`);
       throw badRequest(`Not promoted. ${failed.length ? failed.join(' · ') : 'Score it on the current exam first.'}`);
     }
-    const [current] = await ctx.db.select({ id: ocrModels.id }).from(ocrModels).where(eq(ocrModels.status, 'active')).limit(1);
+    // Only rows of the same kind are replaced: promoting a game classifier must
+    // not stop the line reader, and vice versa. They run side by side.
+    const classifier = m.kind === 'card-classifier';
+    const activeRows = await ctx.db.select({ id: ocrModels.id, card: ocrModels.card }).from(ocrModels).where(eq(ocrModels.status, 'active'));
+    const current = activeRows.find((r) => isClassifierCard(r.card) === classifier);
     await ctx.db.transaction(async (tx) => {
-      await tx.update(ocrModels).set({ status: 'retired', retiredAt: new Date(), retiredReason: `replaced by ${m.id}` }).where(eq(ocrModels.status, 'active'));
+      if (classifier) {
+        const ids = activeRows.filter((r) => isClassifierCard(r.card)).map((r) => r.id);
+        if (ids.length) await tx.update(ocrModels).set({ status: 'retired', retiredAt: new Date(), retiredReason: `replaced by ${m.id}` }).where(inArray(ocrModels.id, ids));
+      } else {
+        // ...and promoting a line reader must leave the game classifier alone
+        const ids = activeRows.filter((r) => !isClassifierCard(r.card)).map((r) => r.id);
+        if (ids.length) await tx.update(ocrModels).set({ status: 'retired', retiredAt: new Date(), retiredReason: `replaced by ${m.id}` }).where(inArray(ocrModels.id, ids));
+      }
       await tx
         .update(ocrModels)
-        .set({ status: 'active', activatedAt: new Date(), activatedBy: currentUser(req).id, previousEngine: current ? `model:${current.id}` : 'tesseract', watch: null, retiredAt: null, retiredReason: null })
+        // the classifier has no line engine to fall back to, so its "previous" is
+        // either another classifier or nothing (Tesseract never routed games)
+        .set({ status: 'active', activatedAt: new Date(), activatedBy: currentUser(req).id, previousEngine: current ? `model:${current.id}` : classifier ? 'none' : 'tesseract', watch: null, retiredAt: null, retiredReason: null })
         .where(eq(ocrModels.id, m.id));
-      await tx.insert(auditLog).values({ userId: currentUser(req).id, action: 'ocr.promote', entity: 'ocr_model', entityId: m.id, metadata: { previous: current ? current.id : 'tesseract' } });
+      await tx.insert(auditLog).values({ userId: currentUser(req).id, action: 'ocr.promote', entity: 'ocr_model', entityId: m.id, metadata: { previous: current ? current.id : 'tesseract', kind: m.kind } });
     });
     req.log.info({ model: m.id }, 'OCR model promoted');
     return { ok: true };
@@ -800,16 +986,21 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
 
   /** Stop using the active model: live scans go back to the previous engine (a model, or Tesseract) within 30 seconds. */
   app.post('/api/dev/ocr/models/rollback', guard, async (req) => {
-    const [m] = await ctx.db.select().from(ocrModels).where(eq(ocrModels.status, 'active')).limit(1);
-    if (!m) return { ok: true, restored: 'tesseract' };
+    const activeRows = await ctx.db.select().from(ocrModels).where(eq(ocrModels.status, 'active'));
+    const kind = z.object({ kind: z.enum(['ocr', 'card-classifier']).optional() }).parse(req.body ?? {}).kind ?? 'ocr';
+    const m = activeRows.find((r) => isClassifierCard(r.card) === (kind === 'card-classifier'));
+    if (!m) return { ok: true, restored: kind === 'card-classifier' ? 'none' : 'tesseract' };
     const prev = m.previousEngine?.startsWith('model:') ? m.previousEngine.slice('model:'.length) : null;
     await ctx.db.transaction(async (tx) => {
       await tx.update(ocrModels).set({ status: 'retired', retiredAt: new Date(), retiredReason: 'rolled back by hand' }).where(eq(ocrModels.id, m.id));
       if (prev) await tx.update(ocrModels).set({ status: 'active', activatedAt: new Date(), retiredReason: null }).where(eq(ocrModels.id, prev));
-      await tx.insert(auditLog).values({ userId: currentUser(req).id, action: 'ocr.rollback', entity: 'ocr_model', entityId: m.id, metadata: { restored: prev ?? 'tesseract' } });
+      // the classifier runs beside the line reader: rolling one back leaves the
+      // other reading scans unless it was asked for explicitly
+      await tx.insert(auditLog).values({ userId: currentUser(req).id, action: 'ocr.rollback', entity: 'ocr_model', entityId: m.id, metadata: { restored: prev ?? 'tesseract', kind } });
     });
-    req.log.info({ model: m.id, restored: prev ?? 'tesseract' }, 'OCR model rolled back');
-    return { ok: true, retired: m.id, restored: prev ?? 'tesseract' };
+    const restored = prev ?? (kind === 'card-classifier' ? 'none' : 'tesseract');
+    req.log.info({ model: m.id, restored, kind }, 'OCR model rolled back');
+    return { ok: true, retired: m.id, restored };
   });
 
   /** Start a live trial: the model reads every new scan alongside the live engine, recorded only. */
@@ -817,6 +1008,7 @@ export async function ocrLabRoutes(app: FastifyInstance, ctx: AppContext) {
     const [m] = await ctx.db.select().from(ocrModels).where(eq(ocrModels.id, req.params.id));
     if (!m) throw notFound();
     if (m.status === 'active') throw badRequest('This model is already reading live scans.');
+    if (isClassifierCard(m.card)) throw badRequest('A game classifier runs beside the line reader and is promoted on its exam score; it has no live trial.');
     await ctx.db.transaction(async (tx) => {
       await tx.update(ocrModels).set({ status: 'candidate' }).where(eq(ocrModels.status, 'shadow'));
       await tx.update(ocrModels).set({ status: 'shadow', trialStartedAt: new Date(), trial: null }).where(eq(ocrModels.id, m.id));

@@ -5,6 +5,7 @@ import type { WorkerContext } from '../context.js';
 import { snapshotCollectionValues } from '../pricing/compute.js';
 import { evaluate, exportDataset, importHarvest, labelReviewed, scanModels } from './ocr-lab.js';
 import { setupOcrPython, trainModel } from './ocr-train.js';
+import { trainWithVision, type VisionTrainRequest } from './ocr-vision.js';
 import { pruneSamples } from '../identification/samples.js';
 import { runWatch } from './ocr-watch.js';
 
@@ -90,6 +91,8 @@ export async function processMaintenance(ctx: WorkerContext, job: Job) {
       return trainModel(ctx, job.data as { dataset?: string; epochs?: number; synthetic?: number; maxMinutes?: number });
     case 'ocr-python-setup':
       return setupOcrPython(ctx);
+    case 'ocr-vision-train':
+      return trainWithVision(ctx, job.data as VisionTrainRequest);
     case 'prune':
       await pruneSamples(ctx);
       await ctx.db.execute(sql`DELETE FROM sessions WHERE expires_at < now()`);

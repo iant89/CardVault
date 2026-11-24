@@ -125,6 +125,22 @@ const sportsFields = (withMemorabilia: boolean): DisplayField[] => [
 
 const sportsNumber = [/\b(?:#|No\.?\s?)([A-Z]{0,4}-?\d{1,4})\b/i];
 
+/**
+ * Where sports cards print the two fields OCR wants.
+ *
+ * The four sports share one physical layout, which is why CardVault-Vision's
+ * classifier has a single `SPORTS` type (and its `layouts/resolver.py` one
+ * `SPORTS` ROI set). These regions are that set: the player's name across the
+ * top band, the card number bottom-right. They are used to crop samples and to
+ * read scans, so a classifier verdict of `SPORTS` (or of any one sport) can
+ * route a card even when the sport itself is not certain.
+ */
+const sportsLayout: OcrLayout = {
+  name: [{ left: 0.05, top: 0.03, width: 0.62, height: 0.09 }],
+  number: [{ left: 0.72, top: 0.9, width: 0.23, height: 0.05 }],
+  numberChars: '0123456789-#ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+};
+
 const sports = (slug: GameSlug, name: string, theme: string, keywords: string[]): GameModule => ({
   slug,
   name,
@@ -133,6 +149,7 @@ const sports = (slug: GameSlug, name: string, theme: string, keywords: string[])
   displayFields: sportsFields(slug !== 'baseball'),
   collectorNumberPatterns: sportsNumber,
   ocrKeywords: keywords,
+  ocrLayout: sportsLayout,
   theme,
 });
 

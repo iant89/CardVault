@@ -35,10 +35,27 @@ export function trimDebris(line: string): string {
   return t.join(' ').replace(/[\s,.:\-]+$/, '');
 }
 
-/** Turn raw OCR text into structured identification signals. */
-export function extractSignals(text: { full: string; top: string; bottom: string }, gameHint?: string): ExtractedSignals {
+/**
+ * Turn raw OCR text into structured identification signals.
+ *
+ * `classified` is a visual game verdict (a CardVault-Vision card classifier read
+ * the whole image): it does not depend on any text, so it is offered as a game
+ * guess in its own right, ranked ahead of the keyword guess but scored by its
+ * confidence rather than as a certainty.
+ */
+export function extractSignals(
+  text: { full: string; top: string; bottom: string },
+  gameHint?: string,
+  classified?: { game: string; confidence?: number },
+): ExtractedSignals {
   const all = `${text.top}\n${text.full}\n${text.bottom}`;
-  const gameGuesses = gameHint ? [{ game: gameHint as GameSlug, score: 1 }] : guessGameFromText(all);
+  const fromText = gameHint ? [{ game: gameHint as GameSlug, score: 1 }] : guessGameFromText(all);
+  const vision = classified && classified.game in GAME_MODULES && classified.game !== 'other' ? classified : undefined;
+  const gameGuesses: { game: GameSlug; score: number }[] = gameHint
+    ? [{ game: gameHint as GameSlug, score: 1 }]
+    : vision
+      ? [{ game: vision.game as GameSlug, score: Math.max(0.34, Math.min(1, vision.confidence ?? 0.5)) }, ...fromText.filter((g) => g.game !== vision.game)]
+      : fromText;
 
   // Name candidates: the cleaner lines of the title band, then full text first lines.
   // Each line is also offered with OCR debris trimmed from its ends (stage

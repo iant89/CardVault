@@ -44,6 +44,18 @@ const schema = z.object({
   OCR_TRAIN_VENV: z.string().optional(),
   /** Index the setup downloads CPU PyTorch from (default: https://download.pytorch.org/whl/cpu). */
   OCR_TRAIN_TORCH_INDEX: z.string().url().optional(),
+  /**
+   * CardVault-Vision: a checkout of github.com/iant89/CardVault-Vision (with its
+   * `src/` layout) whose `vision` CLI OCR Lab can train and export with. Found
+   * automatically in vendor/CardVault-Vision or beside the repository.
+   */
+  CARDVAULT_VISION_DIR: z.string().optional(),
+  /**
+   * Extra model roots to scan for CardVault-Vision exports (`<task>/<version>/`),
+   * e.g. a folder your `vision export` runs write to. Always scanned:
+   * <STORAGE_DIR>/ocr/vision/exports. Several roots: separated by ':'.
+   */
+  VISION_MODELS_DIR: z.string().optional(),
   /** OCR model live trial: confirmed lines needed before a model may be promoted (0 = no trial required). */
   OCR_TRIAL_MIN_LINES: z.coerce.number().int().min(0).default(40),
   /** OCR live watch: confirmed lines / scans needed on each side before judging an active model. */

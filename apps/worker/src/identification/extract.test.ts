@@ -55,6 +55,36 @@ describe('collector numbers from targeted readings', () => {
   });
 });
 
+describe('a card classifier\'s verdict', () => {
+  it('leads the game guesses, so a visual verdict beats a keyword guess', () => {
+    // no text at all: only the classifier can say what the card is
+    const s = extractSignals({ top: '', full: '', bottom: '' }, undefined, { game: 'magic', confidence: 0.93 });
+    expect(s.gameGuesses[0]).toEqual({ game: 'magic', score: 0.93 });
+  });
+
+  it('keeps the text guesses behind it, and its confidence as the score', () => {
+    const s = extractSignals({ top: 'Pikachu 70 HP\nweakness retreat', full: '', bottom: '' }, undefined, { game: 'football', confidence: 0.51 });
+    expect(s.gameGuesses[0]).toEqual({ game: 'football', score: 0.51 });
+    expect(s.gameGuesses.some((g) => g.game === 'pokemon' && g.score > 0)).toBe(true);
+  });
+
+  it('never lets a weak verdict look like a certainty', () => {
+    const s = extractSignals({ top: '', full: '', bottom: '' }, undefined, { game: 'yugioh', confidence: 0.2 });
+    expect(s.gameGuesses[0]!.score).toBeGreaterThanOrEqual(0.34);
+  });
+
+  it('is ignored when the game was given, and when it says "other"', () => {
+    expect(extractSignals({ top: '', full: '', bottom: '' }, 'pokemon', { game: 'magic', confidence: 1 }).gameGuesses).toEqual([{ game: 'pokemon', score: 1 }]);
+    const s = extractSignals({ top: 'Creature — Dragon', full: '', bottom: '' }, undefined, { game: 'other', confidence: 1 });
+    expect(s.gameGuesses[0]!.game).not.toBe('other');
+  });
+
+  it('uses the verdict to read collector numbers of that game', () => {
+    const s = extractSignals({ top: '', full: '', bottom: 'LOB-001' }, undefined, { game: 'yugioh', confidence: 0.9 });
+    expect(s.numbers.map((n) => n.raw)).toContain('LOB-001');
+  });
+});
+
 describe('trimDebris on real misreads', () => {
   it.each([
     ['oasic Porygon', 'Porygon'],

@@ -168,6 +168,8 @@ export function taskKeyOf(jobName: string, data: Record<string, unknown> = {}): 
       return 'ocr-watch';
     case 'ocr-scan-models':
       return 'ocr-rescan';
+    case 'ocr-vision-train':
+      return 'ocr-vision-train';
     default:
       return null;
   }

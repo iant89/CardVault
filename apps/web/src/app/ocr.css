@@ -275,6 +275,9 @@
 .ocr-python.failed, .ocr-python.missing { border-color: rgba(255, 107, 107, .35); }
 .ocr-python.installing { border-color: rgba(110, 168, 255, .35); }
 .ocr-python code { font-size: 12px; word-break: break-all; }
+.ocr-python-mark.ready { color: var(--good); border-color: rgba(61, 220, 151, .35); }
+.ocr-python-mark.missing { color: var(--bad); border-color: rgba(255, 107, 107, .35); }
+.ocr-python-mark.unknown { color: var(--warn); border-color: rgba(255, 190, 90, .3); }
 .ocr-python-mark { flex: none; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); color: var(--text-3); }
 .ocr-python-mark.ready { color: var(--good); border-color: rgba(61, 220, 151, .35); }
 .ocr-python-mark.failed, .ocr-python-mark.missing { color: var(--bad); border-color: rgba(255, 107, 107, .35); }
@@ -292,6 +295,24 @@
 .ocr-sample-text span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ocr-sample-text .bad { color: var(--bad); }
 .ocr-sample-tags { font-size: 11px; }
+
+/* ---------- CardVault-Vision runs ---------- */
+/* one chip per head a run trains, so "name done, number training" is visible */
+.ocr-stage-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.ocr-stage {
+  font-size: 11.5px;
+  font-family: var(--mono);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 9px;
+  color: var(--text-3);
+  background: var(--panel-2);
+  white-space: nowrap;
+}
+.ocr-stage.training { color: var(--text); border-color: rgba(110, 168, 255, .5); }
+.ocr-stage.exporting { color: var(--accent-2); border-color: rgba(110, 168, 255, .35); }
+.ocr-stage.done { color: var(--good); border-color: rgba(61, 220, 151, .4); }
+.ocr-stage.failed { color: var(--bad); border-color: rgba(255, 107, 107, .4); }
 
 /* ---------- small screens ---------- */
 @media (max-width: 760px) {
