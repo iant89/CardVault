@@ -115,7 +115,7 @@ pnpm user:create sam "Sam"           # prompts for a password
 pnpm dev:api      # :3000  Fastify
 pnpm dev:worker   # BullMQ workers
 pnpm dev:web      # :5173  Vite (proxies /api → :3000)
-pnpm test         # unit tests (pricing stats, confidence, SSRF guard, robots, hashing, OCR signal extraction)
+pnpm test         # unit tests (pricing stats, confidence, SSRF guard, robots, hashing, OCR signal extraction, ONNX artifact verification)
 
 bash scripts/ocr-python.sh   # optional: the Python for Developer → OCR Lab → Train
 ```
@@ -216,6 +216,24 @@ Administrators get a workbench for the line reader behind every scan. It is spli
 
 The held-out lines are how training is judged while it runs: they are chosen by card and never trained on, so a model that starts reading them correctly — and confidently — is learning, while one that is confidently wrong needs more data or more epochs. The final verdict is still the frozen exam.
 
+#### CardVault-Vision (the model factory)
+
+OCR Lab can also train with [CardVault-Vision](https://github.com/iant89/CardVault-Vision), a separate PyTorch project that trains **three** models and exports each as a versioned ONNX bundle:
+
+| Task | What it reads | Why it helps |
+|---|---|---|
+| `card-classifier` | the whole card, downscaled | says which game a card is — and which layout to read — in milliseconds, before any text is read |
+| `name-ocr` | the name box | a recogniser trained only on names, so printing and foil styles do not trade off against digits |
+| `number-ocr` | the collector number box | the same, for numbers and set fractions |
+
+CardVault **runs** those bundles itself with `onnxruntime-node`; Python is only needed to train them. Three things follow:
+
+- **Exports are models.** A bundle dropped under `storage/ocr/vision/exports/<task>/<version>/` (or in a folder listed in `VISION_MODELS_DIR`) appears in **Models** after *Look for new models*. CardVault verifies its `checksum.sha256` and contract before using it, so a truncated copy is refused rather than trusted. The checksum, `labels.json` and `preprocessing.json` are read *from the bundle*, which is why CardVault can never disagree with the trainer about how a crop is resized or how logits are decoded.
+- **The safety net is unchanged.** A scored export is a *candidate*; it is promoted only through the same exam, promotion gates and (for the line readers) the live shadow trial that `tools/ocr-trainer` models go through, and the automatic watch still rolls back a model that gets worse in production. The game classifier is scored on the same frozen exam and must beat the active classifier by 0.5 points of game accuracy; being a router rather than a reader it has no live trial, and it runs *beside* the line reader (a rolled-back line reader leaves routing alone, and vice versa).
+- **Only used as a fallback.** The classifier is consulted only when a scan has no game hint from the client; a known game is never overridden, and a low-confidence card is treated as `UNKNOWN` so Tesseract's keyword guess takes over.
+
+To train from the lab, clone the project into `vendor/CardVault-Vision` (or set `CARDVAULT_VISION_DIR`), run `bash scripts/ocr-python.sh` to install it into the trainer's Python, and use **Training → Train with CardVault-Vision**. A run trains the heads you pick — a name/number pair, one head, the classifier, or all three — one after another, exporting and registering each; one head failing does not throw away the others, and the run can be stopped like any other task. Training data comes from an export: **Collected data → Export training data** also writes the whole-card manifest the factory reads (cards, not lines, with each crop's position). Models trained by `tools/ocr-trainer` keep working exactly as before, including their `card.json` sidecars.
+
 ### Providers
 
 Each source implements `CardProvider` (`search / getCard / getPrices / getSales / getImages`) and returns normalized data. Every provider gets its own rate limiter, bounded retries with exponential backoff (honouring `Retry-After`), timeout, circuit breaker, fixed User-Agent and request logging. Admins can enable or disable providers at runtime.
@@ -284,7 +302,7 @@ Copy `./backups` to another disk or machine as well.
 | 1 Foundation: auth, users, sessions, dashboard, Docker | ✅ |
 | 2 Card model: games, sets, cards, variants, collection items, game extensions | ✅ |
 | 3 Scanner: webcam, detection, perspective correction, quality checks, auto-capture, offline queue | ✅ |
-| 4 Identifier: OCR, catalog, name/set/number matching, confidence | ✅ (all games, not just Pokémon) |
+| 4 Identifier: OCR, catalog, name/set/number matching, confidence | ✅ (all games, not just Pokémon; CardVault-Vision models optional) |
 | 5 Queue: BullMQ, persistence, retry, recovery, monitoring | ✅ |
 | 6 Research engine: provider SDK; Pokémon, Magic, Yu-Gi-Oh, eBay | ✅ |
 | 7 Pricing: observations, sold vs listed, statistics, history charts | ✅ |
@@ -301,5 +319,5 @@ Copy `./backups` to another disk or machine as well.
 - **Upside-down captures** aren't auto-rotated by 180°.
 - **eBay sold prices** need Marketplace Insights API access. Without it, eBay adds listed prices only, and sold-style figures come from the TCGplayer, Scryfall and YGOPRODeck aggregates.
 - **Themes** use CSS gradients only and ship no third-party artwork. To use your own images, set `backgroundImage` in `apps/web/src/themes/index.ts` and put the files in `apps/web/public/themes/`.
-- **Custom OCR trainer** (Developer → OCR Lab → Train) needs a Python with PyTorch on the worker's machine. The native installer sets it up in `storage/ocr/venv`, and OCR Lab's **Set up the OCR trainer** does the same later (a few hundred MB, one time). In Docker it lives on the `storage` volume, so it survives `docker compose up --build`; the download needs the worker container to reach PyPI. On an offline server, run `bash scripts/ocr-python.sh` with a local wheel mirror in `OCR_TRAIN_TORCH_INDEX`.
+- **Custom OCR trainer** (Developer → OCR Lab → Train) needs a Python with PyTorch on the worker's machine. The same Python runs CardVault-Vision when you vendor it (`vendor/CardVault-Vision`, see [CardVault-Vision](#cardvault-vision-the-model-factory)) — no second environment, and no Python at all for *using* the models. The native installer sets it up in `storage/ocr/venv`, and OCR Lab's **Set up the OCR trainer** does the same later (a few hundred MB, one time). In Docker it lives on the `storage` volume, so it survives `docker compose up --build`; the download needs the worker container to reach PyPI. On an offline server, run `bash scripts/ocr-python.sh` with a local wheel mirror in `OCR_TRAIN_TORCH_INDEX`.
 - Future-features list (trading, want lists, binders, deck builders, alerts): not started.

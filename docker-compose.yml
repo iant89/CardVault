@@ -73,6 +73,11 @@ services:
       # Developer → OCR Lab → Models → Train: the trainer's Python lives on the
       # storage volume, so the one-time setup survives image updates
       OCR_TRAIN_VENV: /data/storage/ocr/venv
+      # CardVault-Vision: exports land under $STORAGE_DIR/ocr/vision/exports,
+      # which the storage volume already keeps. Point these elsewhere to train
+      # with (or read exports from) a checkout outside the image.
+      CARDVAULT_VISION_DIR: ${CARDVAULT_VISION_DIR:-}
+      VISION_MODELS_DIR: ${VISION_MODELS_DIR:-}
     volumes:
       - storage:/data/storage
     depends_on:

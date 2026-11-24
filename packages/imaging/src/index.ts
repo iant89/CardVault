@@ -165,6 +165,12 @@ export interface CardRegion {
   height: number;
 }
 
+/** Re-encode an image as a plain JPEG (datasets, exports: no metadata, no alpha). */
+export async function toJpeg(input: Buffer, quality = 92): Promise<{ data: Buffer; width: number; height: number }> {
+  const { data, info } = await sharp(input).rotate().jpeg({ quality, mozjpeg: true }).toBuffer({ resolveWithObject: true });
+  return { data, width: info.width, height: info.height };
+}
+
 /** Cut a region (fractions of the card) out of an image, at its original resolution, as PNG. */
 export async function cropRegion(input: Buffer, region: CardRegion): Promise<Buffer> {
   const m = await sharp(input).metadata();
@@ -195,21 +201,74 @@ export async function prepareLine(crop: Buffer, targetHeight = 110): Promise<Buf
 
 /** Input height of the trained line reader (tools/ocr-trainer uses the same). */
 export const LINE_HEIGHT = 32;
+/** Width limits of the trained line reader. */
+export const LINE_MIN_WIDTH = 8;
 export const LINE_MAX_WIDTH = 512;
 
 /**
- * A text line as the trained reader's input: grayscale, LINE_HEIGHT px tall,
- * width scaled to keep the aspect ratio (8..LINE_MAX_WIDTH), values in
- * [-1, 1], row-major. Must match tools/ocr-trainer/ocrtrainer/data.py.
+ * The input contract a line-reader artifact declares for itself
+ * (`preprocessing.json` of a CardVault-Vision export, or `card.input` of a
+ * tools/ocr-trainer model card). Everything that turns a crop into a tensor
+ * reads it from here, so a model's declared contract is what runs.
  */
-export async function lineTensor(crop: Buffer): Promise<{ data: Float32Array; width: number; height: number }> {
+export interface LineTensorSpec {
+  /** fixed input height in px (32 for both trainers) */
+  height: number;
+  /** smallest width a very narrow crop is padded up to */
+  minWidth: number;
+  /** largest width a very long line is squeezed down to */
+  maxWidth: number;
+  /** value range of the pixels sent to the model */
+  range: 'unit' | 'signed';
+  /** send the inverted line (light glyphs on dark paper) instead */
+  invert?: boolean;
+}
+
+/** tools/ocr-trainer: 32px tall, 8..512 wide, pixels in [-1, 1]. */
+export const TRAINER_LINE_SPEC: LineTensorSpec = { height: LINE_HEIGHT, minWidth: LINE_MIN_WIDTH, maxWidth: LINE_MAX_WIDTH, range: 'signed' };
+/** CardVault-Vision: 32px tall, 32..1600 wide, pixels in [0, 1]. */
+export const VISION_LINE_SPEC: LineTensorSpec = { height: 32, minWidth: 32, maxWidth: 1600, range: 'unit' };
+
+/**
+ * A text line as a trained reader's input: grayscale, `spec.height` px tall,
+ * width scaled to keep the aspect ratio (clamped to the spec's range),
+ * row-major, one channel. The default spec is tools/ocr-trainer's.
+ */
+export async function lineTensor(
+  crop: Buffer,
+  spec: LineTensorSpec = TRAINER_LINE_SPEC,
+): Promise<{ data: Float32Array; width: number; height: number }> {
   const m = await sharp(crop).metadata();
-  const h = LINE_HEIGHT;
-  const width = Math.max(8, Math.min(LINE_MAX_WIDTH, Math.round(((m.width ?? 1) * h) / Math.max(1, m.height ?? 1))));
+  const h = spec.height;
+  const width = Math.max(spec.minWidth, Math.min(spec.maxWidth, Math.round(((m.width ?? 1) * h) / Math.max(1, m.height ?? 1))));
   const raw = await sharp(crop).removeAlpha().grayscale().resize(width, h, { fit: 'fill', kernel: 'linear' }).raw().toBuffer();
   const data = new Float32Array(width * h);
-  for (let i = 0; i < data.length; i++) data[i] = raw[i]! / 127.5 - 1;
+  const scale = 255;
+  for (let i = 0; i < data.length; i++) {
+    const v = raw[i]! / scale;
+    data[i] = spec.range === 'unit' ? v : v * 2 - 1;
+  }
+  if (spec.invert) for (let i = 0; i < data.length; i++) data[i] = 1 - data[i]!;
   return { data, width, height: h };
+}
+
+/** Input size of the whole-card game classifier (CardVault-Vision card-type-cnn). */
+export const CLASSIFIER_SIZE = 160;
+
+/**
+ * A whole card as the game classifier's input: RGB, `size`×`size` (aspect ratio
+ * deliberately squashed, as in training), NCHW float32 in [0, 1].
+ */
+export async function classifierTensor(card: Buffer, size = CLASSIFIER_SIZE): Promise<{ data: Float32Array; size: number }> {
+  const raw = await sharp(card).removeAlpha().resize(size, size, { fit: 'fill', kernel: 'linear' }).raw().toBuffer();
+  const plane = size * size;
+  const data = new Float32Array(plane * 3);
+  for (let i = 0, p = 0; i < raw.length; i += 3, p++) {
+    data[p] = raw[i]! / 255;
+    data[plane + p] = raw[i + 1]! / 255;
+    data[plane * 2 + p] = raw[i + 2]! / 255;
+  }
+  return { data, size };
 }
 
 /** One region of a card made ready for OCR (crop + prepareLine). */

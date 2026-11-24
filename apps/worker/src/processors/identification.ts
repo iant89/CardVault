@@ -9,7 +9,7 @@ import { ocrCard, type OcrResult } from '../identification/ocr.js';
 import { extractSignals } from '../identification/extract.js';
 import { nameIndex } from '../identification/dictionary.js';
 import { labelScanSamples, saveScanSamples } from '../identification/samples.js';
-import { liveEngine, shadowEngine } from '../identification/engines.js';
+import { liveClassifier, liveEngine, shadowEngine } from '../identification/engines.js';
 import { GAME_MODULES } from '@cardvault/card-model';
 import { localCandidates, remoteCandidates, scoreCandidates } from '../identification/identify.js';
 import { run } from './common.js';
@@ -63,8 +63,10 @@ export async function processIdentification(ctx: WorkerContext, job: Job<Identif
     let ocr: OcrResult = { full: '', top: '', bottom: '', confidence: 0 };
     if (ctx.config.OCR_ENABLED) {
       try {
-        const reader = await liveEngine(ctx);
-        ocr = await ocrCard(image, ctx.log, ctx.config.OCR_LANG_PATH, job.data.gameHint ?? scan.gameHint ?? undefined, reader ?? undefined);
+        // the game classifier (when one is promoted) routes the card to a
+        // layout before any text is read; the line reader then reads its spots
+        const [reader, classifier] = await Promise.all([liveEngine(ctx), liveClassifier(ctx)]);
+        ocr = await ocrCard(image, ctx.log, ctx.config.OCR_LANG_PATH, job.data.gameHint ?? scan.gameHint ?? undefined, reader ?? undefined, classifier);
       } catch (e) {
         ctx.log.warn({ err: (e as Error).message }, 'OCR failed; continuing with other signals');
       }
@@ -88,7 +90,9 @@ export async function processIdentification(ctx: WorkerContext, job: Job<Identif
     await assertCurrent();
     await tracker.update('MATCHING', 'Matching against local catalog', 45);
     const hint = job.data.gameHint ?? scan.gameHint ?? undefined;
-    const sig = extractSignals(ocr, hint);
+    // a classifier verdict is a visual signal: the game it names never came from
+    // reading a line, so identification scores it apart from the text guess
+    const sig = extractSignals(ocr, hint, ocr.classified);
     const topGame = sig.gameGuesses[0] && sig.gameGuesses[0].score >= 0.34 ? sig.gameGuesses[0].game : null;
     // correct OCR'd names against every known card name for the game
     const dictGame = (hint as GameSlug | undefined) ?? topGame ?? ((ocr.layoutGame as GameSlug | undefined) ?? null);
@@ -120,7 +124,16 @@ export async function processIdentification(ctx: WorkerContext, job: Job<Identif
 
     await assertCurrent();
     const top = scored.slice(0, 5);
-    const raw = { ocr: { top: ocr.top.slice(0, 500), bottom: ocr.bottom.slice(0, 300), full: ocr.full.slice(0, 2000), confidence: ocr.confidence }, signals: sig };
+    const raw = {
+      ocr: {
+        top: ocr.top.slice(0, 500),
+        bottom: ocr.bottom.slice(0, 300),
+        full: ocr.full.slice(0, 2000),
+        confidence: ocr.confidence,
+        ...(ocr.classified ? { classified: ocr.classified } : {}),
+      },
+      signals: sig,
+    };
     if (top.length) {
       await ctx.db.insert(identifications).values(
         top.map((c, i) => ({ scanId, cardId: c.cardId, confidence: c.confidence, method: 'COMBINED' as const, rank: i, rawResult: { ...(i === 0 ? raw : {}), signals: c.signals } })),

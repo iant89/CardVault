@@ -12,6 +12,11 @@ COPY apps ./apps
 COPY migrations ./migrations
 # developer tools (Developer menu → TCGdex Harvester); no dependencies to install
 COPY tools ./tools
+# CardVault-Vision checkout, when the image is built with one (a developer who
+# wants OCR Lab to train with its `vision` CLI). The build context has no such
+# folder by default, so this is empty unless you vendor it:
+#   git clone https://github.com/iant89/CardVault-Vision vendor/CardVault-Vision
+COPY vendor ./vendor
 # OCR Lab's "Set up the OCR trainer" runs this in the worker
 COPY scripts/ocr-python.sh ./scripts/ocr-python.sh
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile

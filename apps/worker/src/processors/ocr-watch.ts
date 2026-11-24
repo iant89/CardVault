@@ -2,6 +2,7 @@ import { auditLog, eq, ocrModels, sql } from '@cardvault/database';
 import type { WorkerContext } from '../context.js';
 import { compareTrial, namePrediction, numberPrediction, rollbackDecision, type LiveUnit, type WatchRules, type WatchWindow } from '../identification/ocr-data.js';
 import { resetLiveEngine } from '../identification/engines.js';
+import { isClassifierRow } from './ocr-lab-vision.js';
 import { ensureTask, saveTask } from '@cardvault/jobs';
 
 interface Row {
@@ -103,14 +104,19 @@ export async function runWatch(ctx: WorkerContext) {
       error: null,
     });
 
-  for (const m of models.filter((x) => x.status === 'shadow' && x.trialStartedAt)) {
+  // A game classifier is compared on the scans it saw, not on lines: its
+  // trials and its watch would need a different statistic, and a classifier
+  // reading alongside the line reader never affects a scan's outcome, so it is
+  // promoted on its exam score alone. Skipping it here keeps the line-reader
+  // numbers honest.
+  for (const m of models.filter((x) => x.status === 'shadow' && x.trialStartedAt && !isClassifierRow(x.card))) {
     const rows = await labelledRows(ctx, { since: m.trialStartedAt!, shadowEngine: `model:${m.id}` });
     const trial = { ...compareTrial(liveUnits(rows)), updatedAt: new Date().toISOString(), since: m.trialStartedAt };
     await ctx.db.update(ocrModels).set({ trial }).where(eq(ocrModels.id, m.id));
     out.trial = { model: m.id, ...trial };
   }
 
-  const active = models.find((x) => x.status === 'active' && x.activatedAt);
+  const active = models.find((x) => x.status === 'active' && x.activatedAt && !isClassifierRow(x.card));
   if (active) {
     const since = active.activatedAt!;
     const span = Math.min(Date.now() - since.getTime(), 30 * 24 * 3600 * 1000);

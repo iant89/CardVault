@@ -58,6 +58,14 @@ export interface OcrResult {
   layoutGame?: string;
   /** each targeted line with its crop: the raw material for the exam and training */
   lines?: OcrLine[];
+  /**
+   * The game the card classifier named, when one read the card: a visual
+   * signal that does not depend on reading any text, so identification scores
+   * it separately from the OCR keyword guess.
+   */
+  classified?: { game: string; label: string; confidence: number; engine: string };
+  /** the classifier declined to route the card (OTHER/UNKNOWN, or below 0.5) */
+  classifierAbstained?: boolean;
 }
 
 export type LineField = 'name' | 'number';
@@ -131,25 +139,67 @@ export async function readLine(crop: Buffer, field: LineField, opts: { numberCha
   return { text: readings.filter(Boolean).join('\n'), readings, confidence: conf };
 }
 
-/**
- * Two passes. First the whole card and its title band, as before (any game).
- * Then, once the game is known (given, or guessed from the first pass), the
- * spots where that game prints the name and collector number are cropped,
- * enlarged and read on their own. Without a known layout every game's title
- * spot is tried and the footer is read in two magnified halves.
- */
-export async function ocrCard(image: Buffer, log: Logger, langPath?: string, gameHint?: string, reader?: LineReader): Promise<OcrResult> {
-  const w = await getWorker(log, langPath);
-  const [fullImg, topImg] = await Promise.all([prepareForOcr(image), prepareForOcr(image, { top: 0, height: 0.18 })]);
-  const a = await read(w, fullImg, PSM.auto);
-  const b = await read(w, topImg, PSM.auto);
+/** A classifier that names a whole card's game (see engines.ts). */
+export interface CardGameClassifier {
+  id: string;
+  classify(card: Buffer): Promise<{ game: string; guess: { label: string; confidence: number } } | null>;
+}
 
+/**
+ * Read a card. The order matters, because it is what makes a scan quick:
+ *
+ *  1. A card classifier, when one is installed, names the game from the whole
+ *     image in milliseconds — no text read at all. That decides the layout, and
+ *     it is also a signal: the game it names does not depend on OCR.
+ *  2. The whole card is read with Tesseract — and, when that did not settle the
+ *     game, its title band too — so the text signals (name candidates, variant
+ *     words, a serial number) keep working. A classifier that already named the
+ *     game saves the title-band pass, because the layout's title crop supplies
+ *     the name; before, two full-card passes ran on every scan without a game
+ *     hint just to guess a game from keywords.
+ *  3. The spots where that game prints the name and collector number are
+ *     cropped, enlarged and read on their own. Without a known layout every
+ *     game's title spot is tried and the footer is read in two magnified halves.
+ */
+export async function ocrCard(
+  image: Buffer,
+  log: Logger,
+  langPath?: string,
+  gameHint?: string,
+  reader?: LineReader,
+  classifier?: CardGameClassifier | null,
+): Promise<OcrResult> {
   let game = gameHint && gameHint in GAME_MODULES ? gameHint : undefined;
-  if (!game) {
-    const g = guessGameFromText(`${b.text}\n${a.text}`)[0];
-    if (g && g.score >= 0.34) game = g.game;
+  let classified: OcrResult['classified'];
+  let classifierAbstained = false;
+  if (!game && classifier) {
+    try {
+      const hit = await classifier.classify(image);
+      if (hit && hit.game in GAME_MODULES) {
+        game = hit.game;
+        classified = { game: hit.game, label: hit.guess.label, confidence: hit.guess.confidence, engine: classifier.id };
+      } else classifierAbstained = true;
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, 'card classifier failed; falling back to reading the card');
+      classifierAbstained = true;
+    }
   }
-  const layout = game ? GAME_MODULES[game as keyof typeof GAME_MODULES].ocrLayout : undefined;
+
+  const w = await getWorker(log, langPath);
+  let layout = game ? GAME_MODULES[game as keyof typeof GAME_MODULES].ocrLayout : undefined;
+  let a: { text: string; confidence: number } = { text: '', confidence: 0 };
+  let b: { text: string; confidence: number } = { text: '', confidence: 0 };
+  // the whole card, once: the text signals identification scores come from here
+  a = await read(w, await prepareForOcr(image), PSM.auto);
+  if (!layout) {
+    // the game is still unknown (or has no layout): read the title band too
+    b = await read(w, await prepareForOcr(image, { top: 0, height: 0.18 }), PSM.auto);
+    if (!game) {
+      const g = guessGameFromText(`${b.text}\n${a.text}`)[0];
+      if (g && g.score >= 0.34) game = g.game;
+      layout = game ? GAME_MODULES[game as keyof typeof GAME_MODULES].ocrLayout : undefined;
+    }
+  }
 
   const names: string[] = [];
   const numbers: string[] = [];
@@ -186,6 +236,8 @@ export async function ocrCard(image: Buffer, log: Logger, langPath?: string, gam
     confidence: a.confidence / 100,
     layoutGame: layout ? game : undefined,
     lines,
+    ...(classified ? { classified } : {}),
+    ...(classifierAbstained ? { classifierAbstained: true } : {}),
   };
 }
 

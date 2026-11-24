@@ -12,6 +12,11 @@ backups/
 .DS_Store
 coverage/
 dump.rdb
+# vendored checkouts (optional; vendor/README.md explains them, they are cloned
+# into place rather than committed)
+vendor/*
+!vendor/README.md
+vendor/*/
 # written by scripts/install.sh at runtime
 *.pid
 .cardvault-installed
