@@ -28,6 +28,12 @@ const schema = z.object({
   RESEARCH_REFRESH_HOURS: z.coerce.number().default(24),
   WORKER_CONCURRENCY: z.coerce.number().int().default(2),
   OCR_ENABLED: bool.default(true),
+  /** ONNX inference parallelism (threads per inference session). */
+  OCR_INTRA_OP_THREADS: z.coerce.number().int().min(1).max(64).default(2),
+  /** Optional ONNX execution provider: auto, cpu, or cuda. Auto prefers CUDA when available. */
+  OCR_EXECUTION_PROVIDER: z.enum(['auto', 'cpu', 'cuda']).default('auto'),
+  /** Concurrent identification jobs; independent scans can be processed in parallel. */
+  OCR_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(2),
   OCR_LANG_PATH: z.string().optional(),
   /** Developer menu (admins only): tools under tools/ that CardVault can start and open. */
   DEV_TOOLS: bool.default(true),

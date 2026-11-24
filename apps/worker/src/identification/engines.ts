@@ -75,9 +75,22 @@ let ortPromise: Promise<Ort> | null = null;
 const ort = () => (ortPromise ??= import('onnxruntime-node'));
 
 /** One loaded ONNX session plus the artifact JSON it was verified against. */
-async function openSession(absoluteDir: string, intraOpNumThreads = 2) {
+async function openSession(absoluteDir: string, intraOpNumThreads = Number(process.env.OCR_INTRA_OP_THREADS) || 2) {
   const [o, artifact] = await Promise.all([ort(), loadVisionArtifact(absoluteDir, absoluteDir)]);
-  const session = await o.InferenceSession.create(path.join(absoluteDir, 'model.onnx'), { intraOpNumThreads });
+  const modelPath = path.join(absoluteDir, 'model.onnx');
+  const provider = process.env.OCR_EXECUTION_PROVIDER ?? 'auto';
+  const options = { intraOpNumThreads, interOpNumThreads: 1 };
+  let session: import('onnxruntime-node').InferenceSession;
+  if (provider === 'cpu') {
+    session = await o.InferenceSession.create(modelPath, { ...options, executionProviders: ['cpu'] });
+  } else {
+    try {
+      session = await o.InferenceSession.create(modelPath, { ...options, executionProviders: ['cuda', 'cpu'] });
+    } catch (error) {
+      if (provider === 'cuda') throw new Error(`CUDA inference requested but unavailable: ${(error as Error).message}`);
+      session = await o.InferenceSession.create(modelPath, { ...options, executionProviders: ['cpu'] });
+    }
+  }
   return { o, artifact, session };
 }
 
@@ -218,7 +231,19 @@ export class OnnxLineEngine implements LineEngine {
   }
 
   private load() {
-    this.session ??= ort().then((o) => o.InferenceSession.create(path.join(this.dir, 'model.onnx'), { intraOpNumThreads: 2 }));
+    this.session ??= ort().then(async (o) => {
+      const modelPath = path.join(this.dir, 'model.onnx');
+      const intraOpNumThreads = Number(process.env.OCR_INTRA_OP_THREADS) || 2;
+      const provider = process.env.OCR_EXECUTION_PROVIDER ?? 'auto';
+      const options = { intraOpNumThreads, interOpNumThreads: 1 };
+      if (provider === 'cpu') return o.InferenceSession.create(modelPath, { ...options, executionProviders: ['cpu'] });
+      try {
+        return await o.InferenceSession.create(modelPath, { ...options, executionProviders: ['cuda', 'cpu'] });
+      } catch (error) {
+        if (provider === 'cuda') throw new Error(`CUDA inference requested but unavailable: ${(error as Error).message}`);
+        return o.InferenceSession.create(modelPath, { ...options, executionProviders: ['cpu'] });
+      }
+    });
     return this.session;
   }
 
