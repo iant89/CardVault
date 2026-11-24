@@ -103,6 +103,23 @@ without touching the line reader.
   CardVault-Vision form and run panel.
 - **Collected data** — every collected line with its crop and filters, plus dataset exports.
 
+## Inference performance (CPU and GPU)
+
+CardVault-Vision ONNX models can use CPU or NVIDIA CUDA inference. Configure these in the
+worker environment (for example in `.env`):
+
+- `OCR_EXECUTION_PROVIDER=auto` (default) tries CUDA, then falls back to CPU. Set `cuda` to
+  require CUDA (startup/inference reports a clear error if unavailable), or `cpu` to disable it.
+- `OCR_INTRA_OP_THREADS=2` controls ONNX's per-model CPU thread pool. Increase it for a
+  CPU-heavy deployment, but account for the number of concurrently running OCR jobs.
+- `OCR_WORKER_CONCURRENCY=2` runs independent identification jobs concurrently. Increase it
+  when the machine has spare CPU/GPU capacity; avoid multiplying high job concurrency by a
+  high ONNX thread count on a small CPU.
+
+CUDA requires an ONNX Runtime build with CUDA provider support and compatible NVIDIA driver / CUDA
+libraries in the worker container. If the installed runtime lacks CUDA, `auto` stays functional
+on CPU. `cuda` intentionally fails rather than silently running on the CPU.
+
 ## Under the hood
 
 - `packages/shared/src/tasks.ts` — the task shape, progress maths and the ETA helpers (shared by
